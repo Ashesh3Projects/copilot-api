@@ -9,6 +9,10 @@ import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
 import {
+  createAzureOpenAIChatCompletions,
+  isAzureOpenAIModel,
+} from "~/services/azure-openai"
+import {
   createChatCompletions,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -19,6 +23,37 @@ export async function handleCompletion(c: Context) {
 
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
+
+  // Check if this is an Azure OpenAI model
+  if (isAzureOpenAIModel(payload.model)) {
+    if (!state.azureOpenAIConfig) {
+      return c.json({ error: "Azure OpenAI not configured" }, 500)
+    }
+
+    consola.info(`Routing to Azure OpenAI -> ${payload.model}`)
+
+    if (state.manualApprove) await awaitApproval()
+
+    const response = await createAzureOpenAIChatCompletions(
+      state.azureOpenAIConfig,
+      payload,
+    )
+
+    if (isNonStreaming(response)) {
+      consola.debug("Non-streaming response:", JSON.stringify(response))
+      return c.json(response)
+    }
+
+    consola.debug("Streaming response")
+    return streamSSE(c, async (stream) => {
+      for await (const chunk of response) {
+        consola.debug("Streaming chunk:", JSON.stringify(chunk))
+        await stream.writeSSE(chunk as SSEMessage)
+      }
+    })
+  }
+
+  consola.info(`Routing to Copilot -> ${payload.model}`)
 
   // Find the selected model
   const selectedModel = state.models?.data.find(

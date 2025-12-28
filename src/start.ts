@@ -11,7 +11,7 @@ import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
-import { cacheModels, cacheVSCodeVersion } from "./lib/utils"
+import { cacheModels, cacheVSCodeVersion, setupAzureOpenAI } from "./lib/utils"
 import { server } from "./server"
 
 interface RunServerOptions {
@@ -60,9 +60,16 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   await setupCopilotToken()
   await cacheModels()
 
-  consola.info(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
-  )
+  // Setup Azure OpenAI (prompt on first run, load from config thereafter)
+  await setupAzureOpenAI()
+
+  // Build combined model list for display
+  const copilotModelIds = state.models?.data.map((model) => model.id) ?? []
+  const azureModelIds =
+    state.azureOpenAIDeployments?.map((deployment) => deployment.id) ?? []
+  const allModelIds = [...copilotModelIds, ...azureModelIds]
+
+  consola.info(`Available models: \n${allModelIds.map((id) => `- ${id}`).join("\n")}`)
 
   const serverUrl = `http://localhost:${options.port}`
 
@@ -73,7 +80,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       "Select a model to use with Claude Code",
       {
         type: "select",
-        options: state.models.data.map((model) => model.id),
+        options: allModelIds,
       },
     )
 
@@ -81,7 +88,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       "Select a small model to use with Claude Code",
       {
         type: "select",
-        options: state.models.data.map((model) => model.id),
+        options: allModelIds,
       },
     )
 

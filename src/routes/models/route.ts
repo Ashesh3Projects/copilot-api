@@ -13,19 +13,35 @@ modelRoutes.get("/", async (c) => {
       await cacheModels()
     }
 
-    const models = state.models?.data.map((model) => ({
-      id: model.id,
-      object: "model",
-      type: "model",
-      created: 0, // No date available from source
-      created_at: new Date(0).toISOString(), // No date available from source
-      owned_by: model.vendor,
-      display_name: model.name,
-    }))
+    // Copilot models
+    const copilotModels =
+      state.models?.data.map((model) => ({
+        id: model.id,
+        object: "model",
+        type: "model",
+        created: 0, // No date available from source
+        created_at: new Date(0).toISOString(), // No date available from source
+        owned_by: model.vendor,
+        display_name: model.name,
+      })) ?? []
+
+    // Azure OpenAI deployments
+    const azureModels =
+      state.azureOpenAIDeployments?.map((deployment) => ({
+        id: deployment.id,
+        object: "model",
+        type: "model",
+        created: deployment.created,
+        created_at: new Date(deployment.created * 1000).toISOString(),
+        owned_by: deployment.owned_by,
+        display_name: `${deployment.deploymentName} (${deployment.model})`,
+      })) ?? []
+
+    const allModels = [...copilotModels, ...azureModels]
 
     return c.json({
       object: "list",
-      data: models,
+      data: allModels,
       has_more: false,
     })
   } catch (error) {
