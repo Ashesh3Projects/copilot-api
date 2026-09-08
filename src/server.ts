@@ -31,6 +31,7 @@ import {
   routingTelemetryStorage,
   runWithRequestDiagnostics,
 } from "./lib/request-session"
+import { storageAdmission } from "./lib/storage/admission"
 import { transparentProxy } from "./lib/transparent-proxy"
 import { audioTranscriptionRoutes } from "./routes/audio-transcriptions/route"
 import { completionRoutes } from "./routes/chat-completions/route"
@@ -124,6 +125,7 @@ async function runWithRequestRoutingScopes<T>(
 }
 
 // Global middleware — applied to ALL routes including pre-auth ones
+server.use("*", storageAdmission)
 server.use("*", statsigProxyMiddleware)
 server.use("*", async (c, next) => {
   const telemetryState = createRoutingTelemetryRequestState(

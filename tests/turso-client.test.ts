@@ -18,6 +18,24 @@ afterEach(() => {
 })
 const sql = (sql: string) => ({ sql, args: [] })
 
+test("backup cancellation during remote session setup prevents callback admission", async () => {
+  remote = createFakeTursoFetch()
+  const storage = createStorage(testConfig())
+  const abort = new AbortController()
+  let entered = false
+  const result = storage.readSnapshot?.(
+    async () => {
+      await Promise.resolve()
+      entered = true
+    },
+    { signal: abort.signal },
+  )
+  abort.abort()
+  await expect(result).rejects.toThrow()
+  expect(entered).toBe(false)
+  await storage.close()
+})
+
 test("real SDK normalizes URL and binds string binary null and exact integers", async () => {
   remote = createFakeTursoFetch()
   const storage = createStorage(testConfig())

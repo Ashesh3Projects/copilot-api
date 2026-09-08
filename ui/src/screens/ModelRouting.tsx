@@ -21,6 +21,8 @@ import { ApiError, get, post } from "../lib/api"
 import {
   formatModelRoutingAccountDetails,
   formatModelRoutingAccountSummary,
+  modelRoutingAccountDisabledReason,
+  modelRoutingAccountStatus,
 } from "../lib/model-routing"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
@@ -94,6 +96,11 @@ export default function ModelRoutingScreen() {
         ...data.accounts.map((account): TableColumn<ModelRow> => {
           const accountSummary = formatModelRoutingAccountSummary(account)
           const accountDetails = formatModelRoutingAccountDetails(account)
+          const disabledReason = modelRoutingAccountDisabledReason(account)
+          const status = modelRoutingAccountStatus(account)
+          let statusVariant: "neutral" | "success" | "error" = "neutral"
+          if (!disabledReason)
+            statusVariant = account.healthy ? "success" : "error"
 
           return {
             key: `account-${account.id}`,
@@ -101,13 +108,16 @@ export default function ModelRoutingScreen() {
               <div aria-label={accountSummary} title={accountSummary}>
                 <HStack gap={1.5} vAlign="center" hAlign="center" width="100%">
                   <StatusDot
-                    variant={account.healthy ? "success" : "error"}
+                    variant={statusVariant}
                     label={accountSummary}
                     tooltip={accountSummary}
                   />
                   <VStack gap={0} hAlign="start">
                     <Text weight="medium">Account #{account.id}</Text>
                     <Text type="supporting">{accountDetails}</Text>
+                    {disabledReason ?
+                      <Text type="supporting">{status}</Text>
+                    : null}
                   </VStack>
                 </HStack>
               </div>
@@ -119,15 +129,17 @@ export default function ModelRoutingScreen() {
                 (acct) => acct.accountId === account.id,
               )
               return (
-                <Switch
-                  label={`Toggle ${item.name} on account ${account.id}`}
-                  isLabelHidden
-                  value={entry?.enabled ?? false}
-                  isDisabled={entry === undefined}
-                  changeAction={(value) =>
-                    handleToggle(item.id, account.id, value)
-                  }
-                />
+                <div title={disabledReason}>
+                  <Switch
+                    label={`Toggle ${item.name} on account ${account.id}`}
+                    isLabelHidden
+                    value={entry?.enabled ?? false}
+                    isDisabled={entry === undefined || Boolean(disabledReason)}
+                    changeAction={(value) =>
+                      handleToggle(item.id, account.id, value)
+                    }
+                  />
+                </div>
               )
             },
           }

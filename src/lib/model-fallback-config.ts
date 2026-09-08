@@ -1,9 +1,13 @@
-import consola from "consola"
-import { randomUUID } from "node:crypto"
-import fs from "node:fs/promises"
 import { z } from "zod"
 
-import { PATHS } from "~/lib/paths"
+import {
+  getLoadedSetting,
+  getLoadedSettingRevision,
+  getLiveSettingRevision,
+  readSetting,
+  writeSetting,
+} from "~/lib/storage/domain-settings"
+import { getRequestSnapshot } from "~/lib/storage/request-snapshot"
 
 const modelId = z
   .string()
@@ -61,12 +65,8 @@ const fallbackConfigSchema = z
 export type ModelFallbackConfig = z.infer<typeof fallbackConfigSchema>
 export type ModelFallbackRule = ModelFallbackConfig["rules"][number]
 
-let config = fallbackConfigSchema.parse({})
-let loaded = false
-let loading: Promise<void> | undefined
-let updateQueue: Promise<void> = Promise.resolve()
-let revision = 0
-let memoryOnly = false
+let testConfig: ModelFallbackConfig | undefined
+let testRevision = 0
 
 export function validateModelFallbackConfig(
   value: unknown,
@@ -75,77 +75,42 @@ export function validateModelFallbackConfig(
 }
 
 export function getLoadedModelFallbackConfig(): ModelFallbackConfig {
-  return structuredClone(config)
+  const value = testConfig ?? getLoadedSetting("model_fallbacks")
+  return structuredClone(
+    validateModelFallbackConfig(value === undefined ? {} : value),
+  )
 }
 
 export function getModelFallbackConfigRevision(): number {
-  return revision
+  return testConfig ? testRevision : getLiveSettingRevision("model_fallbacks")
 }
 
-async function loadConfig(): Promise<void> {
-  try {
-    const data = await fs.readFile(PATHS.MODEL_FALLBACKS_CONFIG_PATH)
-    config = validateModelFallbackConfig(JSON.parse(data.toString()) as unknown)
-  } catch (error) {
-    if (
-      !(error instanceof Error)
-      || !("code" in error)
-      || error.code !== "ENOENT"
-    ) {
-      // Invalid rules must never silently activate a partial fallback policy.
-      consola.error("Failed to load model fallback configuration:", error)
-    }
-    config = fallbackConfigSchema.parse({})
-  }
-  loaded = true
-  revision++
+export function getCapturedModelFallbackConfigRevision(): number {
+  return testConfig ? testRevision : getLoadedSettingRevision("model_fallbacks")
 }
 
 export async function getModelFallbackConfig(): Promise<ModelFallbackConfig> {
-  if (!loaded) {
-    loading ??= loadConfig().finally(() => {
-      loading = undefined
-    })
-    await loading
-  }
-  return getLoadedModelFallbackConfig()
-}
-
-async function persistConfig(next: ModelFallbackConfig): Promise<void> {
-  const temporaryPath = `${PATHS.MODEL_FALLBACKS_CONFIG_PATH}.${randomUUID()}.tmp`
-  try {
-    await fs.mkdir(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-    await fs.writeFile(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    })
-    await fs.rename(temporaryPath, PATHS.MODEL_FALLBACKS_CONFIG_PATH)
-  } finally {
-    await fs.rm(temporaryPath, { force: true })
-  }
+  if (testConfig || getRequestSnapshot()) return getLoadedModelFallbackConfig()
+  const value = await readSetting("model_fallbacks")
+  return validateModelFallbackConfig(value === undefined ? {} : value)
 }
 
 export async function setModelFallbackConfig(
   value: unknown,
 ): Promise<ModelFallbackConfig> {
   const next = validateModelFallbackConfig(value)
-  const update = updateQueue.then(async () => {
-    await getModelFallbackConfig()
-    if (!memoryOnly) await persistConfig(next)
-    config = next
-    revision++
-  })
-  updateQueue = update.catch(() => undefined)
-  await update
+  if (testConfig) {
+    testConfig = next
+    testRevision++
+  } else {
+    await writeSetting("model_fallbacks", next)
+  }
   return structuredClone(next)
 }
 
 export function setModelFallbackConfigForTest(
   value: ModelFallbackConfig | null,
 ): void {
-  config = validateModelFallbackConfig(value ?? {})
-  loaded = value !== null
-  memoryOnly = value !== null
-  loading = undefined
-  revision++
+  testConfig = value === null ? undefined : validateModelFallbackConfig(value)
+  testRevision++
 }

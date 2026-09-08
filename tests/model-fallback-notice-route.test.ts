@@ -9,6 +9,14 @@ import { setSsePreflushDeadlineForTest } from "~/lib/sse-lifecycle"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const previous = { ...state }
 const previousFetch = globalThis.fetch
 let slowTarget = false
@@ -128,20 +136,23 @@ afterEach(() => {
 test.each([false, true])(
   "public Messages response emits opted-in native notice, stream=%s",
   async (stream) => {
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "anthropic-beta": "server-side-fallback-2026-07-01",
-      },
-      body: JSON.stringify({
-        model: "notice-source",
-        max_tokens: 128,
-        stream,
-        messages: [{ role: "user", content: "hello" }],
-        fallbacks: "default",
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "anthropic-beta": "server-side-fallback-2026-07-01",
+        },
+        body: JSON.stringify({
+          model: "notice-source",
+          max_tokens: 128,
+          stream,
+          messages: [{ role: "user", content: "hello" }],
+          fallbacks: "default",
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(200)
     const text = await response.text()
     expect(text).toContain('"type":"fallback"')
@@ -154,26 +165,30 @@ test.each([false, true])(
 test("slow fallback preserves SSE preflush and adds native notice after acceptance", async () => {
   slowTarget = true
   setSsePreflushDeadlineForTest(1)
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "server-side-fallback-2026-07-01",
-    },
-    body: JSON.stringify({
-      model: "notice-source",
-      max_tokens: 128,
-      stream: true,
-      messages: [{ role: "user", content: "hello" }],
-      fallbacks: "default",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "server-side-fallback-2026-07-01",
+      },
+      body: JSON.stringify({
+        model: "notice-source",
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+        fallbacks: "default",
+      }),
     }),
-  })
+  )
   expect(response.status).toBe(200)
   expect(await response.text()).toContain('"type":"fallback"')
 })
 
 test("Claude fallback block round-trips through the next native Messages request", async () => {
   const headers = {
+    authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
     "content-type": "application/json",
     "anthropic-beta": "server-side-fallback-2026-07-01",
     "x-claude-code-session-id": "native-roundtrip",
@@ -184,26 +199,30 @@ test("Claude fallback block round-trips through the next native Messages request
     messages: [{ role: "user", content: "hello" }],
     fallbacks: "default",
   }
-  const first = await server.request("/v1/messages", {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
+  const first = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    }),
+  )
   const body = (await first.json()) as {
     content: Array<Record<string, unknown>>
   }
-  const second = await server.request("/v1/messages", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ...payload,
-      messages: [
-        ...payload.messages,
-        { role: "assistant", content: body.content },
-        { role: "user", content: "continue" },
-      ],
+  const second = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ...payload,
+        messages: [
+          ...payload.messages,
+          { role: "assistant", content: body.content },
+          { role: "user", content: "continue" },
+        ],
+      }),
     }),
-  })
+  )
   expect(second.status).toBe(200)
   expect(requests.map((request) => request.model)).toEqual([
     "notice-source",
@@ -230,16 +249,21 @@ test("Claude fallback block round-trips through the next native Messages request
 test("slow Messages-backed Responses stream carries lazy Codex native metadata", async () => {
   slowTarget = true
   setSsePreflushDeadlineForTest(1)
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "notice-source",
-      input: "hello",
-      max_output_tokens: 128,
-      stream: true,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "notice-source",
+        input: "hello",
+        max_output_tokens: 128,
+        stream: true,
+      }),
     }),
-  })
+  )
   expect(response.status).toBe(200)
   expect(await response.text()).toContain('"openai-model":"notice-target"')
 })

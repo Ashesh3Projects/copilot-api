@@ -19,6 +19,14 @@ import {
 } from "~/routes/responses/websocket"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
 const calls: Array<{ path: string; body: Record<string, unknown> }> = []
@@ -151,14 +159,17 @@ function post(
   threadId?: string,
   path = "/v1/responses",
 ) {
-  return server.request(path, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(threadId ? { "thread-id": threadId } : {}),
-    },
-    body: JSON.stringify({ model: "chain-a", input: "hello", ...extra }),
-  })
+  return seedProtocolDatabase().then(() =>
+    server.request(path, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        ...(threadId ? { "thread-id": threadId } : {}),
+      },
+      body: JSON.stringify({ model: "chain-a", input: "hello", ...extra }),
+    }),
+  )
 }
 
 beforeEach(() => {
@@ -578,19 +589,21 @@ test("WebSocket chaining preserves original-model continuation and caches the fi
 
 async function createSocket() {
   let data: ResponsesWebSocketData | undefined
-  await tryUpgradeResponsesWebSocket(
-    new Request("http://localhost/responses", {
-      headers: {
-        authorization: "Bearer chain-client-secret",
-        "thread-id": "websocket-chain",
+  await seedProtocolDatabase().then(() =>
+    tryUpgradeResponsesWebSocket(
+      new Request("http://localhost/responses", {
+        headers: {
+          authorization: "Bearer chain-client-secret",
+          "thread-id": "websocket-chain",
+        },
+      }),
+      {
+        upgrade(_request, options) {
+          data = (options as { data: ResponsesWebSocketData }).data
+          return true
+        },
       },
-    }),
-    {
-      upgrade(_request, options) {
-        data = (options as { data: ResponsesWebSocketData }).data
-        return true
-      },
-    },
+    ),
   )
   if (!data) throw new Error("Expected WebSocket upgrade")
   const sent: Array<Record<string, unknown>> = []

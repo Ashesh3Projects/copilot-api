@@ -7,7 +7,7 @@
 **Tech Stack:** Bun/TypeScript, Hono, pinned Turso adapter from Plan 1, existing Astryx React dashboard, Bun tests.
 **Spec:** ../specs/2026-09-08-database-persistence-design.md
 **Prerequisite:** Plan 1 reviewed and committed.
-**Status:** Proposed; execute after approval of the complete plan set.
+**Status:** Implemented and reviewed. Final evidence and operational limits: [acceptance record](2026-09-08-database-persistence-acceptance.md).
 
 ## Global Constraints
 

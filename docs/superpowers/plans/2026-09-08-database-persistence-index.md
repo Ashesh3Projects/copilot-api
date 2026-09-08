@@ -6,7 +6,7 @@
 **Architecture:** A shared schema/repository layer targets bun:sqlite or @tursodatabase/serverless 1.4.0. Select one backend once at startup; preserve protocol/routing behavior.
 **Tech Stack:** Bun, strict TypeScript, Hono, existing Astryx/React UI, SQLite/Turso.
 **Spec:** ../specs/2026-09-08-database-persistence-design.md
-**Status:** Approved on 2026-09-08; implementation underway from origin/master b3da081 in isolated codex/database-persistence worktree.
+**Status:** Implemented and reviewed on codex/database-persistence; see [final acceptance evidence](2026-09-08-database-persistence-acceptance.md).
 
 ## Latest user decisions
 
@@ -40,10 +40,10 @@ Plan 1's adapter task has separate local and remote test loops; review both befo
 - [x] Write architecture, acceptance map, four implementation plans and planned README/runbook notes.
 - [x] Incorporate independent design review: secret-free operation markers, disable/delete distinction, first-setup authority, new WebSocket-turn authorization, fallback namespace revisions, single-account parity, explicit telemetry gaps and empty-target restore.
 - [x] User approves this design and implementation plan set.
-- [ ] Execute with subagents and task reviews on an isolated baseline preserving unrelated work.
-- [ ] Verify both actual adapters plus full public-route/next-turn regressions, filesystem write boundaries, UI, build/lint/typecheck.
+- [x] Execute with subagents and task reviews on an isolated baseline preserving unrelated work.
+- [x] Verify both actual adapters plus full public-route/next-turn regressions, filesystem write boundaries, UI, build/lint/typecheck.
 - [ ] Present completed branch and verified migration/runbook; production cutover and old-data deletion are separate actions.
 
 The repository's current fallback changes are still moving in the shared checkout. Start implementation from the user's finalized commit or a reviewed exact isolated snapshot; do not reset or include unrelated edits accidentally. Planning files are safe to review independently.
 
-Current operational README behavior remains labeled current; new database behavior is explicitly marked planned until code is implemented. No database schema or credentials were changed during planning.
+README and the storage runbook now describe this implementation. Production deployment and legacy-data removal remain separate, unperformed operations.

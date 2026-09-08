@@ -1,7 +1,5 @@
-import { randomUUID } from "node:crypto"
-import fs from "node:fs"
-
-import { PATHS } from "~/lib/paths"
+import { getLoadedSetting, updateSetting } from "~/lib/storage/domain-settings"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export type FeatureFlagValue =
   | boolean
@@ -69,91 +67,93 @@ const DEFAULT_FLAGS: FeatureFlags = {
   tengu_disable_streaming_to_non_streaming_fallback: true,
 }
 
-let cachedFlags: FeatureFlags | null = null
-let skipPersistForTest = false
+/** Detached defaults for snapshot-based export without consulting runtime state. */
+export function getDefaultFeatureFlags(): FeatureFlags {
+  return Object.assign(createFlagMap(), DEFAULT_FLAGS)
+}
+
+let testFlags: FeatureFlags | undefined
+
+export function validateStoredFeatureFlags(raw: unknown): FeatureFlags {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new FeatureFlagValidationError("Feature flags must be an object")
+  }
+  const normalized = normalizeFlags(raw)
+  if (Object.keys(normalized).length !== Object.keys(raw).length) {
+    throw new FeatureFlagValidationError("Invalid stored feature flag")
+  }
+  normalizeSettingsJson(normalized)
+  return normalized
+}
+
+function flagsFromValue(value: unknown): FeatureFlags {
+  return value === undefined ?
+      Object.assign(createFlagMap(), DEFAULT_FLAGS)
+    : validateStoredFeatureFlags(value)
+}
 
 function cloneFlags(flags: FeatureFlags): FeatureFlags {
-  return Object.assign(createFlagMap(), flags)
-}
-
-function readFlagsFromDisk(): FeatureFlags {
-  try {
-    const raw = fs.readFileSync(PATHS.FEATURE_FLAGS_PATH, "utf8")
-    if (!raw.trim()) return createFlagMap()
-    return normalizeFlags(JSON.parse(raw) as unknown)
-  } catch {
-    return createFlagMap()
-  }
-}
-
-function writeFlagsToDisk(flags: FeatureFlags): void {
-  if (skipPersistForTest) return
-  const temporaryPath = `${PATHS.FEATURE_FLAGS_PATH}.${process.pid}.${randomUUID()}.tmp`
-  fs.mkdirSync(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-  fs.chmodSync(PATHS.APP_DIR, 0o700)
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(flags, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    })
-    fs.chmodSync(temporaryPath, 0o600)
-    fs.renameSync(temporaryPath, PATHS.FEATURE_FLAGS_PATH)
-    fs.chmodSync(PATHS.FEATURE_FLAGS_PATH, 0o600)
-  } catch (error) {
-    fs.rmSync(temporaryPath, { force: true })
-    throw error
-  }
+  return Object.assign(createFlagMap(), structuredClone(flags))
 }
 
 export function getFeatureFlags(): FeatureFlags {
-  if (!cachedFlags) {
-    cachedFlags = Object.assign(
-      createFlagMap(),
-      DEFAULT_FLAGS,
-      readFlagsFromDisk(),
-    )
-  }
-  return cloneFlags(cachedFlags)
+  return cloneFlags(
+    testFlags ?? flagsFromValue(getLoadedSetting("feature_flags")),
+  )
 }
 
-export function setFeatureFlag(
+export async function setFeatureFlag(
   name: string,
   value: FeatureFlagValue,
-): FeatureFlags {
-  const flags = getFeatureFlags()
-  if (!isValidFeatureFlagName(name)) {
+): Promise<FeatureFlags> {
+  if (!isValidFeatureFlagName(name))
     throw new FeatureFlagValidationError("Invalid feature flag name")
-  }
+  let normalized: FeatureFlags
   try {
-    JSON.stringify(value)
+    normalized = validateStoredFeatureFlags({ [name]: value })
   } catch {
     throw new FeatureFlagValidationError(
       "Feature flag value is not serializable",
     )
   }
-  flags[name] = value
-  writeFlagsToDisk(flags)
-  cachedFlags = flags
-  return cloneFlags(flags)
+  const update = (flags: FeatureFlags) => {
+    flags[name] = normalized[name]
+    return flags
+  }
+  if (testFlags) {
+    testFlags = update(cloneFlags(testFlags))
+    return cloneFlags(testFlags)
+  }
+  return cloneFlags(
+    validateStoredFeatureFlags(
+      await updateSetting("feature_flags", (current) =>
+        normalizeSettingsJson(update(flagsFromValue(current))),
+      ),
+    ),
+  )
 }
 
-export function removeFeatureFlag(name: string): boolean {
+export async function removeFeatureFlag(name: string): Promise<boolean> {
   if (!isValidFeatureFlagName(name)) return false
-  const flags = getFeatureFlags()
-  if (!Object.hasOwn(flags, name)) return false
-  const { [name]: _, ...rest } = flags
-  writeFlagsToDisk(rest)
-  cachedFlags = rest
-  return true
+  let removed = false
+  const update = (flags: FeatureFlags) => {
+    removed = Object.hasOwn(flags, name)
+    const { [name]: _removed, ...rest } = flags
+    return rest
+  }
+  if (testFlags) testFlags = update(cloneFlags(testFlags))
+  else
+    await updateSetting("feature_flags", (current) =>
+      normalizeSettingsJson(update(flagsFromValue(current))),
+    )
+  return removed
 }
 
 export function setFeatureFlagsForTest(
-  flags: FeatureFlags = createFlagMap(),
+  flags: FeatureFlags | null = createFlagMap(),
 ): void {
-  cachedFlags = Object.assign(
-    createFlagMap(),
-    DEFAULT_FLAGS,
-    normalizeFlags(flags),
-  )
-  skipPersistForTest = true
+  testFlags =
+    flags === null ? undefined : (
+      Object.assign(createFlagMap(), DEFAULT_FLAGS, normalizeFlags(flags))
+    )
 }

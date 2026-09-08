@@ -1,10 +1,8 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test"
 import consola from "consola"
 import { createHash } from "node:crypto"
-import fs from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
 
+import { mergeConfigWithDefaults } from "../src/lib/config"
 import { resolveCredential } from "../src/lib/credential-resolver"
 import { listIpAllowlist, setIpAllowlistForTest } from "../src/lib/ip-allowlist"
 import {
@@ -23,6 +21,7 @@ import {
   setFeatureFlag,
 } from "../src/routes/feature-flags/store"
 import { server } from "../src/server"
+import { createAuthStorageFixture } from "./helpers/auth-storage"
 
 const originalApiKeyAuth = state.apiKeyAuth
 const originalInferenceCredentialDigests =
@@ -34,17 +33,28 @@ const oauthScopes =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 const oauthVerifier = "v".repeat(64)
 const oauthState = "state-with-enough-entropy-123456789"
-let temporaryDirectory: string | undefined
-let oauthStorePath: string | undefined
+let authFixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
 
-function setInferenceCredentialDigests(value: string | undefined): void {
-  if (value === undefined) {
-    delete process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
-  } else {
-    process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = value
-  }
+async function setInferenceCredentialDigests(
+  value: string | undefined,
+): Promise<void> {
+  await authFixture.storage.transaction(async (session) => {
+    await session.execute({
+      sql: "DELETE FROM capi_inference_credentials WHERE kind = 'managed'",
+      args: [],
+    })
+    if (value)
+      await session.execute({
+        sql: "INSERT INTO capi_inference_credentials(digest,id,kind,principal_id,label,enabled,scopes_json,created_at,updated_at) VALUES(?,?,'managed',?,NULL,1,?,0,0)",
+        args: [
+          value,
+          "fixture-managed",
+          "inference-managed:fixture-managed",
+          '["user:inference"]',
+        ],
+      })
+  })
 }
-
 function authorizationQuery(
   redirectUri: string = oauthRedirectUri,
 ): URLSearchParams {
@@ -60,37 +70,37 @@ function authorizationQuery(
 }
 
 beforeEach(async () => {
+  authFixture = await createAuthStorageFixture()
+  await mergeConfigWithDefaults()
   setIpAllowlistForTest([])
   state.apiKeyAuth = "test-secret-key"
-  setInferenceCredentialDigests(undefined)
   resetIpSecurityForTest()
   consola.warn = mock(() => {}) as unknown as typeof consola.warn
-  temporaryDirectory = await fs.mkdtemp(
-    path.join(os.tmpdir(), "copilot-oauth-"),
+  await authFixture.storage.transaction((session) =>
+    session.execute({
+      sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES(?,?,?,0)",
+      args: ["fixture-gateway", sha256Hex("test-secret-key"), "test"],
+    }),
   )
-  oauthStorePath = path.join(temporaryDirectory, "oauth_tokens.json")
-  setOAuthStoreForTest(new OAuthStore(oauthStorePath))
+  setOAuthStoreForTest(new OAuthStore({ storage: authFixture.storage }))
 })
 
 afterEach(async () => {
   resetIpSecurityForTest()
   setIpAllowlistForTest([])
   setOAuthStoreForTest(null)
-  setInferenceCredentialDigests(originalInferenceCredentialDigests)
-  const directory = temporaryDirectory
-  temporaryDirectory = undefined
-  oauthStorePath = undefined
-  if (directory) {
-    await fs.rm(directory, { recursive: true, force: true })
-  }
+  await authFixture.close()
 })
 
 afterAll(() => {
   state.apiKeyAuth = originalApiKeyAuth
   consola.warn = originalWarn
-  removeFeatureFlag("claude_code_penguin_mode")
+  if (originalInferenceCredentialDigests === undefined)
+    delete process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
+  else
+    process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S =
+      originalInferenceCredentialDigests
 })
-
 test("accepts versioned telemetry calls without auth", async () => {
   const response = await server.request("/api/event_logging/v2/batch", {
     method: "POST",
@@ -121,7 +131,7 @@ test("still requires auth for defined OAuth API routes", async () => {
 })
 
 test("penguin mode reports fast mode enabled by default", async () => {
-  removeFeatureFlag("claude_code_penguin_mode")
+  await removeFeatureFlag("claude_code_penguin_mode")
 
   const tokens = await authorizeAndExchange()
   const response = await server.request("/api/claude_code_penguin_mode", {
@@ -133,7 +143,7 @@ test("penguin mode reports fast mode enabled by default", async () => {
 })
 
 test("penguin mode honors the claude_code_penguin_mode flag when disabled", async () => {
-  setFeatureFlag("claude_code_penguin_mode", false)
+  await setFeatureFlag("claude_code_penguin_mode", false)
 
   try {
     const tokens = await authorizeAndExchange()
@@ -147,7 +157,7 @@ test("penguin mode honors the claude_code_penguin_mode flag when disabled", asyn
       disabled_reason: "preference",
     })
   } finally {
-    removeFeatureFlag("claude_code_penguin_mode")
+    await removeFeatureFlag("claude_code_penguin_mode")
   }
 })
 
@@ -382,7 +392,7 @@ test("a recognized credential denied for scope never feeds the IP ban tracker", 
 })
 
 test("a wrong-scope OAuth credential cannot recover an actively banned IP", async () => {
-  const store = new OAuthStore(oauthStorePath)
+  const store = new OAuthStore({ storage: authFixture.storage })
   setOAuthStoreForTest(store)
   const code = await store.issueAuthorizationCode({
     clientId: oauthClientId,
@@ -483,7 +493,7 @@ async function issueAuthorizationCode(): Promise<string> {
 }
 
 test("digest-listed OAuth grants cannot mint broader credentials", async () => {
-  setInferenceCredentialDigests(sha256Hex("test-secret-key"))
+  await setInferenceCredentialDigests(sha256Hex("test-secret-key"))
   const bootstrapResponse = await server.request(
     `/oauth/authorize?${authorizationQuery().toString()}`,
     {
@@ -494,9 +504,9 @@ test("digest-listed OAuth grants cannot mint broader credentials", async () => {
   )
   expect(bootstrapResponse.status).toBe(401)
 
-  setInferenceCredentialDigests(undefined)
+  await setInferenceCredentialDigests(undefined)
   const code = await issueAuthorizationCode()
-  setInferenceCredentialDigests(sha256Hex(code))
+  await setInferenceCredentialDigests(sha256Hex(code))
 
   const codeResponse = await server.request("/v1/oauth/token", {
     method: "POST",
@@ -513,9 +523,9 @@ test("digest-listed OAuth grants cannot mint broader credentials", async () => {
   expect(codeResponse.status).toBe(400)
   expect(await codeResponse.json()).toEqual({ error: "invalid_grant" })
 
-  setInferenceCredentialDigests(undefined)
+  await setInferenceCredentialDigests(undefined)
   const tokens = await authorizeAndExchange()
-  setInferenceCredentialDigests(sha256Hex(tokens.refresh_token))
+  await setInferenceCredentialDigests(sha256Hex(tokens.refresh_token))
 
   const refreshResponse = await refreshOauthToken(tokens.refresh_token)
   expect(refreshResponse.status).toBe(400)
@@ -672,7 +682,23 @@ test("issues scoped opaque tokens and a distinct inference-only API key", async 
   })
   expect(oauthAdminResponse.status).toBe(401)
 
-  const persisted = await fs.readFile(oauthStorePath ?? "", "utf8")
+  const persisted = JSON.stringify(
+    await authFixture.storage.read(async (session) => {
+      const tables = [
+        "capi_oauth_codes",
+        "capi_oauth_access",
+        "capi_oauth_refresh",
+        "capi_oauth_families",
+        "capi_inference_credentials",
+      ]
+      const records = []
+      for (const table of tables)
+        records.push(
+          await session.query({ sql: `SELECT * FROM ${table}`, args: [] }),
+        )
+      return records
+    }),
+  )
   expect(persisted).not.toContain(tokens.access_token)
   expect(persisted).not.toContain(tokens.refresh_token)
   expect(persisted).not.toContain(rawKey)

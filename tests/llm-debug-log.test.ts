@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, expect, jest, test } from "bun:test"
+import { mkdir } from "node:fs/promises"
+import { resolve } from "node:path"
 
 import {
   abortLlmDebugLog,
@@ -10,17 +12,36 @@ import {
   listLlmDebugLogs,
   startLlmDebugLog,
 } from "../src/lib/llm-debug-log"
+import { LocalSqliteStorage } from "../src/lib/storage/local-sqlite"
+import { migrateStorage } from "../src/lib/storage/migrations"
+import {
+  createHistoryRuntime,
+  type HistoryRuntime,
+} from "../src/lib/telemetry-writer"
 
-beforeEach(() => {
-  clearLlmDebugLogs()
+let storage: LocalSqliteStorage
+let history: HistoryRuntime
+beforeEach(async () => {
+  const directory = resolve(
+    import.meta.dir,
+    "../.superpowers/test-data/debug-log",
+  )
+  await mkdir(directory, { recursive: true })
+  storage = new LocalSqliteStorage(
+    resolve(directory, `${crypto.randomUUID()}.sqlite`),
+  )
+  await migrateStorage(storage)
+  history = await createHistoryRuntime(storage, { autoFlush: false })
+  await clearLlmDebugLogs()
 })
 
-afterEach(() => {
-  clearLlmDebugLogs()
+afterEach(async () => {
   jest.useRealTimers()
+  await history.close(500)
+  await storage.close()
 })
 
-test("stores exact request and completed response details", () => {
+test("scrubs request and completed response credentials before storage", async () => {
   const startedAtMs = Date.now()
   const requestBody = `{"messages": [ {"role": "user", "content": "Find this request"} ], "api_key": "body-secret", "model": "gpt-test", "stream": false}`
   const responseBody = `{ "access_token": "response-secret", "ok": true }`
@@ -56,28 +77,37 @@ test("stores exact request and completed response details", () => {
     startedAtMs + 123,
   )
 
-  const list = listLlmDebugLogs()
+  const list = await listLlmDebugLogs()
   expect(list.count).toBe(1)
   expect(list.entries[0]?.model).toBe("gpt-test")
   expect(list.entries[0]?.requestPreview).toContain("Find this request")
   expect(list.entries[0]?.responsePreview).toContain("ok")
   expect(list.entries[0]?.durationMs).toBe(123)
 
-  const detail = getLlmDebugLog(id)
+  const detail = await getLlmDebugLog(id)
   expect(detail?.request).toMatchObject({
-    body: requestBody,
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "Find this request" }],
+      api_key: "[REDACTED]",
+      model: "gpt-test",
+      stream: false,
+    }),
     bodyBytes: new TextEncoder().encode(requestBody).byteLength,
-    headers: requestHeaders,
-    url,
+    headers: {
+      authorization: "[REDACTED]",
+      cookie: "[REDACTED]",
+      "x-api-key": "[REDACTED]",
+    },
+    url: "https://example.test/chat/completions?api_key=%5BREDACTED%5D",
   })
   expect(detail?.response).toMatchObject({
-    body: responseBody,
+    body: JSON.stringify({ access_token: "[REDACTED]", ok: true }),
     bodyBytes: new TextEncoder().encode(responseBody).byteLength,
-    headers: responseHeaders,
+    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
   })
 })
 
-test("classifies non-success upstream responses as errors", () => {
+test("classifies non-success upstream responses as errors", async () => {
   const id = startLlmDebugLog({
     method: "POST",
     path: "/responses",
@@ -95,11 +125,11 @@ test("classifies non-success upstream responses as errors", () => {
     statusText: "Bad Request",
   })
 
-  expect(getLlmDebugLog(id)?.status).toBe("error")
-  expect(listLlmDebugLogs().entries[0]?.status).toBe("error")
+  expect((await getLlmDebugLog(id))?.status).toBe("error")
+  expect((await listLlmDebugLogs()).entries[0]?.status).toBe("error")
 })
 
-test("stores exact session headers and nested structured request body", () => {
+test("scrubs session headers and nested structured request bodies", async () => {
   const rawIds = [
     "root-session-private",
     "root-thread-private",
@@ -138,12 +168,15 @@ test("stores exact session headers and nested structured request body", () => {
     url: "https://example.test/responses",
   })
 
-  const detail = getLlmDebugLog(id)
-  expect(detail?.request.body).toBe(requestBody)
-  expect(detail?.request.headers).toEqual(requestHeaders)
+  const detail = await getLlmDebugLog(id)
+  for (const value of rawIds)
+    expect(JSON.stringify(detail)).not.toContain(value)
+  for (const value of Object.values(requestHeaders))
+    expect(JSON.stringify(detail)).not.toContain(value)
+  expect(detail?.replayable).toBe(false)
 })
 
-test("stores non-JSON request bodies unchanged", () => {
+test("omits unsupported request bodies", async () => {
   const requestBody = "api_key=body-secret & keep = exact spacing"
   const id = startLlmDebugLog({
     method: "POST",
@@ -153,10 +186,13 @@ test("stores non-JSON request bodies unchanged", () => {
     url: "https://example.test/embeddings",
   })
 
-  expect(getLlmDebugLog(id)?.request.body).toBe(requestBody)
+  expect((await getLlmDebugLog(id))?.request).toMatchObject({
+    body: null,
+    omittedReason: "unsupported",
+  })
 })
 
-test("stores exact aborted response details and runtime error path", () => {
+test("scrubs aborted response details and runtime error URL", async () => {
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
     method: "POST",
@@ -189,16 +225,18 @@ test("stores exact aborted response details and runtime error path", () => {
     },
   })
 
-  const detail = getLlmDebugLog(id)
-  expect(detail?.error?.path).toBe(errorPath)
+  const detail = await getLlmDebugLog(id)
+  expect(detail?.error?.path).toBe(
+    "https://example.test/responses?token=%5BREDACTED%5D",
+  )
   expect(detail?.response).toMatchObject({
-    body: responseBody,
+    body: JSON.stringify({ refresh_token: "[REDACTED]" }),
     bodyBytes: new TextEncoder().encode(responseBody).byteLength,
-    headers: responseHeaders,
+    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
   })
 })
 
-test("returns defensive clones of raw entries", () => {
+test("returns independent sanitized entries", async () => {
   const requestBody = `{ "api_key": "request-secret" }`
   const responseBody = `{ "access_token": "response-secret" }`
   const id = startLlmDebugLog({
@@ -215,21 +253,25 @@ test("returns defensive clones of raw entries", () => {
     statusText: "OK",
   })
 
-  const firstRead = getLlmDebugLog(id)
+  const firstRead = await getLlmDebugLog(id)
   if (!firstRead?.response) throw new Error("Expected a completed debug entry")
   firstRead.request.body = "mutated"
   firstRead.request.headers.authorization = "mutated"
   firstRead.response.body = "mutated"
   firstRead.response.headers["set-cookie"] = "mutated"
 
-  const secondRead = getLlmDebugLog(id)
-  expect(secondRead?.request.body).toBe(requestBody)
-  expect(secondRead?.request.headers.authorization).toBe("Bearer raw-token")
-  expect(secondRead?.response?.body).toBe(responseBody)
-  expect(secondRead?.response?.headers["set-cookie"]).toBe("upstream=secret")
+  const secondRead = await getLlmDebugLog(id)
+  expect(secondRead?.request.body).toBe(
+    JSON.stringify({ api_key: "[REDACTED]" }),
+  )
+  expect(secondRead?.request.headers.authorization).toBe("[REDACTED]")
+  expect(secondRead?.response?.body).toBe(
+    JSON.stringify({ access_token: "[REDACTED]" }),
+  )
+  expect(secondRead?.response?.headers["set-cookie"]).toBe("[REDACTED]")
 })
 
-test("prunes entries older than the retention window", () => {
+test("prunes entries older than the retention window", async () => {
   const now = Date.now()
   const oldId = startLlmDebugLog({
     method: "POST",
@@ -253,13 +295,13 @@ test("prunes entries older than the retention window", () => {
     url: "https://example.test/responses",
   })
 
-  const list = listLlmDebugLogs()
+  const list = await listLlmDebugLogs()
   expect(list.count).toBe(1)
   expect(list.entries[0]?.id).toBe(freshId)
   expect(list.entries[0]?.model).toBe("fresh-model")
 })
 
-test("retains unsuccessful entries for one hour while successful entries expire after ten minutes", () => {
+test("retains unsuccessful entries for one hour while successful entries expire after ten minutes", async () => {
   jest.useFakeTimers()
   const startedAtMs = Date.UTC(2026, 7, 24)
   jest.setSystemTime(startedAtMs)
@@ -312,17 +354,15 @@ test("retains unsuccessful entries for one hour while successful entries expire 
 
   jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS + 1)
   expect(
-    listLlmDebugLogs()
-      .entries.map((entry) => entry.id)
-      .sort(),
+    (await listLlmDebugLogs()).entries.map((entry) => entry.id).sort(),
   ).toEqual([abortedId, erroredId, nonSuccessId].sort())
-  expect(getLlmDebugLog(completeId)).toBeUndefined()
+  expect(await getLlmDebugLog(completeId)).toBeUndefined()
 
   jest.setSystemTime(startedAtMs + 60 * 60 * 1000 + 1)
-  expect(listLlmDebugLogs().count).toBe(0)
+  expect((await listLlmDebugLogs()).count).toBe(0)
 })
 
-test("retains requests that become unsuccessful after ten minutes", () => {
+test("retains requests that become unsuccessful after ten minutes", async () => {
   jest.useFakeTimers()
   const startedAtMs = Date.UTC(2026, 7, 24)
   jest.setSystemTime(startedAtMs)
@@ -341,12 +381,12 @@ test("retains requests that become unsuccessful after ten minutes", () => {
     startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS + 1,
   )
 
-  expect(getLlmDebugLog(id)?.status).toBe("error")
+  expect((await getLlmDebugLog(id))?.status).toBe("error")
   jest.setSystemTime(startedAtMs + 60 * 60 * 1000 + 1)
-  expect(getLlmDebugLog(id)).toBeUndefined()
+  expect(await getLlmDebugLog(id)).toBeUndefined()
 })
 
-test("keeps timestamp ordering after a newer successful entry expires", () => {
+test("keeps timestamp ordering after a newer successful entry expires", async () => {
   jest.useFakeTimers()
   const startedAtMs = Date.UTC(2026, 7, 24)
   jest.setSystemTime(startedAtMs)
@@ -376,7 +416,7 @@ test("keeps timestamp ordering after a newer successful entry expires", () => {
   )
 
   jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS + 2)
-  expect(getLlmDebugLog(expiredSuccessId)).toBeUndefined()
+  expect(await getLlmDebugLog(expiredSuccessId)).toBeUndefined()
 
   const backdatedId = startLlmDebugLog({
     method: "POST",
@@ -387,13 +427,13 @@ test("keeps timestamp ordering after a newer successful entry expires", () => {
     url: "https://example.test/responses",
   })
 
-  expect(listLlmDebugLogs().entries.map((entry) => entry.id)).toEqual([
+  expect((await listLlmDebugLogs()).entries.map((entry) => entry.id)).toEqual([
     retainedErrorId,
     backdatedId,
   ])
 })
 
-test("retains complete previews inside the retention window", () => {
+test("retains complete previews inside the retention window", async () => {
   const longPrompt = "x".repeat(400)
   const id = startLlmDebugLog({
     method: "POST",
@@ -403,11 +443,13 @@ test("retains complete previews inside the retention window", () => {
     url: "https://example.test/responses",
   })
 
-  const entry = listLlmDebugLogs().entries.find((item) => item.id === id)
+  const entry = (await listLlmDebugLogs()).entries.find(
+    (item) => item.id === id,
+  )
   expect(entry?.requestPreview).toContain(longPrompt)
 })
 
-test("evicts expired entries while idle and releases the backing store", () => {
+test("cleanup removes expired durable entries", async () => {
   jest.useFakeTimers()
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
@@ -425,15 +467,16 @@ test("evicts expired entries while idle and releases the backing store", () => {
     statusText: "OK",
   })
 
-  jest.advanceTimersByTime(LLM_DEBUG_HISTORY_WINDOW_MS)
+  await history.writer.flush()
+  jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS)
+  await history.repository.prune(Date.now())
   jest.setSystemTime(startedAtMs)
 
-  // Moving the clock back proves the timer removed the entry; a read-time
-  // prune alone would keep it at this timestamp.
-  expect(listLlmDebugLogs().count).toBe(0)
+  // Moving the clock back proves cleanup removed the durable row.
+  expect((await listLlmDebugLogs()).count).toBe(0)
 })
 
-test("keeps aborted requests terminal when late response work finishes", () => {
+test("keeps aborted requests terminal when late response work finishes", async () => {
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
     method: "POST",
@@ -459,14 +502,14 @@ test("keeps aborted requests terminal when late response work finishes", () => {
   )
   failLlmDebugLog(id, new Error("late failure"), startedAtMs + 75)
 
-  const detail = getLlmDebugLog(id)
+  const detail = await getLlmDebugLog(id)
   expect(detail?.status).toBe("aborted")
   expect(detail?.durationMs).toBe(25)
   expect(detail?.error?.name).toBe("AbortError")
   expect(detail?.response).toBeUndefined()
 })
 
-test("does not let an abort overwrite a completed request", () => {
+test("does not let an abort overwrite a completed request", async () => {
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
     method: "POST",
@@ -491,6 +534,6 @@ test("does not let an abort overwrite a completed request", () => {
     endedAtMs: startedAtMs + 20,
   })
 
-  expect(getLlmDebugLog(id)?.status).toBe("complete")
-  expect(getLlmDebugLog(id)?.durationMs).toBe(10)
+  expect((await getLlmDebugLog(id))?.status).toBe("complete")
+  expect((await getLlmDebugLog(id))?.durationMs).toBe(10)
 })

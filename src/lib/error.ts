@@ -19,6 +19,12 @@ import {
   isProxyObject,
   snapshotPlainDataRecord,
 } from "~/lib/plain-data-snapshot"
+import {
+  StorageCommitUnknownError,
+  StorageConflictError,
+  StorageSchemaError,
+  StorageUnavailableError,
+} from "~/lib/storage/errors"
 import { collectSafeCopilotResponseHeaders } from "~/services/copilot/copilot-contract"
 
 const ABORT_ERROR_DESCRIPTOR_KEYS = new Set(["name"])
@@ -979,6 +985,37 @@ async function forwardHttpError(c: Context, error: HTTPError) {
 }
 
 export async function forwardError(c: Context, error: unknown) {
+  if (
+    !isProxyObject(error)
+    && (error instanceof StorageUnavailableError
+      || error instanceof StorageCommitUnknownError
+      || error instanceof StorageSchemaError
+      || error instanceof StorageConflictError)
+  ) {
+    c.header("Cache-Control", "no-store")
+    const conflict = error instanceof StorageConflictError
+    const unknownCommit = error instanceof StorageCommitUnknownError
+    let code = "storage_unavailable"
+    let message = "Database storage is temporarily unavailable."
+    if (conflict) {
+      code = "storage_conflict"
+      message = "Stored state changed. Reload and try again."
+    } else if (unknownCommit) {
+      code = "storage_commit_unknown"
+      message =
+        "The save outcome could not be confirmed. Reload before making further changes."
+    }
+    return c.json(
+      {
+        error: {
+          code,
+          message,
+          type: "server_error",
+        },
+      },
+      conflict ? 409 : 503,
+    )
+  }
   // Client disconnected — nothing to send back, don't log as error
   if (isAbortError(error)) {
     consola.debug("Client disconnected (AbortError)")

@@ -154,12 +154,16 @@ dashboardAuthRoutes.post("/setup", async (c) => {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return c.json({ error: "Invalid request" }, 400)
   }
-  const { gatewayKey, password } = body as Record<string, unknown>
-  if (typeof gatewayKey !== "string" || typeof password !== "string") {
+  const { gatewayKey, password, setupCode } = body as Record<string, unknown>
+  if (
+    typeof gatewayKey !== "string"
+    || typeof password !== "string"
+    || typeof setupCode !== "string"
+  ) {
     if (clientIp !== null) recordFailedAttempt(clientIp)
     return c.json({ error: "Invalid request" }, 400)
   }
-  const result = await setupAdminAuth(gatewayKey, password)
+  const result = await setupAdminAuth(gatewayKey, password, setupCode)
   if ("error" in result) {
     if (result.error === "Authentication failed" && clientIp !== null) {
       recordFailedAttempt(clientIp)

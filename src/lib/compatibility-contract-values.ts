@@ -42,7 +42,7 @@ export const STREAM_BEHAVIOR_CONTRACT = [
 export const SESSION_TOKEN_PRIVACY_CONTRACT = [
   {
     surface: "Administrator-only LLM Debug",
-    behavior: "exact forwarded token may be captured",
+    behavior: "session token value is redacted",
   },
   {
     surface: "Ordinary handler logs",

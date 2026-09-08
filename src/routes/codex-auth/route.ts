@@ -82,7 +82,7 @@ codexAuthRoutes.post("/refresh", async (c) => {
   }
 
   const jwt = parseCodexDesktopRefreshToken(body.refresh_token)
-  if (!jwt || !trustedJwtDigestStore.findEnabledCredential(jwt)) {
+  if (!jwt || !(await trustedJwtDigestStore.findEnabledCredential(jwt))) {
     setNoStoreHeaders(c)
     return c.json(
       {

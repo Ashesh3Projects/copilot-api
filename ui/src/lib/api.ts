@@ -52,14 +52,23 @@ async function extractErrorMessage(
   return fallback
 }
 
+export interface MutationOptions {
+  expectedRevision?: number
+  operationId?: string
+}
+// eslint-disable-next-line max-params -- Optional revision and operation metadata are independent from the request body.
 export async function api<T>(
   method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
+  mutation?: MutationOptions,
 ): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers["content-type"] = "application/json"
   if (!["GET"].includes(method)) {
+    headers["idempotency-key"] = mutation?.operationId ?? crypto.randomUUID()
+    if (mutation?.expectedRevision !== undefined)
+      headers["if-match"] = JSON.stringify(String(mutation.expectedRevision))
     const csrfToken = getCookie("__Host-copilot_admin_csrf")
     if (csrfToken) headers["x-copilot-csrf"] = csrfToken
   }

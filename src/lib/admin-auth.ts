@@ -1,5 +1,17 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import fs from "node:fs/promises"
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto"
+
+import {
+  createAdminRepository,
+  type AdminSessionRecord,
+} from "~/lib/storage/admin-repository"
+import { credentialDigest } from "~/lib/storage/credentials-repository"
+import { StorageConflictError, StorageSchemaError } from "~/lib/storage/errors"
+import { getStorageRuntime } from "~/lib/storage/runtime"
 
 import {
   isConfiguredInferenceCredential,
@@ -8,16 +20,14 @@ import {
   resolveRequestCredentialKind,
 } from "./credential-resolver"
 import { extractClientIpFromHeaders, isIpBlocked } from "./ip-blocker"
-import { PATHS } from "./paths"
-import { getActiveApiKeys } from "./request-auth"
+import { hasActiveGatewayCredentials } from "./request-auth"
 
 export const ADMIN_SESSION_COOKIE = "__Host-copilot_admin"
 export const ADMIN_CSRF_COOKIE = "__Host-copilot_admin_csrf"
 export const ADMIN_PASSWORD_MIN_LENGTH = 4
 export const ADMIN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
-
+export const ADMIN_SETUP_CODE_TTL_MS = 15 * 60 * 1000
 const LAST_SEEN_WRITE_INTERVAL_MS = 5 * 60 * 1000
-const ENV_ADMIN_SESSION_VERSION_PREFIX = "env:"
 const ARGON2ID_HASH_PATTERN =
   /^\$argon2id\$v=19\$m=(\d+),t=(\d+),p=(\d+)\$([A-Za-z0-9+/]+)\$([A-Za-z0-9+/]+)$/
 const ARGON2ID_MIN_MEMORY_COST = 65_536
@@ -29,109 +39,73 @@ const ARGON2ID_MAX_PARALLELISM = 16
 const ARGON2ID_MIN_SALT_BYTES = 16
 const ARGON2ID_MIN_HASH_BYTES = 32
 
-type AdminSessionVersion =
-  | number
-  | `${typeof ENV_ADMIN_SESSION_VERSION_PREFIX}${string}`
-
-interface LocalAdminAuthData {
-  passwordHash: string
-  sessionVersion: number
-  createdAt: number
-  updatedAt: number
-}
-
-interface EnvironmentAdminAuthData {
-  source: "environment"
-  credentialFingerprint: string
-  sessionVersion: number
-  createdAt: number
-  updatedAt: number
-}
-
-type AdminAuthData = EnvironmentAdminAuthData | LocalAdminAuthData
-
-interface AdminSessionRecord {
-  tokenHash: string
-  csrfHash: string
-  sessionVersion: AdminSessionVersion
-  createdAt: number
-  lastSeenAt: number
-  expiresAt: number
-}
-
-interface AdminSessionsData {
-  sessions: Array<AdminSessionRecord>
-}
-
 export interface CreatedAdminSession {
   token: string
   csrfToken: string
   expiresAt: number
 }
-
 export interface AuthenticatedAdminSession {
   tokenHash: string
   csrfToken: string
   expiresAt: number
 }
-
 export interface AdminAuthClock {
   now(): number
 }
-
-type ChangeAdminPasswordError =
-  | { error: string; reason: "credential" }
-  | { error: string; reason: "managed" }
-  | { error: string; reason: "session" }
-  | { error: string; reason: "validation" }
-
-interface EffectiveAdminCredential {
-  passwordHash: string
-  sessionVersion: AdminSessionVersion
-  source: "environment" | "local"
+type ChangeAdminPasswordError = {
+  error: string
+  reason: "credential" | "managed" | "session" | "validation"
 }
-
-let authData: AdminAuthData | null | undefined
-let sessionsData: AdminSessionsData | undefined
-let writeQueue: Promise<void> = Promise.resolve()
-let authMutationQueue: Promise<void> = Promise.resolve()
-let inMemoryTestMode = false
 let clock: AdminAuthClock = { now: () => Date.now() }
-
-function noop(): void {}
-
-async function serializeAuthMutation<T>(
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = authMutationQueue
-  let release = noop
-  authMutationQueue = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  await previous
-  try {
-    return await operation()
-  } finally {
-    release()
-  }
-}
-
-function digest(value: string): string {
-  return createHash("sha256").update(value).digest("base64url")
-}
-
-function randomToken(): string {
-  return randomBytes(32).toString("base64url")
-}
-
 function now(): number {
   return clock.now()
 }
-
+function repository() {
+  return createAdminRepository(getStorageRuntime().storage)
+}
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("base64url")
+}
+function randomToken(): string {
+  return randomBytes(32).toString("base64url")
+}
 function safeEqual(left: string, right: string): boolean {
-  const leftDigest = createHash("sha256").update(left).digest()
-  const rightDigest = createHash("sha256").update(right).digest()
-  return timingSafeEqual(leftDigest, rightDigest)
+  return timingSafeEqual(
+    createHash("sha256").update(left).digest(),
+    createHash("sha256").update(right).digest(),
+  )
+}
+function validatePassword(password: string): string | null {
+  return password.length < ADMIN_PASSWORD_MIN_LENGTH ?
+      `Admin password must be at least ${ADMIN_PASSWORD_MIN_LENGTH} characters`
+    : null
+}
+function hashPassword(password: string): Promise<string> {
+  return Bun.password.hash(password, {
+    algorithm: "argon2id",
+    memoryCost: 65_536,
+    timeCost: 3,
+  })
+}
+function newSession(version: number): {
+  session: CreatedAdminSession
+  record: AdminSessionRecord
+} {
+  const token = randomToken(),
+    csrfToken = randomToken(),
+    currentTime = now()
+  const expiresAt = currentTime + ADMIN_SESSION_TTL_MS
+  return {
+    session: { token, csrfToken, expiresAt },
+    record: {
+      tokenHash: digest(token),
+      csrfHash: digest(csrfToken),
+      sessionVersion: version,
+      createdAt: currentTime,
+      lastSeenAt: currentTime,
+      expiresAt,
+    },
+  }
 }
 
 export function validateAdminPasswordHash(hash: string): string {
@@ -177,335 +151,116 @@ function decodeCanonicalBase64(value: string): number {
   return decoded.byteLength
 }
 
-function getEnvironmentAdminPasswordHash(): string | null {
-  const configured = process.env.COPILOT_ADMIN_PASSWORD_HASH?.trim()
-  if (!configured) return null
-
-  try {
-    return validateAdminPasswordHash(configured)
-  } catch (error) {
-    throw new Error(
-      `COPILOT_ADMIN_PASSWORD_HASH: ${error instanceof Error ? error.message : String(error)}`,
-      { cause: error },
-    )
-  }
-}
-
-async function getEffectiveAdminCredential(): Promise<EffectiveAdminCredential | null> {
-  const environmentHash = getEnvironmentAdminPasswordHash()
-  if (environmentHash) {
-    return {
-      passwordHash: environmentHash,
-      sessionVersion: `${ENV_ADMIN_SESSION_VERSION_PREFIX}${digest(environmentHash)}`,
-      source: "environment",
-    }
-  }
-  const local = await loadAuthData()
-  if (!local) return null
-  if (isEnvironmentAdminAuthData(local)) {
-    throw new Error(
-      "COPILOT_ADMIN_PASSWORD_HASH is required because administrator authentication is environment-managed",
-    )
-  }
-  return {
-    passwordHash: local.passwordHash,
-    sessionVersion: local.sessionVersion,
-    source: "local",
-  }
-}
-
-async function readJson<T>(filePath: string): Promise<T | null> {
-  try {
-    return JSON.parse((await fs.readFile(filePath)).toString("utf8")) as T
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
-    throw error
-  }
-}
-
-async function atomicWrite(filePath: string, value: unknown): Promise<void> {
-  if (inMemoryTestMode) return
-  await fs.mkdir(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-  await fs.chmod(PATHS.APP_DIR, 0o700).catch(() => undefined)
-  const tempPath = `${filePath}.${process.pid}.${randomToken()}.tmp`
-  try {
-    await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    })
-    await fs.chmod(tempPath, 0o600)
-    await fs.rename(tempPath, filePath)
-    await fs.chmod(filePath, 0o600).catch(() => undefined)
-  } catch (error) {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined)
-    throw error
-  }
-}
-
-function enqueueWrite(filePath: string, value: unknown): Promise<void> {
-  const snapshot = structuredClone(value)
-  writeQueue = writeQueue.then(() => atomicWrite(filePath, snapshot))
-  return writeQueue
-}
-
-async function loadAuthData(): Promise<AdminAuthData | null> {
-  if (authData !== undefined) return authData
-  const loaded = await readJson<AdminAuthData>(PATHS.ADMIN_AUTH_PATH)
-  if (loaded === null) {
-    // eslint-disable-next-line require-atomic-updates
-    authData = null
-    return authData
-  }
-  if (
-    !Number.isInteger(loaded.sessionVersion)
-    || loaded.sessionVersion <= 0
-    || !Number.isFinite(loaded.createdAt)
-    || !Number.isFinite(loaded.updatedAt)
-    || (isEnvironmentAdminAuthData(loaded)
-      && !/^[\w-]{43}$/.test(loaded.credentialFingerprint))
-    || (!isEnvironmentAdminAuthData(loaded)
-      && typeof loaded.passwordHash !== "string")
-  ) {
-    throw new Error("Invalid administrator authentication store")
-  }
-  // eslint-disable-next-line require-atomic-updates
-  authData = loaded
-  return authData
-}
-
-function isEnvironmentAdminAuthData(
-  value: AdminAuthData,
-): value is EnvironmentAdminAuthData {
-  return "source" in value && "credentialFingerprint" in value
-}
-
-async function loadSessionsData(): Promise<AdminSessionsData> {
-  if (sessionsData !== undefined) return sessionsData
-  const loaded = await readJson<AdminSessionsData>(PATHS.ADMIN_SESSIONS_PATH)
-  if (loaded !== null && !Array.isArray(loaded.sessions)) {
-    throw new Error("Invalid administrator session store")
-  }
-  // eslint-disable-next-line require-atomic-updates
-  sessionsData = {
-    sessions: (loaded?.sessions ?? [])
-      .filter((session) => isSession(session))
-      .sort((a, b) => b.lastSeenAt - a.lastSeenAt),
-  }
-  return sessionsData
-}
-
-function isSession(value: unknown): value is AdminSessionRecord {
-  if (typeof value !== "object" || value === null) return false
-  const record = value as Partial<AdminSessionRecord>
-  return (
-    typeof record.tokenHash === "string"
-    && typeof record.csrfHash === "string"
-    && isAdminSessionVersion(record.sessionVersion)
-    && typeof record.createdAt === "number"
-    && typeof record.lastSeenAt === "number"
-    && typeof record.expiresAt === "number"
-  )
-}
-
-function isAdminSessionVersion(value: unknown): value is AdminSessionVersion {
-  return (
-    (Number.isInteger(value) && (value as number) > 0)
-    || (typeof value === "string" && /^env:[\w-]{43}$/.test(value))
-  )
-}
-
-function validatePassword(password: string): string | null {
-  if (password.length < ADMIN_PASSWORD_MIN_LENGTH) {
-    return `Admin password must be at least ${ADMIN_PASSWORD_MIN_LENGTH} characters`
-  }
-  return null
-}
-
-function gatewayKeyMatches(candidate: string): boolean {
-  return resolveGatewayCredential(candidate) !== null
-}
-
 export async function getAdminAuthStatus(): Promise<{
   configured: boolean
   gatewayConfigured: boolean
   passwordManagedExternally: boolean
 }> {
-  const credential = await getEffectiveAdminCredential()
+  const [admin, gatewayConfigured] = await Promise.all([
+    repository().get(),
+    hasActiveGatewayCredentials(),
+  ])
   return {
-    configured: credential !== null,
-    gatewayConfigured: getActiveApiKeys().length > 0,
-    passwordManagedExternally: credential?.source === "environment",
+    configured: admin !== null,
+    gatewayConfigured,
+    passwordManagedExternally: false,
   }
 }
-
 export async function initializeAdminAuth(): Promise<void> {
-  await serializeAuthMutation(async () => {
-    const environmentHash = getEnvironmentAdminPasswordHash()
-    const existing = await loadAuthData()
-    if (!environmentHash) {
-      if (existing && isEnvironmentAdminAuthData(existing)) {
-        throw new Error(
-          "COPILOT_ADMIN_PASSWORD_HASH is required because administrator authentication is environment-managed",
-        )
-      }
-      return
-    }
-    const credentialFingerprint = digest(environmentHash)
-    if (
-      existing
-      && isEnvironmentAdminAuthData(existing)
-      && safeEqual(existing.credentialFingerprint, credentialFingerprint)
-    ) {
-      return
-    }
-
-    await persistEnvironmentAdminAuth(existing, credentialFingerprint)
+  const admin = await repository().get()
+  if (admin) validateAdminPasswordHash(admin.passwordHash)
+}
+export async function issueAdminSetupCode(): Promise<{
+  code: string
+  expiresAt: number
+}> {
+  const code = randomToken(),
+    currentTime = now(),
+    expiresAt = currentTime + ADMIN_SETUP_CODE_TTL_MS
+  await repository().issueSetupCode({
+    digest: digest(code),
+    now: currentTime,
+    expiresAt,
   })
+  return { code, expiresAt }
 }
-
-async function ensureEnvironmentAdminAuthInitialized(
-  credentialFingerprint: string,
-): Promise<void> {
-  const existing = await loadAuthData()
-  if (
-    existing
-    && isEnvironmentAdminAuthData(existing)
-    && safeEqual(existing.credentialFingerprint, credentialFingerprint)
-  ) {
-    return
-  }
-
-  await serializeAuthMutation(async () => {
-    const current = await loadAuthData()
-    if (
-      current
-      && isEnvironmentAdminAuthData(current)
-      && safeEqual(current.credentialFingerprint, credentialFingerprint)
-    ) {
-      return
-    }
-    await persistEnvironmentAdminAuth(current, credentialFingerprint)
-  })
-}
-
-async function persistEnvironmentAdminAuth(
-  existing: AdminAuthData | null,
-  credentialFingerprint: string,
-): Promise<void> {
-  const currentTime = now()
-  authData = {
-    source: "environment",
-    credentialFingerprint,
-    sessionVersion: (existing?.sessionVersion ?? 0) + 1,
-    createdAt: existing?.createdAt ?? currentTime,
-    updatedAt: currentTime,
-  }
-  sessionsData = { sessions: [] }
-  await enqueueWrite(PATHS.ADMIN_AUTH_PATH, authData)
-  await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, sessionsData)
-}
-
 export async function setupAdminAuth(
   gatewayKey: string,
   password: string,
+  setupCode?: string,
 ): Promise<{ session: CreatedAdminSession } | { error: string }> {
-  return await serializeAuthMutation(async () => {
-    if ((await getEffectiveAdminCredential()) !== null) {
-      return { error: "Administrator authentication is already configured" }
-    }
-    if (!gatewayKeyMatches(gatewayKey)) {
-      return { error: "Authentication failed" }
-    }
-    const passwordError = validatePassword(password)
-    if (passwordError) return { error: passwordError }
-
-    const currentTime = now()
-    authData = {
-      passwordHash: await Bun.password.hash(password, {
-        algorithm: "argon2id",
-        memoryCost: 65_536,
-        timeCost: 3,
-      }),
-      sessionVersion: 1,
-      createdAt: currentTime,
-      updatedAt: currentTime,
-    }
-    await enqueueWrite(PATHS.ADMIN_AUTH_PATH, authData)
-    return { session: await createAdminSession() }
+  if (await repository().get())
+    return { error: "Administrator authentication is already configured" }
+  if (
+    !setupCode
+    || !gatewayKey.trim()
+    || safeEqual(gatewayKey.trim(), setupCode)
+    || (await isConfiguredInferenceCredential(gatewayKey.trim()))
+  )
+    return { error: "Authentication failed" }
+  const error = validatePassword(password)
+  if (error) return { error }
+  const passwordHash = await hashPassword(password)
+  const created = newSession(1)
+  const result = await repository().setup({
+    codeDigest: digest(setupCode),
+    passwordHash,
+    gateway: {
+      id: randomUUID(),
+      digest: credentialDigest(gatewayKey.trim()),
+      label: "Initial gateway key",
+      createdAt: created.record.createdAt,
+    },
+    session: created.record,
   })
+  if (result !== "ok")
+    return {
+      error:
+        result === "configured" ?
+          "Administrator authentication is already configured"
+        : "Authentication failed",
+    }
+  return { session: created.session }
 }
-
-async function verifyPassword(password: string): Promise<boolean> {
-  const current = await getEffectiveAdminCredential()
-  if (!current) {
-    await Bun.password.hash(password || "invalid-admin-password", {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    })
+async function verifyPassword(
+  password: string,
+  passwordHash?: string,
+): Promise<boolean> {
+  if (!passwordHash) {
+    await hashPassword(password || "invalid-admin-password")
     return false
   }
   try {
-    return await Bun.password.verify(password, current.passwordHash)
+    validateAdminPasswordHash(passwordHash)
   } catch {
-    return false
+    throw new StorageSchemaError("Invalid administrator password verifier")
   }
+  return Bun.password.verify(password, passwordHash)
 }
-
 export async function loginAdmin(
   gatewayKey: string,
   password: string,
 ): Promise<CreatedAdminSession | null> {
-  const [validPassword] = await Promise.all([verifyPassword(password)])
+  const admin = await repository().get()
+  const validPassword = await verifyPassword(password, admin?.passwordHash)
   if (
-    !gatewayKeyMatches(gatewayKey)
+    !admin
     || !validPassword
-    || validatePassword(password) !== null
-  ) {
-    return null
-  }
-  const environmentHash = getEnvironmentAdminPasswordHash()
-  if (environmentHash) {
-    await ensureEnvironmentAdminAuthInitialized(digest(environmentHash))
-  }
-  return await serializeAuthMutation(async () => await createAdminSession())
-}
-
-async function createAdminSession(): Promise<CreatedAdminSession> {
-  const current = await getEffectiveAdminCredential()
-  if (!current)
-    throw new Error("Administrator authentication is not configured")
-  const data = await loadSessionsData()
-  const currentTime = now()
-  pruneSessions(data, current.sessionVersion, currentTime)
-
-  const token = randomToken()
-  const csrfToken = randomToken()
-  const record: AdminSessionRecord = {
-    tokenHash: digest(token),
-    csrfHash: digest(csrfToken),
-    sessionVersion: current.sessionVersion,
-    createdAt: currentTime,
-    lastSeenAt: currentTime,
-    expiresAt: currentTime + ADMIN_SESSION_TTL_MS,
-  }
-  data.sessions.push(record)
-  data.sessions.sort((a, b) => b.lastSeenAt - a.lastSeenAt)
-  sessionsData = data
-  await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, data)
-  return { token, csrfToken, expiresAt: record.expiresAt }
-}
-
-function pruneSessions(
-  data: AdminSessionsData,
-  version: AdminSessionVersion,
-  now: number,
-): boolean {
-  const before = data.sessions.length
-  data.sessions = data.sessions.filter(
-    (session) => session.sessionVersion === version && session.expiresAt > now,
+    || validatePassword(password)
+    || !(await resolveGatewayCredential(gatewayKey))
   )
-  return data.sessions.length !== before
+    return null
+  const created = newSession(admin.sessionVersion)
+  return (
+      (await repository().createSession({
+        admin,
+        gatewayDigest: credentialDigest(gatewayKey.trim()),
+        gatewayLiteral: gatewayKey.trim(),
+        session: created.record,
+      }))
+    ) ?
+      created.session
+    : null
 }
 
 function parseCookieHeader(header: string | null): Record<string, string> {
@@ -524,41 +279,18 @@ function parseCookieHeader(header: string | null): Record<string, string> {
   return cookies
 }
 
-function resolveAdminSessionToken(
-  cookies: Readonly<Record<string, string>>,
-): string | null {
-  const token = cookies[ADMIN_SESSION_COOKIE]
-  return token && !isConfiguredInferenceCredential(token) ? token : null
-}
-
-// Authentication deliberately evaluates cookie, CSRF, origin, expiry, and
-// session version in one place.
-
 async function resolveAdminSession(
   request: Request,
   options: { requireCsrf?: boolean } = {},
 ): Promise<AuthenticatedAdminSession | null> {
-  const current = await getEffectiveAdminCredential()
-  if (!current) return null
-  const data = await loadSessionsData()
-  const currentTime = now()
-  const pruned = pruneSessions(data, current.sessionVersion, currentTime)
   const cookies = parseCookieHeader(request.headers.get("cookie"))
-  const token = resolveAdminSessionToken(cookies)
-  if (!token) {
-    if (pruned) await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, data)
-    return null
-  }
+  const token = cookies[ADMIN_SESSION_COOKIE]
+  if (!token || (await isConfiguredInferenceCredential(token))) return null
+  const currentTime = now()
   const tokenHash = digest(token)
-  const session = data.sessions.find((entry) =>
-    safeEqual(entry.tokenHash, tokenHash),
-  )
-  if (!session) {
-    if (pruned) await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, data)
-    return null
-  }
-
-  const csrfToken = cookies[ADMIN_CSRF_COOKIE]
+  const session = await repository().session(tokenHash, currentTime)
+  if (!session) return null
+  const csrfToken = cookies[ADMIN_CSRF_COOKIE] ?? ""
   if (options.requireCsrf) {
     const supplied = request.headers.get("x-copilot-csrf")
     if (
@@ -567,52 +299,40 @@ async function resolveAdminSession(
       || !safeEqual(csrfToken, supplied)
       || !safeEqual(digest(supplied), session.csrfHash)
       || !isAllowedAdminOrigin(request.headers.get("origin"))
-    ) {
+    )
       return null
-    }
   }
-  const shouldPersist =
+  if (
     currentTime - session.lastSeenAt >= LAST_SEEN_WRITE_INTERVAL_MS
-  session.expiresAt = currentTime + ADMIN_SESSION_TTL_MS
-  if (shouldPersist) session.lastSeenAt = currentTime
-  if (pruned || shouldPersist) {
-    sessionsData = data
-    await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, data)
-  }
-  return {
-    tokenHash,
-    csrfToken,
-    expiresAt: session.expiresAt,
-  }
+    && !(await repository().refreshSession(
+      session,
+      currentTime,
+      ADMIN_SESSION_TTL_MS,
+    ))
+  )
+    return null
+  return { tokenHash, csrfToken, expiresAt: currentTime + ADMIN_SESSION_TTL_MS }
 }
-
 export async function authenticateAdminRequest(
   request: Request,
   options: { requireCsrf?: boolean } = {},
 ): Promise<AuthenticatedAdminSession | null> {
   const clientIp = extractClientIpFromHeaders(request.headers)
   if (clientIp !== null && isIpBlocked(clientIp)) return null
-
-  const credential = await resolveRequestCredentialKind(request, "admin", {
-    requireCsrf: options.requireCsrf,
-  })
-  const tokenHash = credential?.metadata?.tokenHash
-  const csrfToken = credential?.metadata?.csrfToken
-  const expiresAt = credential?.metadata?.expiresAt
-  if (
-    typeof tokenHash !== "string"
-    || typeof csrfToken !== "string"
-    || typeof expiresAt !== "number"
-  ) {
-    return null
-  }
-  return {
-    tokenHash,
-    csrfToken,
-    expiresAt,
-  }
+  const credential = await resolveRequestCredentialKind(
+    request,
+    "admin",
+    options,
+  )
+  const { tokenHash, csrfToken, expiresAt } = credential?.metadata ?? {}
+  return (
+      typeof tokenHash === "string"
+        && typeof csrfToken === "string"
+        && typeof expiresAt === "number"
+    ) ?
+      { tokenHash, csrfToken, expiresAt }
+    : null
 }
-
 export function isAllowedAdminOrigin(origin: string | null): boolean {
   if (!origin) return false
   const configured = process.env.COPILOT_ADMIN_ORIGIN?.trim()
@@ -629,91 +349,61 @@ export function isAllowedAdminOrigin(origin: string | null): boolean {
 }
 
 export async function logoutAdmin(request: Request): Promise<void> {
-  await serializeAuthMutation(async () => {
-    const session = await authenticateAdminRequest(request, {
-      requireCsrf: true,
-    })
-    if (!session) return
-    const data = await loadSessionsData()
-    data.sessions = data.sessions.filter(
-      (entry) => !safeEqual(entry.tokenHash, session.tokenHash),
-    )
-    sessionsData = data
-    await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, data)
-  })
+  const session = await authenticateAdminRequest(request, { requireCsrf: true })
+  if (session) await repository().logout(session.tokenHash)
 }
-
 export async function changeAdminPassword(
   request: Request,
   currentPassword: string,
   newPassword: string,
 ): Promise<CreatedAdminSession | ChangeAdminPasswordError> {
-  return await serializeAuthMutation(async () => {
-    const session = await authenticateAdminRequest(request, {
-      requireCsrf: true,
-    })
-    if (!session) {
-      return { error: "Authentication failed", reason: "session" }
-    }
-    if (!(await verifyPassword(currentPassword))) {
-      return { error: "Authentication failed", reason: "credential" }
-    }
-    const effective = await getEffectiveAdminCredential()
-    if (effective?.source === "environment") {
-      return {
-        error:
-          "Administrator password is managed by COPILOT_ADMIN_PASSWORD_HASH",
-        reason: "managed",
-      }
-    }
-    const passwordError = validatePassword(newPassword)
-    if (passwordError) {
-      return { error: passwordError, reason: "validation" }
-    }
-    const current = await loadAuthData()
-    if (!current || isEnvironmentAdminAuthData(current)) {
-      return { error: "Authentication failed", reason: "session" }
-    }
-    current.passwordHash = await Bun.password.hash(newPassword, {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    })
-    current.sessionVersion += 1
-    current.updatedAt = now()
-    authData = current
-    sessionsData = { sessions: [] }
-    await enqueueWrite(PATHS.ADMIN_AUTH_PATH, current)
-    await enqueueWrite(PATHS.ADMIN_SESSIONS_PATH, sessionsData)
-    return await createAdminSession()
+  const session = await authenticateAdminRequest(request, { requireCsrf: true })
+  if (!session) return { error: "Authentication failed", reason: "session" }
+  const admin = await repository().get()
+  if (!admin || !(await verifyPassword(currentPassword, admin.passwordHash)))
+    return { error: "Authentication failed", reason: "credential" }
+  const error = validatePassword(newPassword)
+  if (error) return { error, reason: "validation" }
+  const passwordHash = await hashPassword(newPassword)
+  const created = newSession(admin.sessionVersion + 1)
+  const changed = await repository().changePassword({
+    expected: admin,
+    passwordHash,
+    tokenHash: session.tokenHash,
+    now: created.record.createdAt,
+    replacement: created.record,
   })
+  return changed ?
+      created.session
+    : { error: "Authentication failed", reason: "session" }
 }
-
-export async function resetAdminAuth(): Promise<void> {
-  await serializeAuthMutation(async () => {
-    authData = null
-    sessionsData = { sessions: [] }
-    if (inMemoryTestMode) return
-    await Promise.all([
-      fs.rm(PATHS.ADMIN_AUTH_PATH, { force: true }),
-      fs.rm(PATHS.ADMIN_SESSIONS_PATH, { force: true }),
-    ])
-  })
+export async function resetAdminPassword(password: string): Promise<void> {
+  const error = validatePassword(password)
+  if (error) throw new StorageConflictError(error)
+  const admin = await repository().get()
+  if (!admin)
+    throw new StorageConflictError(
+      "Administrator authentication is not configured; use --setup-code",
+    )
+  const passwordHash = await hashPassword(password)
+  if (
+    !(await repository().changePassword({
+      expected: admin,
+      passwordHash,
+      now: now(),
+    }))
+  )
+    throw new StorageConflictError(
+      "Administrator authentication changed; retry the reset",
+    )
 }
-
-export function setAdminAuthTestMode(enabled: boolean): void {
-  inMemoryTestMode = enabled
-  authData = null
-  sessionsData = { sessions: [] }
-  writeQueue = Promise.resolve()
-  authMutationQueue = Promise.resolve()
-  clock = { now: () => Date.now() }
+/** Retained only for existing tests; storage is always explicitly initialized by fixtures. */
+export function setAdminAuthTestMode(_enabled: boolean): void {
+  setAdminAuthClockForTest()
 }
-
 export function setAdminAuthClockForTest(testClock?: AdminAuthClock): void {
   clock = testClock ?? { now: () => Date.now() }
 }
-
 registerCredentialProvider("admin", async (request, context) => {
   const session = await resolveAdminSession(request, {
     requireCsrf: context.requireCsrf,

@@ -18,6 +18,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalModels = state.models
 const encoder = new TextEncoder()
@@ -549,11 +557,16 @@ function installModel(endpoint: "/responses" | "/chat/completions"): void {
 
 function postResponses(extra: Record<string, unknown>): Promise<Response> {
   return Promise.resolve(
-    server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "route-model", ...extra }),
-    }),
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "route-model", ...extra }),
+      }),
+    ),
   )
 }
 

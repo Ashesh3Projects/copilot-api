@@ -9,6 +9,9 @@ import {
   streamChatCompletionsAsResponses,
   useFunctionApplyPatch,
 } from "../src/routes/responses/handler"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 function chatStream(
   chunks: Array<Record<string, unknown> | "[DONE]">,

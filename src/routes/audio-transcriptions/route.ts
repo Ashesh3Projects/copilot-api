@@ -1,6 +1,7 @@
 import { Hono, type HonoRequest } from "hono"
 
 import { getConfig } from "~/lib/config"
+import { getGroqApiKey } from "~/lib/custom-providers"
 import { createProxyResponseHeaders } from "~/lib/proxy-http"
 import { setRequestContext } from "~/lib/request-logger"
 import {
@@ -307,8 +308,8 @@ async function fetchGroqTranscription(options: {
 
 audioTranscriptionRoutes.post("/", async (c) => {
   const config = getConfig()
-  const apiKey = config.groqApiKey ?? process.env.GROQ_API_KEY
-  if (!apiKey) return serverError("GROQ_API_KEY is not configured", null)
+  const apiKey = getGroqApiKey()
+  if (!apiKey) return serverError("Groq API key is not configured", null)
 
   const prepared = await prepareTranscriptionRequest(c.req, config.groqModel)
   if (prepared instanceof Response) return prepared

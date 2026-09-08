@@ -29,6 +29,10 @@ import { handleWithChatCompletions } from "~/routes/google-ai/handler"
 import { handleWithResponsesApi } from "~/routes/google-ai/handler"
 import { adaptGoogleToChatCandidate } from "~/routes/google-ai/request-translation"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const model = {
   id: "test-model",
   name: "test-model",

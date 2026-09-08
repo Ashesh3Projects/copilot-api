@@ -18,6 +18,7 @@ import {
   readStoreRevision,
   runMutation,
 } from "~/lib/storage/operations"
+import { loadCustomProviderSnapshotFromSession } from "~/lib/storage/providers-repository"
 
 const namespaces: ReadonlySet<string> = new Set([
   "app",
@@ -188,6 +189,7 @@ export function createSettingsRepository(
       }
       return {
         revision,
+        providers: await loadCustomProviderSnapshotFromSession(session),
         documents: new Map(
           documents.map((document) => [document.namespace, document]),
         ),

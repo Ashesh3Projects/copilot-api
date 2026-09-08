@@ -32,8 +32,7 @@ export const initialTables = {
     credential_revision INTEGER NOT NULL DEFAULT 0 CHECK (credential_revision >= 0),
     validation_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE (domain, upstream_user_id)`,
+    updated_at INTEGER NOT NULL`,
   capi_account_credentials: `
     account_id INTEGER PRIMARY KEY NOT NULL REFERENCES capi_accounts(id) ON DELETE RESTRICT,
     oauth_value TEXT NOT NULL,
@@ -218,6 +217,8 @@ export const initialTables = {
 } as const
 
 export const initialIndexes = {
+  capi_accounts_identity_active:
+    "capi_accounts(domain, upstream_user_id) WHERE deleted_at IS NULL",
   capi_operations_created: "capi_applied_operations(created_at)",
   capi_accounts_enabled: "capi_accounts(enabled, deleting_at, deleted_at)",
   capi_providers_enabled: "capi_providers(enabled, deleted_at)",
@@ -256,7 +257,8 @@ export const initialMigration = {
       ([name, columns]) => `CREATE TABLE ${name} (${columns}\n)`,
     ),
     ...Object.entries(initialIndexes).map(
-      ([name, target]) => `CREATE INDEX ${name} ON ${target}`,
+      ([name, target]) =>
+        `CREATE ${name === "capi_accounts_identity_active" ? "UNIQUE " : ""}INDEX ${name} ON ${target}`,
     ),
     "INSERT INTO capi_usage_lifetime (id) VALUES (1)",
   ],

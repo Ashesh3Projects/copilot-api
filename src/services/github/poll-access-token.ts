@@ -33,31 +33,10 @@ export async function pollAccessToken(
 
   while (pollNow() < expiresAt) {
     try {
-      const response = await fetch(
-        `${githubBaseUrl(instanceDomain)}/login/oauth/access_token`,
-        {
-          method: "POST",
-          headers: {
-            ...standardHeaders(),
-            "content-type": "application/x-www-form-urlencoded",
-          },
-          body: new URLSearchParams({
-            client_id: GITHUB_CLIENT_ID,
-            device_code: deviceCode.device_code,
-            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          }),
-        },
+      const json = await pollAccessTokenOnce(
+        deviceCode.device_code,
+        instanceDomain,
       )
-
-      if (!response.ok) {
-        consola.debug(
-          `Access-token poll returned ${response.status} ${response.statusText}`,
-        )
-        await pollSleep(pollIntervalSeconds * 1000)
-        continue
-      }
-
-      const json = (await response.json()) as AccessTokenResponse
       const { access_token, error, error_description, interval } = json
 
       if (access_token) return access_token
@@ -86,13 +65,40 @@ export async function pollAccessToken(
   throw new Error("GitHub device code expired before authorization completed")
 }
 
-interface AccessTokenResponse {
+export interface AccessTokenResponse {
   access_token?: string
   error?: string
   error_description?: string
   interval?: number
   token_type?: string
   scope?: string
+}
+
+/** One upstream attempt, shared by durable dashboard and interactive CLI flows. */
+export async function pollAccessTokenOnce(
+  deviceCode: string,
+  instanceDomain = DEFAULT_GITHUB_DOMAIN,
+): Promise<AccessTokenResponse> {
+  const response = await fetch(
+    `${githubBaseUrl(instanceDomain)}/login/oauth/access_token`,
+    {
+      method: "POST",
+      headers: {
+        ...standardHeaders(),
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        client_id: GITHUB_CLIENT_ID,
+        device_code: deviceCode,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      }),
+    },
+  )
+  if (!response.ok)
+    throw new Error(
+      `GitHub device authorization is unavailable (HTTP ${response.status})`,
+    )
+  return (await response.json()) as AccessTokenResponse
 }
 
 class TerminalOAuthError extends Error {}

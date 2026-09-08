@@ -245,7 +245,7 @@ async function handleAuthorizationCodeGrant(
   ) {
     return oauthError(c, "invalid_grant")
   }
-  if (isConfiguredInferenceCredential(body.code)) {
+  if (await isConfiguredInferenceCredential(body.code)) {
     return oauthError(c, "invalid_grant")
   }
 
@@ -265,7 +265,7 @@ async function handleRefreshTokenGrant(
   body: Record<string, string>,
 ): Promise<Response> {
   if (!body.refresh_token) return oauthError(c, "invalid_grant")
-  if (isConfiguredInferenceCredential(body.refresh_token)) {
+  if (await isConfiguredInferenceCredential(body.refresh_token)) {
     return oauthError(c, "invalid_grant")
   }
   const requestedScopes = body.scope ? parseScopes(body.scope) : undefined
@@ -509,8 +509,8 @@ oauthApiRoutes.get("/claude_code_penguin_mode", oauthInferenceGuard, (c) => {
 oauthApiRoutes.get("/claude_cli_profile", oauthProfileGuard, (c) => c.json({}))
 
 // GET /api/oauth/usage — usage data for settings panel
-oauthApiRoutes.get("/oauth/usage", oauthProfileGuard, (c) =>
-  c.json(getUsageResponse()),
+oauthApiRoutes.get("/oauth/usage", oauthProfileGuard, async (c) =>
+  c.json(await getUsageResponse()),
 )
 
 // GET /api/oauth/claude_cli/client_data
@@ -758,7 +758,7 @@ oauthApiRoutes.all("*", async (c) => {
   const clientIp = extractClientIp(c)
   const gatewayHeaderPresent = c.req.raw.headers.has("x-copilot-gateway-key")
   if (gatewayHeaderPresent) {
-    const credential = resolveGatewayCredential(
+    const credential = await resolveGatewayCredential(
       c.req.raw.headers.get("x-copilot-gateway-key") ?? "",
       ["user:inference"],
     )

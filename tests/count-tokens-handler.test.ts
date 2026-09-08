@@ -3,11 +3,19 @@ import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 import type { RoutingAffinity } from "../src/lib/routing-affinity"
 import type { ModelsResponse } from "../src/services/copilot/get-models"
 
+import { getAccountsService } from "../src/lib/accounts-service"
 import { setConfigForTest } from "../src/lib/config"
 import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { getRoutingAffinity } from "../src/lib/routing-affinity"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -138,9 +146,16 @@ async function requestCountTokens(options?: {
   headers?: Record<string, string>
   model?: string
 }): Promise<Response> {
+  const catalogUnavailable = state.models === undefined
+  await seedProtocolDatabase()
+  await getAccountsService().refreshRuntime()
+  // Populate persisted accounts first, then model the explicit discovery outage.
+  // eslint-disable-next-line require-atomic-updates -- This isolated fixture deliberately replaces the discovery snapshot.
+  if (catalogUnavailable) state.models = undefined
   return await server.request("/v1/messages/count_tokens", {
     method: "POST",
     headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
       "content-type": "application/json",
       ...options?.headers,
     },
@@ -479,11 +494,16 @@ test.each([
 ] as const)(
   "count_tokens returns machine metadata for malformed $name input",
   async ({ body, code, param }) => {
-    const response = await server.request("/v1/messages/count_tokens", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages/count_tokens", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }),
+    )
     const responseBody = await response.text()
 
     expect(response.status).toBe(400)
@@ -503,11 +523,16 @@ test("count_tokens preserves future native tools without local schema policing",
     tools: [{ name: "missing_schema" }],
   }
 
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(await response.json()).toEqual({ input_tokens: 42 })
@@ -520,15 +545,20 @@ test("count_tokens preserves unnamed future native tools with nested fields", as
     config: { enabled: true, nested: { mode: "opaque" } },
   }
 
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.7-1m-internal",
-      messages: [{ role: "user", content: "hello" }],
-      tools: [futureTool],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7-1m-internal",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [futureTool],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(await response.json()).toEqual({ input_tokens: 42 })
@@ -566,15 +596,20 @@ test.each([
     },
   ],
 ] as const)("count_tokens preserves %s", async (_label, futureTool) => {
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.7-1m-internal",
-      messages: [{ role: "user", content: "hello" }],
-      tools: [futureTool],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7-1m-internal",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [futureTool],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(await response.json()).toEqual({ input_tokens: 42 })
@@ -586,14 +621,19 @@ test.each([
 })
 
 test("count_tokens rejects malformed whole message entries when none survive", async () => {
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.7-1m-internal",
-      messages: [null],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7-1m-internal",
+        messages: [null],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(400)
   expect(await response.json()).toMatchObject({
@@ -604,14 +644,19 @@ test("count_tokens rejects malformed whole message entries when none survive", a
 })
 
 test("count_tokens drops malformed nested content instead of rejecting the request", async () => {
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.7-1m-internal",
-      messages: [{ role: "user", content: [null] }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7-1m-internal",
+        messages: [{ role: "user", content: [null] }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(await response.json()).toEqual({ input_tokens: 42 })
@@ -623,11 +668,16 @@ test("count_tokens drops malformed nested content instead of rejecting the reque
 
 test("count_tokens returns invalid_json metadata without raw input", async () => {
   const marker = "PRIVATE_COUNT_INVALID_JSON"
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: `{"model":"${marker}",`,
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: `{"model":"${marker}",`,
+    }),
+  )
   const body = await response.text()
 
   expect(response.status).toBe(400)

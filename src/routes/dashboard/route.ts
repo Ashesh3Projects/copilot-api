@@ -2,9 +2,12 @@ import { Hono } from "hono"
 
 import { authenticateAdminRequest } from "~/lib/admin-auth"
 import { secureHtml } from "~/lib/secure-html"
+import { withSettingsActor } from "~/lib/storage/domain-settings"
 import { getSession } from "~/routes/code-sessions/session-store"
 import { mintRemoteWebSocketTicket } from "~/routes/remote/ws-security"
 
+import { dashboardAccountRoutes } from "./accounts"
+import { dashboardActivityRoutes } from "./activity"
 import {
   handleAddTrustedJwtDigest,
   handleAddModelRedirect,
@@ -61,6 +64,7 @@ import {
   dashboardAuthRoutes,
   getRefreshedSessionCookieHeaders,
 } from "./auth-route"
+import { createDashboardCredentialRoutes } from "./credentials"
 import {
   handleClearFallbackCache,
   handleGetFallbacks,
@@ -68,6 +72,7 @@ import {
 } from "./fallbacks"
 import { handleReplayLlmDebugLog } from "./llm-debug-replay"
 import { DASHBOARD_HTML } from "./page-generated"
+import { handleBackupSettings } from "./settings-backup"
 import { handleExportSettings } from "./settings-export"
 
 export const dashboardRoutes = new Hono()
@@ -93,13 +98,16 @@ dashboardRoutes.use("/api/*", async (c, next) => {
       401,
     )
   }
-  await next()
+  await withSettingsActor(`admin:${session.tokenHash}`, next)
   for (const cookie of getRefreshedSessionCookieHeaders(c.req.raw)) {
     c.header("Set-Cookie", cookie, { append: true })
   }
 })
 
 // Overview
+dashboardRoutes.route("/api/accounts", dashboardAccountRoutes)
+dashboardRoutes.route("/api/credentials", createDashboardCredentialRoutes())
+dashboardRoutes.route("/api", dashboardActivityRoutes)
 dashboardRoutes.get("/api/overview", handleOverview)
 
 // Sessions
@@ -215,6 +223,7 @@ dashboardRoutes.delete("/api/llm-debug", handleClearLlmDebugLogs)
 // Settings
 dashboardRoutes.get("/api/settings", handleGetSettings)
 dashboardRoutes.get("/api/settings/export", handleExportSettings)
+dashboardRoutes.post("/api/settings/backup", handleBackupSettings)
 dashboardRoutes.post(
   "/api/settings/codex-cleanup-model",
   handleSetCodexCleanupModel,

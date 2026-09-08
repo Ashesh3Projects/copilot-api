@@ -1,14 +1,12 @@
+/* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-confusing-void-expression -- Bun rejects assertions require awaiting despite their typings. */
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
-import fs from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
+import { randomUUID } from "node:crypto"
 
-import { setConfigForTest } from "../src/lib/config"
 import {
   extractRequestCredential,
   hasSuppliedRequestCredential,
   isGoogleApiCredentialPath,
+  isConfiguredInferenceCredential,
   registerCredentialProvider,
   resolveCredential,
   resolveGatewayCredential,
@@ -20,58 +18,56 @@ import {
   setOAuthStoreForTest,
 } from "../src/lib/oauth-store"
 import { state } from "../src/lib/state"
-import { trustedJwtDigestStore } from "../src/lib/trusted-jwt-digests"
+import {
+  credentialDigest,
+  createCredentialsRepository,
+} from "../src/lib/storage/credentials-repository"
+import { getStoreRevision } from "../src/lib/storage/operations"
+import { createAuthStorageFixture } from "./helpers/auth-storage"
 
-const originalGatewayKey = state.apiKeyAuth
-const originalInferenceCredentialDigests =
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
 const clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 const redirectUri = "http://localhost:54545/callback"
 const verifier = "v".repeat(64)
 const oauthState = "state-with-enough-entropy-123456789"
-
-let temporaryDirectory: string
+let fixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
 let store: OAuthStore
-
+let oldEnv: string | undefined
 beforeEach(async () => {
-  temporaryDirectory = await fs.mkdtemp(
-    path.join(os.tmpdir(), "copilot-credential-resolver-"),
-  )
-  store = new OAuthStore(path.join(temporaryDirectory, "oauth_tokens.json"))
+  fixture = await createAuthStorageFixture()
+  store = new OAuthStore({ storage: fixture.storage })
   setOAuthStoreForTest(store)
-  state.apiKeyAuth = "gateway-secret"
-  setConfigForTest({ auth: { apiKeys: [] } })
-  delete process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
-  trustedJwtDigestStore.replaceForTest([])
+  oldEnv = process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
+      args: [
+        "fixture-gateway",
+        credentialDigest("gateway-secret"),
+        "Gateway",
+        Date.now(),
+      ],
+    })
+  })
 })
-
 afterEach(async () => {
   setOAuthStoreForTest(null)
-  setConfigForTest(null)
-  state.apiKeyAuth = originalGatewayKey
-  if (originalInferenceCredentialDigests === undefined) {
+  state.apiKeyAuth = undefined
+  if (oldEnv === undefined)
     delete process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
-  } else {
-    process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S =
-      originalInferenceCredentialDigests
-  }
-  trustedJwtDigestStore.resetAfterTest()
-  await fs.rm(temporaryDirectory, { recursive: true, force: true })
+  else process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = oldEnv
+  await fixture.close()
 })
-
 function bearer(token: string): Request {
   return new Request("http://localhost/protected", {
     headers: { authorization: `Bearer ${token}` },
   })
 }
-
 function request(pathname: string, headers?: Record<string, string>): Request {
   return new Request(
     `http://localhost${pathname}`,
     headers === undefined ? undefined : { headers: new Headers(headers) },
   )
 }
-
 async function issueOAuthToken(): Promise<string> {
   const code = await store.issueAuthorizationCode({
     clientId,
@@ -90,217 +86,190 @@ async function issueOAuthToken(): Promise<string> {
   if (result.status !== "ok") throw new Error("Failed to issue OAuth token")
   return result.tokens.accessToken
 }
-
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex")
+async function inference(raw: string, enabled = true) {
+  const id = randomUUID()
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "INSERT INTO capi_inference_credentials (digest,id,kind,principal_id,enabled,scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+      args: [
+        credentialDigest(raw),
+        id,
+        "managed",
+        `inference-managed:${id}`,
+        enabled ? 1 : 0,
+        '["user:inference"]',
+        Date.now(),
+        Date.now(),
+      ],
+    })
+  })
+  return id
 }
 
-test("distinguishes gateway, OAuth, and inference-client credentials", async () => {
-  const oauthToken = await issueOAuthToken()
-  const inferenceKey = await store.mintInferenceCredential()
-
+test("distinguishes gateway, OAuth and inference-only credentials with stable principals", async () => {
+  const oauth = await issueOAuthToken()
+  const key = await store.mintInferenceCredential()
   expect(
     await resolveRequestCredentialKind(bearer("gateway-secret"), "gateway"),
-  ).toMatchObject({ kind: "gateway" })
+  ).toMatchObject({
+    kind: "gateway",
+    principalId: `gateway:${credentialDigest("gateway-secret").slice(0, 16)}`,
+  })
   expect(
-    await resolveRequestCredentialKind(bearer(oauthToken), "oauth", {
+    await resolveRequestCredentialKind(bearer(oauth), "oauth", {
       requiredScopes: ["user:profile"],
     }),
   ).toMatchObject({ kind: "oauth" })
   expect(
-    await resolveRequestCredentialKind(
-      bearer(inferenceKey),
-      "inference-client",
-      { requiredScopes: ["user:inference"] },
+    await resolveRequestCredentialKind(bearer(key), "inference-client", {
+      requiredScopes: ["user:inference"],
+    }),
+  ).toMatchObject({ kind: "inference-client" })
+  expect(
+    await resolveRequestCredentialKind(bearer(oauth), "gateway"),
+  ).toBeNull()
+  expect(await resolveCredential(key, ["org:create_api_key"])).toBeNull()
+  expect(await resolveCredential(oauth, ["voice:transcribe"])).not.toBeNull()
+})
+
+test("configured inference scopes cannot expand beyond inference", async () => {
+  const id = await inference("managed.jwt.signature")
+  expect(
+    await resolveCredential("managed.jwt.signature", ["user:inference"]),
+  ).toMatchObject({
+    kind: "inference-client",
+    principalId: `inference-managed:${id}`,
+    scopes: new Set(["user:inference"]),
+  })
+  expect(
+    await resolveCredential("managed.jwt.signature", ["user:profile"]),
+  ).toBeNull()
+  expect(
+    await resolveCredential("managed.jwt.signature", ["voice:transcribe"]),
+  ).toBeNull()
+  expect(
+    await resolveCredential(credentialDigest("managed.jwt.signature")),
+  ).toBeNull()
+  expect(
+    await resolveCredential(
+      credentialDigest("managed.jwt.signature").toUpperCase(),
     ),
-  ).toMatchObject({ kind: "inference-client" })
-  expect(
-    await resolveRequestCredentialKind(bearer(oauthToken), "gateway"),
   ).toBeNull()
 })
 
-test("limits configured digest credentials to inference scope", async () => {
-  const rawCredential = "test-codex-desktop-token"
+test("disabled and revoked inference credentials block gateway and OAuth elevation", async () => {
+  const oauth = await issueOAuthToken()
+  await inference("gateway-secret", false)
+  await inference(oauth, false)
+  expect(await resolveCredential("gateway-secret")).toBeNull()
+  expect(await resolveGatewayCredential("gateway-secret")).toBeNull()
+  expect(await resolveCredential(oauth)).toBeNull()
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "UPDATE capi_inference_credentials SET enabled = 1, revoked_at = ?",
+      args: [Date.now()],
+    })
+  })
+  expect(await isConfiguredInferenceCredential(oauth)).toBe(true)
+  expect(await resolveCredential(oauth)).toBeNull()
+})
+
+test("digest literals cannot authenticate even when they collide with gateway raw input", async () => {
+  const literal = credentialDigest("inference-only-secret")
+  await inference("inference-only-secret")
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
+      args: ["literal-key", credentialDigest(literal), "Literal", Date.now()],
+    })
+  })
+  expect(await resolveCredential(literal)).toBeNull()
+  expect(await resolveGatewayCredential(literal)).toBeNull()
+  expect(await resolveCredential(credentialDigest("gateway-secret"))).toBeNull()
+})
+
+test("legacy environment and process state never override database credentials", async () => {
   process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S =
-    "a3b73b87238555863cbe9291649bd56227b8871aaa7bfc052d9f704bbfce8585"
-
-  expect(
-    await resolveCredential(rawCredential, ["user:inference"]),
-  ).toMatchObject({
-    kind: "inference-client",
-    principalId: "inference-env:a3b73b8723855586",
-    scopes: new Set(["user:inference"]),
-  })
-  expect(await resolveCredential(rawCredential, ["user:profile"])).toBeNull()
-  expect(
-    await resolveCredential(rawCredential, ["org:create_api_key"]),
-  ).toBeNull()
-})
-
-test("limits dashboard-managed JWT digests to inference scope", async () => {
-  const rawCredential = "managed.jwt.signature"
-  const digest = sha256Hex(rawCredential)
-  const entry = trustedJwtDigestStore.add({ label: "Laptop", digest })
-
-  expect(
-    await resolveCredential(rawCredential, ["user:inference"]),
-  ).toMatchObject({
-    principalId: `inference-managed:${entry.id}`,
-    kind: "inference-client",
-    scopes: new Set(["user:inference"]),
-  })
-  expect(await resolveCredential(rawCredential, ["user:profile"])).toBeNull()
-  expect(
-    await resolveCredential(rawCredential, ["org:create_api_key"]),
-  ).toBeNull()
-  expect(await resolveCredential(digest)).toBeNull()
-
-  trustedJwtDigestStore.setEnabled(entry.id, false)
-  expect(await resolveCredential(rawCredential)).toBeNull()
-})
-
-test("managed JWT rows override duplicate environment digests until deleted", async () => {
-  const rawCredential = "managed-environment-duplicate.jwt.signature"
-  const digest = sha256Hex(rawCredential)
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = digest
-  const entry = trustedJwtDigestStore.add({
-    label: "Managed migration",
-    digest,
-  })
-
-  expect(
-    await resolveCredential(rawCredential, ["user:inference"]),
-  ).toMatchObject({
-    principalId: `inference-managed:${entry.id}`,
-    kind: "inference-client",
-  })
-  expect(await resolveCredential(digest)).toBeNull()
-
-  trustedJwtDigestStore.setEnabled(entry.id, false)
-  expect(await resolveCredential(rawCredential, ["user:inference"])).toBeNull()
-  expect(await resolveCredential(digest)).toBeNull()
-
-  trustedJwtDigestStore.remove(entry.id)
-  expect(
-    await resolveCredential(rawCredential, ["user:inference"]),
-  ).toMatchObject({
-    principalId: `inference-env:${digest.slice(0, 16)}`,
-    kind: "inference-client",
-  })
-})
-
-test("does not elevate a managed digest through gateway fallback", async () => {
-  const rawCredential = "gateway-secret"
-  const entry = trustedJwtDigestStore.add({
-    label: "Gateway collision",
-    digest: sha256Hex(rawCredential),
-  })
-
-  expect(
-    await resolveCredential(rawCredential, ["user:inference"]),
-  ).toMatchObject({ kind: "inference-client" })
-  expect(await resolveCredential(rawCredential, ["user:profile"])).toBeNull()
-  expect(resolveGatewayCredential(rawCredential)).toBeNull()
-
-  trustedJwtDigestStore.setEnabled(entry.id, false)
-  expect(await resolveCredential(rawCredential)).toBeNull()
-  expect(resolveGatewayCredential(rawCredential)).toBeNull()
-
-  trustedJwtDigestStore.remove(entry.id)
-  expect(resolveGatewayCredential(rawCredential)).toMatchObject({
+    credentialDigest("environment-token")
+  state.apiKeyAuth = "legacy-gateway"
+  expect(await resolveCredential("environment-token")).toBeNull()
+  expect(await resolveCredential("legacy-gateway")).toBeNull()
+  expect(await resolveCredential("gateway-secret")).toMatchObject({
     kind: "gateway",
   })
 })
 
-test("does not elevate a configured inference digest through gateway fallback", async () => {
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = sha256Hex("gateway-secret")
-
-  expect(
-    await resolveCredential("gateway-secret", ["user:inference"]),
-  ).toMatchObject({ kind: "inference-client" })
-  expect(await resolveCredential("gateway-secret", ["user:profile"])).toBeNull()
-  expect(resolveGatewayCredential("gateway-secret")).toBeNull()
-
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = sha256Hex("gateway-secret")
-  expect(resolveGatewayCredential(" gateway-secret ")).toBeNull()
-
-  state.apiKeyAuth = " gateway-secret "
-  expect(resolveGatewayCredential("gateway-secret")).toBeNull()
-
-  state.apiKeyAuth = undefined
-  setConfigForTest({
-    auth: { apiKeys: ["gateway-secret", " gateway-secret "] },
-  })
-  expect(resolveGatewayCredential("gateway-secret")).toBeNull()
-
-  const digestLiteral = sha256Hex("inference-only-secret")
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = digestLiteral
-  state.apiKeyAuth = digestLiteral
-  expect(resolveGatewayCredential(digestLiteral)).toBeNull()
-  expect(await resolveCredential(digestLiteral)).toBeNull()
-})
-
 test("preserves internal bearer whitespace for inference classification", async () => {
-  state.apiKeyAuth = "inference secret"
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S =
-    sha256Hex("inference  secret")
-
+  await inference("inference  secret")
   expect(
     await resolveRequestCredentialKind(
       bearer("inference  secret"),
       "inference-client",
-      { requiredScopes: ["user:inference"] },
     ),
-  ).toMatchObject({ kind: "inference-client" })
-  expect(
-    await resolveRequestCredentialKind(bearer("inference  secret"), "gateway"),
-  ).toBeNull()
+  ).not.toBeNull()
+  expect(await resolveCredential("inference secret")).toBeNull()
 })
 
-test("does not elevate a configured inference digest through OAuth fallback", async () => {
-  const oauthToken = await issueOAuthToken()
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = sha256Hex(oauthToken)
-
-  expect(await resolveCredential(oauthToken, ["user:profile"])).toBeNull()
+test("gateway create returns its secret once, list redacts it and last-key revoke is rejected", async () => {
+  const repo = createCredentialsRepository(fixture.storage)
+  const context = {
+    actorId: "admin:fixture",
+    operationId: randomUUID(),
+    kind: "gateway.create",
+    inputDigest: "create-key",
+    expectedRevision: await getStoreRevision(fixture.storage),
+  }
+  const created = await repo.create("Laptop", context)
+  expect(created.value.credential).toBeString()
+  const raw = created.value.credential
+  if (!raw) throw new Error("Gateway fixture did not issue credential")
+  expect(await resolveCredential(raw)).toMatchObject({
+    kind: "gateway",
+  })
+  const replayed = await repo.create("Laptop", context)
+  expect(replayed.value.credential).toBeUndefined()
+  expect(JSON.stringify(await repo.list())).not.toContain(raw)
+  expect(JSON.stringify(await repo.list())).not.toContain("digest")
+  const markers = await fixture.storage.read((sql) =>
+    sql.query({
+      sql: "SELECT result_json FROM capi_applied_operations",
+      args: [],
+    }),
+  )
+  expect(JSON.stringify(markers)).not.toContain(raw)
+  await repo.revoke("fixture-gateway", {
+    ...context,
+    operationId: randomUUID(),
+    kind: "gateway.revoke",
+    expectedRevision: created.revision,
+  })
+  expect(await resolveCredential("gateway-secret")).toBeNull()
+  await fixture.restart()
+  expect(await resolveCredential(raw)).not.toBeNull()
+  await expect(
+    repo.revoke(created.value.id, {
+      ...context,
+      operationId: randomUUID(),
+      kind: "gateway.revoke",
+      expectedRevision: await getStoreRevision(fixture.storage),
+    }),
+  ).rejects.toThrow("last gateway")
 })
 
-test("does not elevate a managed digest through OAuth fallback", async () => {
-  const oauthToken = await issueOAuthToken()
-  const entry = trustedJwtDigestStore.add({
-    label: "OAuth collision",
-    digest: sha256Hex(oauthToken),
+test("fresh indexed reads observe revocation and lookup errors stay typed", async () => {
+  const key = await inference("revoked-later")
+  expect(await resolveCredential("revoked-later")).not.toBeNull()
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "UPDATE capi_inference_credentials SET revoked_at = ? WHERE id = ?",
+      args: [Date.now(), key],
+    })
   })
-
-  expect(await resolveCredential(oauthToken, ["user:profile"])).toBeNull()
-
-  trustedJwtDigestStore.setEnabled(entry.id, false)
-  expect(await resolveCredential(oauthToken, ["user:profile"])).toBeNull()
-
-  trustedJwtDigestStore.remove(entry.id)
-  expect(await resolveCredential(oauthToken, ["user:profile"])).toMatchObject({
-    kind: "oauth",
+  expect(await resolveCredential("revoked-later")).toBeNull()
+  fixture.failReads()
+  await expect(resolveCredential("gateway-secret")).rejects.toMatchObject({
+    code: "storage_unavailable",
   })
-})
-
-test("accepts configured digest lists without treating digests as secrets", async () => {
-  const firstCredential = "first-codex-desktop-token"
-  const secondCredential = "second-codex-desktop-token"
-  const firstDigest = sha256Hex(firstCredential)
-  const secondDigest = sha256Hex(secondCredential)
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = [
-    "not-a-sha256-digest",
-    firstDigest.toUpperCase(),
-    secondDigest,
-  ].join(",")
-
-  expect(await resolveCredential(firstCredential)).toMatchObject({
-    kind: "inference-client",
-  })
-  expect(await resolveCredential(secondCredential)).toMatchObject({
-    kind: "inference-client",
-  })
-  expect(await resolveCredential(firstDigest)).toBeNull()
-  expect(await resolveCredential("unconfigured-token")).toBeNull()
 })
 
 test("rejects ambiguous credentials and accepts long credential values", () => {

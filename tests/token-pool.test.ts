@@ -19,6 +19,9 @@ import {
 import { state } from "../src/lib/state"
 import * as tokenPoolModule from "../src/lib/token-pool"
 import { DEFAULT_COPILOT_INTEGRATION_ID } from "../src/services/copilot/copilot-contract"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const MODEL_A = "model-a"
 const MODEL_B = "model-b"
@@ -434,6 +437,42 @@ test("masks tokens before logging them", () => {
   expect(tokenPoolModule.maskTokenForLog("1234567890abcdef")).toBe(
     "1234...cdef",
   )
+})
+
+test("coalesced discovery refreshes every detached lease snapshot", async () => {
+  const pool = new tokenPoolModule.TokenPool()
+  pools.add(pool)
+  const account = createInitializedAccount(pool)
+  account.credentialRevision = 4
+  const firstLease = pool.acquireLease(account)
+  const secondLease = pool.acquireLease(account)
+  if (!firstLease || !secondLease) throw new Error("Expected two leases")
+  const deferredModels = createDeferredFetchResponse()
+  queuedResults.push(
+    Response.json({
+      login: "refreshed",
+      analytics_tracking_id: "refreshed-subject",
+      endpoints: { api: "https://api.business.githubcopilot.com" },
+    }),
+    deferredModels,
+  )
+  const first = pool.reinitializeAccount(firstLease.account)
+  const second = pool.reinitializeAccount(secondLease.account)
+  await deferredModels.requestStarted
+  deferredModels.resolveResponse(modelsResponse([createModel(MODEL_B)]))
+  await Promise.all([first, second])
+  for (const snapshot of [firstLease.account, secondLease.account]) {
+    expect(snapshot.copilotApiBaseUrl).toBe(
+      "https://api.business.githubcopilot.com",
+    )
+    expect(snapshot.copilotAccountSubject).toBe("refreshed-subject")
+    expect(snapshot.models).toEqual(new Set([MODEL_B]))
+  }
+  expect(copilotUserRequests()).toHaveLength(1)
+  expect(modelRequests()).toHaveLength(1)
+  expect(firstLease.account.modelsData).not.toBe(secondLease.account.modelsData)
+  firstLease.release()
+  secondLease.release()
 })
 
 test("selects the exact highest SHA-256 rendezvous score", () => {

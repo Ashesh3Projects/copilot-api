@@ -1,8 +1,17 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
 import type { EmbeddingResponse } from "~/services/copilot/create-embeddings"
 
-import { initializeTestState, postJSON, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  postJSON,
+  TEST_TIMEOUT,
+} from "./setup"
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

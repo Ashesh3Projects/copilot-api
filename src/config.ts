@@ -17,6 +17,7 @@ import {
   updateReplacement,
   type ReplacementRule,
 } from "~/lib/auto-replace"
+import { mergeConfigWithDefaults } from "~/lib/config"
 import {
   createNebiusQwen3EmbeddingProvider,
   listCustomProvidersForDashboard,
@@ -27,7 +28,11 @@ import {
   DEFAULT_GITHUB_DOMAIN,
   normalizeGitHubDomain,
 } from "~/lib/github-instance"
-import { ensurePaths, PATHS } from "~/lib/paths"
+import {
+  initializeStorageRuntime,
+  closeStorageRuntime,
+  getStorageRuntime,
+} from "~/lib/storage/runtime"
 import { tokenPool } from "~/lib/token-pool"
 import { getDeviceCode } from "~/services/github/get-device-code"
 import { pollAccessToken } from "~/services/github/poll-access-token"
@@ -445,9 +450,7 @@ async function showAccountDetails(): Promise<void> {
 
   consola.info(`\n🔍 Account #${Number(selected) + 1}`)
   consola.info(`  Token: ${maskToken(account.token)}`)
-  consola.info(
-    `  GitHub instance: ${account.instanceDomain ?? DEFAULT_GITHUB_DOMAIN}`,
-  )
+  consola.info(`  GitHub instance: ${account.instanceDomain}`)
   if (account.label) consola.info(`  Label: ${account.label}`)
   consola.info("  (Start the server to see models and health status)")
   console.log()
@@ -613,26 +616,24 @@ async function removeAccountMenu(): Promise<void> {
     return
   }
 
-  const remaining = await storeRemoveAccount(index)
+  const remaining = await storeRemoveAccount(account.id)
   consola.success(`Account removed. (${remaining.length} remaining)`)
 }
 
-type DashboardCustomProvider = ReturnType<
-  typeof listCustomProvidersForDashboard
+type DashboardCustomProvider = Awaited<
+  ReturnType<typeof listCustomProvidersForDashboard>
 >[number]
 
 function formatCustomProvider(provider: DashboardCustomProvider): string {
   let keySource = "missing api key"
   if (provider.apiKeyConfigured) {
     keySource = "stored api key"
-  } else if (provider.apiKeyEnv) {
-    keySource = `env ${provider.apiKeyEnv}`
   }
   return `${provider.name} (${provider.id}) - ${provider.models.length} model${provider.models.length === 1 ? "" : "s"} - ${provider.baseUrl} - ${keySource}`
 }
 
-function listCustomProvidersMenu(): void {
-  const providers = listCustomProvidersForDashboard()
+async function listCustomProvidersMenu(): Promise<void> {
+  const providers = await listCustomProvidersForDashboard()
   if (providers.length === 0) {
     consola.info("No custom providers configured.")
     return
@@ -663,14 +664,14 @@ async function addNebiusProviderMenu(): Promise<void> {
   }
 
   const provider = createNebiusQwen3EmbeddingProvider(apiKey.trim())
-  upsertCustomProvider(provider)
+  await upsertCustomProvider(provider)
   consola.success(
     `Saved ${provider.name}. Use ${provider.models[0]?.aliases?.[0] ?? provider.models[0]?.id} for embeddings.`,
   )
 }
 
 async function removeCustomProviderMenu(): Promise<void> {
-  const providers = listCustomProvidersForDashboard()
+  const providers = await listCustomProvidersForDashboard()
   if (providers.length === 0) {
     consola.info("No custom providers configured.")
     return
@@ -700,7 +701,7 @@ async function removeCustomProviderMenu(): Promise<void> {
     return
   }
 
-  if (removeCustomProvider(selected)) {
+  if (await removeCustomProvider(selected)) {
     consola.success("Custom provider removed.")
   } else {
     consola.error("Custom provider not found.")
@@ -748,7 +749,7 @@ function getMenuOptions(): Array<{ label: string; value: MenuAction }> {
 
 async function mainMenu(): Promise<void> {
   consola.info(`\n🔧 Copilot API - Replacement Configuration`)
-  consola.info(`Config file: ${PATHS.REPLACEMENTS_CONFIG_PATH}\n`)
+  consola.info(`Database: ${getStorageRuntime().config.kind}\n`)
 
   let running = true
 
@@ -779,7 +780,12 @@ export const config = defineCommand({
     description: "Configure replacement rules interactively",
   },
   run: async () => {
-    await ensurePaths()
-    await mainMenu()
+    await initializeStorageRuntime()
+    await mergeConfigWithDefaults()
+    try {
+      await mainMenu()
+    } finally {
+      await closeStorageRuntime()
+    }
   },
 })

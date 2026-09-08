@@ -1,5 +1,5 @@
-/* eslint-disable max-lines -- route and transport coverage share singleton fetch fixtures */
 import * as Sentry from "@sentry/bun"
+/* eslint-disable max-lines -- route and transport coverage share singleton fetch fixtures */
 import {
   afterAll,
   beforeAll,
@@ -28,7 +28,7 @@ import {
   type RoutingAffinity,
 } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
@@ -41,8 +41,15 @@ import {
   createChatCompletionsWithProcessedPayload,
   type Message,
 } from "../src/services/copilot/create-chat-completions"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
 
 // Save and restore original fetch so integration tests aren't affected
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalIsMultiToken = state.isMultiToken
 const addedAccountIds = [2101, 2102]
@@ -173,7 +180,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   queuedResponses.length = 0
   capturedAffinities.length = 0
@@ -185,7 +192,7 @@ beforeEach(() => {
   state.isMultiToken = originalIsMultiToken
   setModelSettingsForTest([])
   setModelRedirectsForTest([])
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetRoutingTelemetryForTest()
 })
 
@@ -211,10 +218,12 @@ test("retries one exact unsupported Chat control on the finalized wire clone", a
   } as ChatCompletionsPayload
   const source = structuredClone(payload)
 
-  const result = await createChatCompletionsWithProcessedPayload(payload, {
-    candidatePrepared: true,
-    copilotSessionToken: "session-stays-fixed",
-  })
+  const result = await seedProtocolDatabase().then(() =>
+    createChatCompletionsWithProcessedPayload(payload, {
+      candidatePrepared: true,
+      copilotSessionToken: "session-stays-fixed",
+    }),
+  )
 
   expect(payload).toEqual(source)
   expect(requestBodies).toHaveLength(2)
@@ -258,13 +267,15 @@ test("uses one account selection and account token for a Chat compatibility retr
     createDefaultResponse(),
   )
 
-  await createChatCompletions(
-    {
-      model,
-      messages: [{ role: "user", content: "hello" }],
-      temperature: 1,
-    },
-    { candidatePrepared: true },
+  await seedProtocolDatabase().then(() =>
+    createChatCompletions(
+      {
+        model,
+        messages: [{ role: "user", content: "hello" }],
+        temperature: 1,
+      },
+      { candidatePrepared: true },
+    ),
   )
 
   const lastCalls = fetchMock.mock.calls.slice(-2)
@@ -307,13 +318,15 @@ test("preserves only the final Chat compatibility failure response", async () =>
 
   let error: unknown
   try {
-    await createChatCompletions(
-      {
-        model: "gpt-test",
-        messages: [{ role: "user", content: "hello" }],
-        temperature: 1,
-      },
-      { candidatePrepared: true },
+    await seedProtocolDatabase().then(() =>
+      createChatCompletions(
+        {
+          model: "gpt-test",
+          messages: [{ role: "user", content: "hello" }],
+          temperature: 1,
+        },
+        { candidatePrepared: true },
+      ),
     )
   } catch (caught: unknown) {
     error = caught
@@ -333,54 +346,65 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
     data: [createLegacyMessagesModel("gpt-test")],
   }
   const matchingToken = sessionToken({ selected_model: "gpt-test" })
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": matchingToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": matchingToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestHeaders?.get("copilot-session-token")).toBe(matchingToken)
-  const matchingDebug = getLlmDebugLog(listLlmDebugLogs().entries[0]?.id ?? "")
+  const matchingDebug = await getLlmDebugLog(
+    (await listLlmDebugLogs()).entries[0]?.id ?? "",
+  )
   expect(matchingDebug?.request.headers["Copilot-Session-Token"]).toBe(
-    matchingToken,
+    "[REDACTED]",
   )
 
   const longMatchingToken = sessionToken({
     selected_model: "gpt-test",
     padding: "x".repeat(2 * 1024),
   })
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": longMatchingToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": longMatchingToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestHeaders?.get("copilot-session-token")).toBe(
     longMatchingToken,
   )
 
   const binaryToken = binarySessionToken({ selected_model: "gpt-test" })
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": binaryToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "binary opaque segments" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": binaryToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "binary opaque segments" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestHeaders?.get("copilot-session-token")).toBe(binaryToken)
 
   for (const token of [
@@ -388,17 +412,20 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
     "malformed-token",
     ...invalidSessionTokens("gpt-test"),
   ]) {
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": token,
-      },
-      body: JSON.stringify({
-        model: "gpt-test",
-        messages: [{ role: "user", content: "hello" }],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": token,
+        },
+        body: JSON.stringify({
+          model: "gpt-test",
+          messages: [{ role: "user", content: "hello" }],
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(200)
     expect(lastRequestHeaders?.get("copilot-session-token")).toBeNull()
     expect(lastRequestHeaders?.get("authorization")).toBe("Bearer test-token")
@@ -420,17 +447,20 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
     selected_model: "gpt-redirected",
     available_models: ["gpt-test", "gpt-redirected"],
   })
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": redirectedToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": redirectedToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestBody?.model).toBe("gpt-redirected")
   expect(lastRequestHeaders?.get("copilot-session-token")).toBeNull()
 
@@ -440,17 +470,20 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
     data: [createLegacyMessagesModel("gpt-4.1")],
   }
   const aliasToken = sessionToken({ selected_model: "gpt-4.1" })
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-4-1",
-      messages: [{ role: "user", content: "ordinary alias" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-4-1",
+        messages: [{ role: "user", content: "ordinary alias" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestBody?.model).toBe("gpt-4.1")
   expect(lastRequestHeaders?.get("copilot-session-token")).toBe(aliasToken)
 
@@ -468,17 +501,20 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
       enabled: true,
     },
   ])
-  await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-4-1",
-      messages: [{ role: "user", content: "configured alias redirect" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-4-1",
+        messages: [{ role: "user", content: "configured alias redirect" }],
+      }),
     }),
-  })
+  )
   expect(lastRequestBody?.model).toBe("gpt-4.1")
   expect(lastRequestHeaders?.get("copilot-session-token")).toBeNull()
 })
@@ -501,17 +537,20 @@ test("preserves an upstream body even when it contains request metadata", async 
   )
 
   try {
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": privateToken,
-      },
-      body: JSON.stringify({
-        model: "gpt-test",
-        messages: [{ role: "user", content: "hello" }],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": privateToken,
+        },
+        body: JSON.stringify({
+          model: "gpt-test",
+          messages: [{ role: "user", content: "hello" }],
+        }),
       }),
-    })
+    )
     const body = await response.text()
 
     expect(response.status).toBe(400)
@@ -519,11 +558,14 @@ test("preserves an upstream body even when it contains request metadata", async 
     expect(JSON.stringify(errorSpy.mock.calls)).toContain(privateToken)
     expect(JSON.stringify(captureException.mock.calls)).toContain(privateToken)
 
-    const rawDebug = getLlmDebugLog(listLlmDebugLogs().entries[0]?.id ?? "")
-    expect(rawDebug?.request.headers["Copilot-Session-Token"]).toBe(
-      privateToken,
+    const rawDebug = await getLlmDebugLog(
+      (await listLlmDebugLogs()).entries[0]?.id ?? "",
     )
-    expect(rawDebug?.response?.body).toContain(privateToken)
+    expect(rawDebug?.request.headers["Copilot-Session-Token"]).toBe(
+      "[REDACTED]",
+    )
+    expect(rawDebug?.response?.body).not.toContain(privateToken)
+    expect(rawDebug?.response?.body).toContain("[REDACTED]")
   } finally {
     errorSpy.mockRestore()
     captureException.mockRestore()
@@ -531,11 +573,16 @@ test("preserves an upstream body even when it contains request metadata", async 
 })
 
 test("returns a safe local Chat error for a null JSON body", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: "null",
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: "null",
+    }),
+  )
   const body = (await response.json()) as Record<string, unknown>
 
   expect(response.status).toBe(400)
@@ -554,11 +601,13 @@ test("returns a safe local Chat error for a null JSON body", async () => {
 test("rejects direct BigInt payloads before upstream serialization", async () => {
   let thrown: unknown
   try {
-    await createChatCompletions({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
-      metadata: { count: 1n },
-    } as unknown as ChatCompletionsPayload)
+    await seedProtocolDatabase().then(() =>
+      createChatCompletions({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+        metadata: { count: 1n },
+      } as unknown as ChatCompletionsPayload),
+    )
   } catch (error) {
     thrown = error
   }
@@ -583,7 +632,7 @@ test("rejects direct cyclic payloads before upstream serialization", async () =>
   let thrown: unknown
 
   try {
-    await createChatCompletions(payload)
+    await seedProtocolDatabase().then(() => createChatCompletions(payload))
   } catch (error) {
     thrown = error
   }
@@ -651,32 +700,34 @@ test("fits explicitly marked ChatCompletions compaction payloads", async () => {
     + "x".repeat(COMPACTION_PAYLOAD_MAX_BYTES + 2 * 1024 * 1024)
     + "\nEND-CHAT-TRANSPORT"
 
-  await createChatCompletions(
-    {
-      model: "gpt-test",
-      messages: [
-        {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "call_chat_transport",
-              type: "function",
-              function: {
-                name: "exec",
-                arguments: JSON.stringify({ input: "run chat diagnostic" }),
+  await seedProtocolDatabase().then(() =>
+    createChatCompletions(
+      {
+        model: "gpt-test",
+        messages: [
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_chat_transport",
+                type: "function",
+                function: {
+                  name: "exec",
+                  arguments: JSON.stringify({ input: "run chat diagnostic" }),
+                },
               },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          tool_call_id: "call_chat_transport",
-          content: oversizedOutput,
-        },
-      ] as Array<Message>,
-    },
-    { compaction: true },
+            ],
+          },
+          {
+            role: "tool",
+            tool_call_id: "call_chat_transport",
+            content: oversizedOutput,
+          },
+        ] as Array<Message>,
+      },
+      { compaction: true },
+    ),
   )
 
   const serialized = JSON.stringify(lastRequestBody)
@@ -709,18 +760,23 @@ test("installs Claude metadata affinity before provider dispatch", async () => {
     data: [createLegacyMessagesModel(model)],
   }
   const request = () =>
-    server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "hello" }],
-        max_tokens: 32,
-        metadata: {
-          user_id: JSON.stringify({ session_id: "claude-body-session" }),
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
         },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "hello" }],
+          max_tokens: 32,
+          metadata: {
+            user_id: JSON.stringify({ session_id: "claude-body-session" }),
+          },
+        }),
       }),
-    })
+    )
 
   const first = await request()
   const second = await request()
@@ -763,7 +819,7 @@ test("sets X-Initiator to agent if tool/assistant present", async () => {
     ],
     model: "gpt-test",
   }
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
   expect(fetchMock).toHaveBeenCalled()
   const headers = (
     fetchMock.mock.calls.at(-1)?.[1] as { headers: Record<string, string> }
@@ -780,7 +836,7 @@ test("sets X-Initiator to user if only user present", async () => {
     ],
     model: "gpt-test",
   }
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
   expect(fetchMock).toHaveBeenCalled()
   const headers = (
     fetchMock.mock.calls.at(-1)?.[1] as { headers: Record<string, string> }
@@ -799,7 +855,7 @@ test("skips non-function tools during payload normalization", async () => {
     ],
   } as unknown as ChatCompletionsPayload
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   const lastCall = fetchMock.mock.calls.at(-1)?.[1] as unknown as {
     body: string
@@ -827,7 +883,7 @@ test("dispatches normalized deprecated Chat controls without mutating the caller
   const original = structuredClone(payload)
   queuedResponses.push(createSSEStreamResponse(["data: [DONE]"]))
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   expect(payload).toEqual(original)
   expect(lastRequestBody).toMatchObject({
@@ -862,8 +918,9 @@ test("exposes the processed clone without changing the direct response API", asy
     ],
   }
   const original = structuredClone(payload)
-  const { processedPayload, response } =
-    await createChatCompletionsWithProcessedPayload(payload)
+  const { processedPayload, response } = await seedProtocolDatabase().then(() =>
+    createChatCompletionsWithProcessedPayload(payload),
+  )
 
   expect(response).toHaveProperty("object", "chat.completion")
   expect(payload).toEqual(original)
@@ -889,9 +946,11 @@ test("dispatches a prepared native candidate without semantic reprocessing", asy
     future_top_level: { preserved: true },
   } as unknown as ChatCompletionsPayload
 
-  const result = await createChatCompletionsWithProcessedPayload(payload, {
-    candidatePrepared: true,
-  })
+  const result = await seedProtocolDatabase().then(() =>
+    createChatCompletionsWithProcessedPayload(payload, {
+      candidatePrepared: true,
+    }),
+  )
   expect(result.processedPayload).toEqual(payload)
   expect(fetchMock).toHaveBeenCalled()
   const sent = JSON.parse(
@@ -912,8 +971,9 @@ test("isolates the processed snapshot from stream retry state", async () => {
     messages: [{ role: "user", content: "hello" }],
   }
 
-  const { processedPayload, response } =
-    await createChatCompletionsWithProcessedPayload(payload)
+  const { processedPayload, response } = await seedProtocolDatabase().then(() =>
+    createChatCompletionsWithProcessedPayload(payload),
+  )
   processedPayload.model = "attacker-model"
   processedPayload.messages[0].content = "attacker-content"
   for await (const _event of response as AsyncIterable<unknown>) {
@@ -928,16 +988,18 @@ test("isolates the processed snapshot from stream retry state", async () => {
 })
 
 test("ignores removed processed-payload hooks without changing responses", async () => {
-  const response = await createChatCompletions(
-    {
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
-    },
-    {
-      onProcessedPayload: () => {
-        throw new Error("hook failure")
+  const response = await seedProtocolDatabase().then(() =>
+    createChatCompletions(
+      {
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
       },
-    } as unknown as Parameters<typeof createChatCompletions>[1],
+      {
+        onProcessedPayload: () => {
+          throw new Error("hook failure")
+        },
+      } as unknown as Parameters<typeof createChatCompletions>[1],
+    ),
   )
 
   expect(response).toHaveProperty("object", "chat.completion")
@@ -965,12 +1027,13 @@ test("isolates processed snapshots from non-streaming response state", async () 
       { headers: { "content-type": "application/json" } },
     ),
   )
-  const { processedPayload, response } =
-    await createChatCompletionsWithProcessedPayload({
+  const { processedPayload, response } = await seedProtocolDatabase().then(() =>
+    createChatCompletionsWithProcessedPayload({
       model: "gpt-test",
       messages: [{ role: "user", content: "return JSON" }],
       response_format: { type: "json_object" },
-    })
+    }),
+  )
   processedPayload.response_format = null
 
   expect(response).toHaveProperty("choices.0.message.content", '{"ok":true}')
@@ -1005,7 +1068,9 @@ test("retries streamed chat completions when the first SSE event is an overload 
     messages: [{ role: "user", content: "hello" }],
   }
 
-  const response = await createChatCompletions(payload)
+  const response = await seedProtocolDatabase().then(() =>
+    createChatCompletions(payload),
+  )
   const receivedEvents: Array<string> = []
 
   for await (const chunk of response as AsyncIterable<{ data?: string }>) {
@@ -1062,26 +1127,28 @@ test("stream overload retry keeps the image-stripped compaction body", async () 
     chainedFetch as unknown as typeof fetch
 
   try {
-    const response = await createChatCompletions(
-      {
-        model: "gpt-test",
-        stream: true,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "describe" },
-              {
-                type: "image_url",
-                image_url: {
-                  url: `data:image/png;base64,${"a".repeat(4096)}`,
+    const response = await seedProtocolDatabase().then(() =>
+      createChatCompletions(
+        {
+          model: "gpt-test",
+          stream: true,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "describe" },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:image/png;base64,${"a".repeat(4096)}`,
+                  },
                 },
-              },
-            ],
-          },
-        ],
-      },
-      { compaction: true },
+              ],
+            },
+          ],
+        },
+        { compaction: true },
+      ),
     )
     for await (const _event of response as AsyncIterable<unknown>) {
       // Drain the stream so the overload retry executes.
@@ -1105,7 +1172,7 @@ test("defaults stream_options.include_usage for direct streaming chat completion
 
   queuedResponses.push(createSSEStreamResponse(["data: [DONE]"]))
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   const lastCall = fetchMock.mock.calls.at(-1)?.[1] as unknown as {
     body: string
@@ -1150,7 +1217,7 @@ test("rewrites final assistant messages for models without assistant prefill", a
 
   queuedResponses.push(createSSEStreamResponse(["data: [DONE]"]))
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   const lastCall = fetchMock.mock.calls.at(-1)?.[1] as unknown as {
     body: string
@@ -1192,7 +1259,7 @@ test("rewrites final assistant messages for built-in no-prefill models", async (
 
   queuedResponses.push(createSSEStreamResponse(["data: [DONE]"]))
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   const lastCall = fetchMock.mock.calls.at(-1)?.[1] as unknown as {
     body: string
@@ -1214,7 +1281,7 @@ test("preserves final assistant messages when assistant prefill is unset", async
     ],
   }
 
-  await createChatCompletions(payload)
+  await seedProtocolDatabase().then(() => createChatCompletions(payload))
 
   const lastCall = fetchMock.mock.calls.at(-1)?.[1] as unknown as {
     body: string
@@ -1231,7 +1298,7 @@ test("preserves final assistant messages when assistant prefill is unset", async
   )
 })
 
-test("preserves upstream chat 404 identity and exact route bytes", async () => {
+test("preserves upstream chat 404 status, headers, and exact route bytes", async () => {
   const body = new TextEncoder().encode("model not found\r\n  ")
   const createUpstream = () =>
     new Response(body.slice(), {
@@ -1241,28 +1308,41 @@ test("preserves upstream chat 404 identity and exact route bytes", async () => {
   const upstream = createUpstream()
   queuedResponses.push(upstream)
 
-  const error = await createChatCompletions({
-    model: "gpt-test",
-    messages: [{ role: "user", content: "hello" }],
-  }).catch((caught: unknown) => caught)
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      createChatCompletions({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const upstreamError = (error as HTTPError).response
+  expect(upstreamError.status).toBe(404)
+  expect(upstreamError.headers.get("content-type")).toBe("text/plain")
+  expect(Array.from(new Uint8Array(await upstreamError.arrayBuffer()))).toEqual(
+    Array.from(body),
+  )
 
   state.models = {
     object: "list",
     data: [createLegacyMessagesModel("gpt-test")],
   }
   queuedResponses.push(createUpstream())
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-test",
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(404)
   expect(response.headers.get("content-type")).toBe("text/plain")
@@ -1283,10 +1363,12 @@ test("keeps malformed successful Chat JSON local and bodyless", async () => {
   try {
     let thrown: unknown
     try {
-      await createChatCompletions({
-        model: "gpt-test",
-        messages: [{ role: "user", content: "hello" }],
-      })
+      await seedProtocolDatabase().then(() =>
+        createChatCompletions({
+          model: "gpt-test",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      )
     } catch (error) {
       thrown = error
     }
@@ -1315,10 +1397,12 @@ test("does not log upstream ChatCompletions status text", async () => {
   try {
     let thrown: unknown
     try {
-      await createChatCompletions({
-        model: "gpt-test",
-        messages: [{ role: "user", content: "hello" }],
-      })
+      await seedProtocolDatabase().then(() =>
+        createChatCompletions({
+          model: "gpt-test",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      )
     } catch (error) {
       thrown = error
     }

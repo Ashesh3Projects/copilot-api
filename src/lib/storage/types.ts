@@ -1,3 +1,5 @@
+import type { ProviderSnapshot } from "~/lib/storage/providers-repository"
+
 export type SqlValue = null | string | number | bigint | Uint8Array
 
 export interface SqlStatement {
@@ -13,6 +15,10 @@ export interface SqlSession {
 }
 
 export interface Storage {
+  readSnapshot?<T>(
+    work: (session: SqlSession) => Promise<T>,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<T>
   read<T>(work: (session: SqlSession) => Promise<T>): Promise<T>
   transaction<T>(work: (session: SqlSession) => Promise<T>): Promise<T>
   atomicBatch(statements: ReadonlyArray<SqlStatement>): Promise<void>
@@ -68,6 +74,7 @@ export interface SettingsRepository {
 export interface RuntimeSnapshot {
   revision: number
   documents: ReadonlyMap<SettingsNamespace, SettingsDocument>
+  providers?: ProviderSnapshot
 }
 
 export interface SnapshotManager {

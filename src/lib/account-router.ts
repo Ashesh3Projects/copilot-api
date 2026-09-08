@@ -13,9 +13,16 @@ import type { Model } from "~/services/copilot/get-models"
 import type { RetryBudget } from "~/services/copilot/transport-retry"
 
 import {
+  leaseAccount,
+  unavailableAccount,
+  withAccountLeases,
+  withActiveAccount,
+} from "~/lib/account-lease-context"
+import {
   selectCandidateAccount,
   selectModelAccount,
 } from "~/lib/account-routing-selection"
+import { getAccountsService } from "~/lib/accounts-service"
 import { sessionTokenMatchesAccount } from "~/lib/copilot-session-token"
 import { LocalHTTPError } from "~/lib/error"
 import { recordModelFallbackResponse } from "~/lib/model-fallback"
@@ -32,6 +39,7 @@ import {
   type UpstreamSendReason,
 } from "~/lib/routing-telemetry"
 import { state } from "~/lib/state"
+import { peekStorageRuntime } from "~/lib/storage/runtime"
 import { tokenPool } from "~/lib/token-pool"
 import { copilotFetch, copilotHeaders } from "~/services/copilot/copilot-client"
 import {
@@ -112,7 +120,7 @@ export function selectRoutedModel(
   options?: RoutedModelSelectionOptions,
 ): RoutedModelSelection {
   const fallbackModel = state.models?.data.find((model) => model.id === modelId)
-  if (!state.isMultiToken) return { model: fallbackModel }
+  if (!usesPooledAccounts()) return { model: fallbackModel }
 
   const selection = selectRoutedAccount({
     affinityKey: getEffectiveAffinityKey(),
@@ -325,8 +333,9 @@ function createNoEnabledAccountResponse(modelId: string): Response {
 }
 
 async function fetchWithAccount(
-  options: AccountFetchOptions,
+  requested: AccountFetchOptions,
 ): Promise<Response> {
+  const options = { ...requested, account: leaseAccount(requested.account) }
   const {
     account,
     headerOptions,
@@ -372,9 +381,10 @@ async function fetchWithAccount(
 }
 
 async function recoverMisdirectedAccount(
-  options: AccountFetchOptions,
+  requested: AccountFetchOptions,
   originalResponse: Response,
 ): Promise<Response> {
+  const options = { ...requested, account: leaseAccount(requested.account) }
   const { account, path, retryBudget } = options
   if (retryBudget.remaining <= 0) {
     consola.warn(
@@ -467,6 +477,7 @@ async function fetchWithFallbackAccount(
     )
   }
 
+  if (peekStorageRuntime()) throw unavailableAccount()
   const fallbackHeaderOptions = bindSessionTokenToAccount({
     accountToken: state.copilotToken,
     headerOptions,
@@ -716,12 +727,50 @@ function controlPlaneRequestInit(
 export async function routedControlPlaneFetch(
   options: RoutedControlPlaneFetchOptions,
 ): Promise<RoutedControlPlaneFetchResult> {
+  if (peekStorageRuntime()) {
+    await getAccountsService().refreshRuntime()
+    return await withAccountLeases(options.signal, () =>
+      routedControlPlaneFetchInner(options),
+    )
+  }
+  return await routedControlPlaneFetchInner(options)
+}
+
+async function routedControlPlaneFetchInner(
+  options: RoutedControlPlaneFetchOptions,
+): Promise<RoutedControlPlaneFetchResult> {
   const affinityKey = getEffectiveAffinityKey()
   const retryBudget = createRetryBudget()
   const telemetryModel = options.modelId ?? "control-plane"
   setLastUsedRoutedAccountId(undefined)
 
-  if (!state.isMultiToken) {
+  if (!usesPooledAccounts()) {
+    if (peekStorageRuntime()) {
+      const selected = tokenPool.getFirstHealthyAccount()
+      if (!selected) return createNoControlPlaneAccountResult()
+      const account = leaseAccount(selected)
+      return await withActiveAccount(account, async () => {
+        const response = await copilotFetch(
+          options.path,
+          controlPlaneRequestInit(
+            options,
+            copilotHeaders({
+              copilotSessionToken: options.copilotSessionToken,
+            }),
+          ),
+          {
+            retryBudget,
+            telemetry: copilotTelemetry({
+              accountId: account.id,
+              model: telemetryModel,
+              path: options.path,
+              reason: "initial",
+            }),
+          },
+        )
+        return { response, account }
+      })
+    }
     const response = await copilotFetch(
       options.path,
       controlPlaneRequestInit(
@@ -747,6 +796,8 @@ export async function routedControlPlaneFetch(
     .filter(
       (account) =>
         account.healthy
+        && account.enabled !== false
+        && !account.deleting
         && (options.modelId === undefined
           || account.models.has(options.modelId)),
     )
@@ -815,7 +866,10 @@ export async function routedFetch(
   init: RequestInit | undefined,
   options: RoutedFetchOptions,
 ): Promise<{ response: Response; account: Account | undefined }> {
-  const result = await routedFetchInner(path, init, options)
+  if (peekStorageRuntime()) await getAccountsService().refreshRuntime()
+  const result = await withAccountLeases(init?.signal, () =>
+    routedFetchInner(path, init, options),
+  )
   if (
     path === "/chat/completions"
     || path === "/responses"
@@ -826,7 +880,7 @@ export async function routedFetch(
   return result
 }
 
-// eslint-disable-next-line complexity -- existing account selection and bounded retry matrix
+// eslint-disable-next-line complexity, max-lines-per-function -- Keep single-account compatibility, pooled selection, and retry attribution in one transport decision.
 async function routedFetchInner(
   path: string,
   init: RequestInit | undefined,
@@ -864,7 +918,24 @@ async function routedFetchInner(
   }
   setLastUsedRoutedAccountId(undefined)
 
-  if (!state.isMultiToken) {
+  if (!usesPooledAccounts()) {
+    if (peekStorageRuntime()) {
+      const account = tokenPool.getFirstHealthyAccount()
+      if (!account) throw unavailableAccount()
+      const pinnedId =
+        routedAccountPin?.accountId ?? selectedAccountPin?.accountId
+      if (pinnedId !== undefined && account.id !== pinnedId)
+        throw unavailableAccount()
+      const snapshot = leaseAccount(account)
+      return await withActiveAccount(snapshot, async () => {
+        const result = await singleTokenRoutedFetch({
+          context,
+          modelId,
+          shouldRecordSelection,
+        })
+        return { ...result, account: snapshot }
+      })
+    }
     return await singleTokenRoutedFetch({
       context,
       modelId,
@@ -925,4 +996,12 @@ async function routedFetchInner(
     mutableAccountPin.accountId = result.account.id
   }
   return result
+}
+
+function usesPooledAccounts(): boolean {
+  return (
+    state.isMultiToken
+    || (peekStorageRuntime() !== undefined
+      && tokenPool.getAllAccounts().length > 1)
+  )
 }

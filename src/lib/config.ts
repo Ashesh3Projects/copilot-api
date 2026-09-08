@@ -1,7 +1,14 @@
-import consola from "consola"
-import fs from "node:fs"
+import { z } from "zod"
 
-import { PATHS } from "./paths"
+import type { JsonValue } from "~/lib/storage/types"
+
+import {
+  getLoadedSetting,
+  updateSetting,
+  writeSetting,
+} from "~/lib/storage/domain-settings"
+import { StorageSchemaError } from "~/lib/storage/errors"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export interface AppConfig {
   auth?: {
@@ -86,47 +93,7 @@ const defaultConfig: AppConfig = {
   compactUseSmallModel: false,
 }
 
-let cachedConfig: AppConfig | null = null
-let useInMemoryConfigForTest = false
-
-function ensureConfigFile(): void {
-  try {
-    fs.accessSync(PATHS.CONFIG_PATH, fs.constants.R_OK | fs.constants.W_OK)
-  } catch {
-    fs.mkdirSync(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-    fs.chmodSync(PATHS.APP_DIR, 0o700)
-    fs.writeFileSync(
-      PATHS.CONFIG_PATH,
-      `${JSON.stringify(defaultConfig, null, 2)}\n`,
-      "utf8",
-    )
-    try {
-      fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
-    } catch {
-      return
-    }
-  }
-}
-
-function readConfigFromDisk(): AppConfig {
-  ensureConfigFile()
-  try {
-    const raw = fs.readFileSync(PATHS.CONFIG_PATH, "utf8")
-    if (!raw.trim()) {
-      fs.writeFileSync(
-        PATHS.CONFIG_PATH,
-        `${JSON.stringify(defaultConfig, null, 2)}\n`,
-        { encoding: "utf8", mode: 0o600 },
-      )
-      fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
-      return defaultConfig
-    }
-    return JSON.parse(raw) as AppConfig
-  } catch (error) {
-    consola.error("Failed to read config file, using default config", error)
-    return defaultConfig
-  }
-}
+let testConfig: AppConfig | null = null
 
 function mergeDefaultExtraPrompts(config: AppConfig): {
   mergedConfig: AppConfig
@@ -155,64 +122,137 @@ function mergeDefaultExtraPrompts(config: AppConfig): {
   }
 }
 
-export function mergeConfigWithDefaults(): AppConfig {
-  const config = readConfigFromDisk()
-  const { mergedConfig, changed } = mergeDefaultExtraPrompts(config)
+const reasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+])
+const stringRecord = z.record(z.string(), z.string())
+const providerModelSchema = z.looseObject({
+  id: z.string(),
+  aliases: z.array(z.string()).optional(),
+  kind: z.enum(["chat", "embedding"]),
+  dimensions: z.number().optional(),
+  supportsStreaming: z.boolean().optional(),
+  passReasoningEffort: z.boolean().optional(),
+})
+const providerSchema = z.looseObject({
+  id: z.string(),
+  name: z.string(),
+  type: z.literal("openai-compatible"),
+  baseUrl: z.string(),
+  apiKey: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+  headers: stringRecord.optional(),
+  models: z.array(providerModelSchema),
+  passReasoningEffort: z.boolean().optional(),
+})
+const appConfigSchema = z.looseObject({
+  auth: z.looseObject({ apiKeys: z.array(z.string()).optional() }).optional(),
+  customProviders: z.array(providerSchema).optional(),
+  extraPrompts: stringRecord.optional(),
+  smallModel: z.string().optional(),
+  modelReasoningEfforts: z.record(z.string(), reasoningEffortSchema).optional(),
+  useFunctionApplyPatch: z.boolean().optional(),
+  compactUseSmallModel: z.boolean().optional(),
+  groqApiKey: z.string().optional(),
+  groqModel: z.string().optional(),
+  codexCleanupModel: z.string().optional(),
+})
 
-  if (changed) {
-    try {
-      fs.writeFileSync(
-        PATHS.CONFIG_PATH,
-        `${JSON.stringify(mergedConfig, null, 2)}\n`,
-        { encoding: "utf8", mode: 0o600 },
-      )
-      fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
-    } catch (writeError) {
-      consola.warn(
-        "Failed to write merged extraPrompts to config file",
-        writeError,
-      )
-    }
-  }
-
-  cachedConfig = mergedConfig
-  return mergedConfig
+export function validateAppConfigJson(value: unknown): JsonValue {
+  if (!appConfigSchema.safeParse(value).success)
+    throw new StorageSchemaError("Invalid app configuration")
+  return normalizeSettingsJson(omitUndefinedProperties(value))
 }
 
-export function writeConfig(config: AppConfig): void {
-  if (useInMemoryConfigForTest) {
-    cachedConfig = config
+function omitUndefinedProperties(
+  value: unknown,
+  parents = new WeakSet<object>(),
+): unknown {
+  if (value === null || typeof value !== "object") return value
+  if (parents.has(value))
+    throw new StorageSchemaError("Invalid app configuration")
+  parents.add(value)
+  try {
+    if (Array.isArray(value))
+      return Array.from(value, (child: unknown) =>
+        omitUndefinedProperties(child, parents),
+      )
+    const prototype: unknown = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null)
+      throw new StorageSchemaError("Invalid app configuration")
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, child]) => child !== undefined)
+        .map(([key, child]) => [key, omitUndefinedProperties(child, parents)]),
+    )
+  } finally {
+    parents.delete(value)
+  }
+}
+
+function appConfigFromJson(value: unknown): AppConfig {
+  return validateAppConfigJson(value) as AppConfig
+}
+
+export async function mergeConfigWithDefaults(): Promise<AppConfig> {
+  if (testConfig !== null) {
+    testConfig = mergeDefaultExtraPrompts(testConfig).mergedConfig
+    return testConfig
+  }
+  const merged = await updateSetting("app", (stored) => {
+    const config =
+      stored === undefined ? defaultConfig : appConfigFromJson(stored)
+    return validateAppConfigJson(mergeDefaultExtraPrompts(config).mergedConfig)
+  })
+  return appConfigFromJson(merged)
+}
+
+export async function writeConfig(config: AppConfig): Promise<void> {
+  const value = validateAppConfigJson(config)
+  if (testConfig !== null) {
+    testConfig = appConfigFromJson(value)
     return
   }
-
-  ensureConfigFile()
-  fs.writeFileSync(
-    PATHS.CONFIG_PATH,
-    `${JSON.stringify(config, null, 2)}\n`,
-    "utf8",
-  )
-  fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
-  cachedConfig = config
+  await writeSetting("app", value)
 }
 
-export function updateConfig(
+export async function updateConfig(
   updater: (config: AppConfig) => AppConfig,
-): AppConfig {
-  const nextConfig = updater(getConfig())
-  writeConfig(nextConfig)
-  return nextConfig
+): Promise<AppConfig> {
+  if (testConfig !== null) {
+    const next = appConfigFromJson(updater(structuredClone(testConfig)))
+    testConfig = next
+    return next
+  }
+  const committed = await updateSetting("app", (value) => {
+    if (value === undefined)
+      throw new StorageSchemaError("App configuration is not initialized")
+    return validateAppConfigJson(updater(appConfigFromJson(value)))
+  })
+  return appConfigFromJson(committed)
 }
 
 export function setConfigForTest(config: AppConfig | null): void {
-  useInMemoryConfigForTest = config !== null
-  cachedConfig = config
+  testConfig = config === null ? null : appConfigFromJson(config)
+}
+
+export function getConfigForTest(): AppConfig | undefined {
+  return testConfig === null ? undefined : structuredClone(testConfig)
 }
 
 export function getConfig(): AppConfig {
-  cachedConfig ??= readConfigFromDisk()
-  return cachedConfig
+  if (testConfig !== null) return testConfig
+  const value = getLoadedSetting("app")
+  if (value === undefined)
+    throw new StorageSchemaError("App configuration is not initialized")
+  return appConfigFromJson(value)
 }
-
 export function getExtraPromptForModel(model: string): string {
   const config = getConfig()
   return config.extraPrompts?.[model] ?? ""
@@ -243,7 +283,7 @@ export function getCodexCleanupModel(): string {
   return configured && configured.length > 0 ? configured : getSmallModel()
 }
 
-export function setCodexCleanupModel(model: string | null): AppConfig {
+export function setCodexCleanupModel(model: string | null): Promise<AppConfig> {
   return updateConfig((config) => {
     if (model === null || model.trim().length === 0) {
       const { codexCleanupModel: _omit, ...rest } = config

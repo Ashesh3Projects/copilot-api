@@ -1,8 +1,17 @@
+import "./data-dir"
+
 import { expect, test } from "bun:test"
 
 import { state } from "~/lib/state"
 
-import { initializeTestState, postJSON, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  postJSON,
+  TEST_TIMEOUT,
+} from "./setup"
+
+useIntegrationFixture()
 
 await initializeTestState()
 

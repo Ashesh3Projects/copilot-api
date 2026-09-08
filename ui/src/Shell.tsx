@@ -44,9 +44,11 @@ const MONITOR_ITEMS: Array<NavEntry> = [
   { section: "environments", label: "Environments", icon: MonitorIcon },
   { section: "llm-debug", label: "LLM Debug", icon: BugIcon },
   { section: "usage", label: "Usage", icon: ChartBarIcon },
+  { section: "activity", label: "Activity", icon: MessageSquareIcon },
 ]
 
 const CONTROL_ITEMS: Array<NavEntry> = [
+  { section: "accounts", label: "GitHub Accounts", icon: CopilotIcon },
   { section: "flags", label: "Feature Flags", icon: FlagIcon },
   { section: "replacements", label: "Replacements", icon: Repeat2Icon },
   {

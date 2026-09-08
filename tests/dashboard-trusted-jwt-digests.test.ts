@@ -40,12 +40,12 @@ test("generated dashboard exposes trusted JWT digest controls", () => {
 })
 
 beforeEach(async () => {
-  trustedJwtDigestStore.replaceForTest([])
+  trustedJwtDigestStore.resetAfterTest()
   admin = await createTestAdminSession()
 })
 
-afterEach(() => {
-  resetTestAdminSession()
+afterEach(async () => {
+  await resetTestAdminSession()
   trustedJwtDigestStore.resetAfterTest()
 })
 
@@ -219,7 +219,7 @@ test("adding a digest rejects invalid JSON, fields, labels, and digests", async 
     })
     expect(response.status, invalidBody.name).toBe(400)
   }
-  expect(trustedJwtDigestStore.list()).toEqual([])
+  expect(await trustedJwtDigestStore.list()).toEqual([])
 })
 
 test("adding a duplicate digest returns conflict", async () => {
@@ -237,11 +237,11 @@ test("adding a duplicate digest returns conflict", async () => {
     body: JSON.stringify({ label: "Second", digest: digest.toUpperCase() }),
   })
   expect(duplicate.status).toBe(409)
-  expect(trustedJwtDigestStore.list()).toHaveLength(1)
+  expect(await trustedJwtDigestStore.list()).toHaveLength(1)
 })
 
 test("patch requires exactly one boolean enabled field", async () => {
-  const entry = trustedJwtDigestStore.add({
+  const entry = await trustedJwtDigestStore.add({
     label: "Office",
     digest: sha256Hex("office-device"),
   })
@@ -267,7 +267,7 @@ test("patch requires exactly one boolean enabled field", async () => {
     })
     expect(response.status, invalidBody.name).toBe(400)
   }
-  expect(trustedJwtDigestStore.list()[0]?.enabled).toBe(true)
+  expect((await trustedJwtDigestStore.list())[0]?.enabled).toBe(true)
 })
 
 test("patch and delete return not found for an unknown valid UUID", async () => {
@@ -287,7 +287,7 @@ test("patch and delete return not found for an unknown valid UUID", async () => 
 
 test("an inference JWT cannot access trusted digest dashboard routes", async () => {
   const rawJwt = "header.payload.inference-signature"
-  trustedJwtDigestStore.add({
+  await trustedJwtDigestStore.add({
     label: "Inference only",
     digest: sha256Hex(rawJwt),
   })

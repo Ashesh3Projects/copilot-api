@@ -1,11 +1,21 @@
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 
 import {
+  AccountsService,
+  createAccountMutationContext,
+} from "../src/lib/accounts-service"
+import {
   clearLlmDebugLogs,
   finishLlmDebugLog,
   startLlmDebugLog,
 } from "../src/lib/llm-debug-log"
 import { state } from "../src/lib/state"
+import { getStorageRuntime } from "../src/lib/storage/runtime"
+import {
+  createHistoryRuntime,
+  peekHistoryRuntime,
+} from "../src/lib/telemetry-writer"
+import { tokenPool } from "../src/lib/token-pool"
 import { DASHBOARD_HTML } from "../src/routes/dashboard/page-generated"
 import { server } from "../src/server"
 import {
@@ -39,17 +49,50 @@ beforeAll(() => {
 
 beforeEach(async () => {
   fetchMock.mockClear()
-  clearLlmDebugLogs()
+  await peekHistoryRuntime()?.close(500)
   state.accountType = "individual"
   state.copilotToken = "fresh-copilot-token"
   state.githubToken = "github-token"
   state.isMultiToken = false
   adminSession = await createTestAdminSession()
+  await createHistoryRuntime(getStorageRuntime().storage, { autoFlush: false })
+  await clearLlmDebugLogs()
+  const storage = getStorageRuntime().storage
+  const service = new AccountsService(storage, {
+    pool: tokenPool,
+    validate: (input) =>
+      Promise.resolve({
+        persisted: {
+          token: input.token,
+          instanceDomain: "github.com",
+          upstreamUserId: "debug-fixture",
+          login: "fixture",
+          label: null,
+          accountType: "individual",
+          modelCount: 0,
+        },
+        resolved: {
+          token: "fresh-copilot-token",
+          baseUrl: "https://api.githubcopilot.com",
+          models: { object: "list", data: [] },
+        },
+      }),
+  })
+  const context = await createAccountMutationContext(
+    storage,
+    "account.create",
+    {},
+    "owner:debug-fixture",
+  )
+  await service.create({ token: "github-token" }, context)
 })
 
-afterAll(() => {
+afterAll(async () => {
+  for (const account of tokenPool.getAllAccounts())
+    tokenPool.deleteAccount(account.id)
   state.apiKeyAuth = originalApiKeyAuth
-  resetTestAdminSession()
+  await peekHistoryRuntime()?.close(500)
+  await resetTestAdminSession()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
@@ -109,13 +152,17 @@ test("serves LLM debug logs through dashboard API", async () => {
     }
   }
   expect(detailBody.request).toMatchObject({
-    body: requestBody,
-    headers: requestHeaders,
-    url,
+    body: JSON.stringify({
+      input: "dashboard lookup",
+      api_key: "[REDACTED]",
+      model: "gpt-ui",
+    }),
+    headers: { authorization: "[REDACTED]", cookie: "[REDACTED]" },
+    url: "https://example.test/responses?api_key=%5BREDACTED%5D",
   })
   expect(detailBody.response).toMatchObject({
-    body: responseBody,
-    headers: responseHeaders,
+    body: JSON.stringify({ access_token: "[REDACTED]", ok: true }),
+    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
   })
 
   const clearResponse = await server.request("/dashboard/api/llm-debug", {

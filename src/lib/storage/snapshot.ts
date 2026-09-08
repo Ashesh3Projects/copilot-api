@@ -20,6 +20,17 @@ function freezeJson(value: JsonValue): JsonValue {
   return value
 }
 
+function freezeDetached<T>(value: T): T {
+  const detached = structuredClone(value)
+  const freeze = (item: unknown): void => {
+    if (item === null || typeof item !== "object") return
+    for (const child of Object.values(item)) freeze(child)
+    Object.freeze(item)
+  }
+  freeze(detached)
+  return detached
+}
+
 /** ReadonlyMap at runtime too: freezing a native Map does not disable its setters. */
 class SnapshotDocuments
   implements ReadonlyMap<SettingsNamespace, SettingsDocument>
@@ -89,6 +100,9 @@ function immutableSnapshot(source: RuntimeSnapshot): RuntimeSnapshot {
   return Object.freeze({
     revision: source.revision,
     documents: new SnapshotDocuments(documents),
+    ...(source.providers ?
+      { providers: freezeDetached(source.providers) }
+    : {}),
   })
 }
 

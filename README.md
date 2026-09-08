@@ -138,8 +138,8 @@ Responses compaction.
   replay, model redirects/settings/routing, custom providers, replacements,
   feature flags, IP allowlists, and configuration export.
 - Current GitHub Copilot quota reporting through both the CLI and `GET /usage`.
-- Complete local minute/model request and token aggregates plus lifetime totals
-  for dashboard utilization views.
+- Durable minute/model request and token aggregates plus lifetime totals, with
+  collection-gap indicators for lost or uncertain telemetry.
 - Manual approval for primary generation endpoints.
 - Optional Sentry tracing.
 
@@ -157,19 +157,25 @@ Responses compaction.
 - A GitHub account with an active Copilot subscription.
 - Bun for package and source usage. Docker is an alternative.
 
-Choose a long random gateway key and start the published package on loopback.
-The valueless `--api-key-auth` flag reads the key from
-`COPILOT_API_KEY_AUTH`:
+From this checkout, install dependencies, issue a one-use setup code, and start
+on loopback. Both commands must select the same database:
 
 ```sh
-export COPILOT_API_KEY_AUTH='replace-with-a-long-random-key'
-bunx --bun @ashsec/copilot-api@latest start --host 127.0.0.1 --api-key-auth
+bun install
+bun src/main.ts admin --setup-code
+bun src/main.ts start --host 127.0.0.1
 ```
 
-On the first run, follow the GitHub device-authentication prompt. The resulting
-token and configuration are stored under the application data directory. To
-generate a reusable environment entry for GitHub.com or GitHub Enterprise Cloud
-without storing it, run `copilot-api auth`.
+Without the optional Turso pair, this uses `copilot-api.sqlite` in `DATA_DIR`
+(default `~/.local/share/copilot-api`). Open
+`http://127.0.0.1:4141/dashboard` and enter the printed setup code, a new long
+random gateway key, and an administrator password. The code expires after 15
+minutes and can be used once. No GitHub account is needed to open setup.
+
+Add GitHub.com or GitHub Enterprise Cloud accounts through the dashboard. The
+account registry and credentials are stored in the selected database. Existing
+JSON files and environment credentials are imported only through an explicit
+migration command; see the [storage runbook](docs/turso-storage.md).
 
 List the models available to that account:
 
@@ -187,8 +193,7 @@ curl http://127.0.0.1:4141/v1/chat/completions \
   -d '{"model":"MODEL_ID_FROM_V1_MODELS","messages":[{"role":"user","content":"Hello"}],"stream":false}'
 ```
 
-Open the operator dashboard at `http://127.0.0.1:4141/dashboard`. First-time
-setup uses the same gateway key plus a new administrator password.
+Use the gateway key chosen during setup for the requests above.
 
 > [!CAUTION]
 > Always pass `--host 127.0.0.1` for a local-only server. If `--host` is
@@ -199,19 +204,17 @@ setup uses the same gateway key plus a new administrator password.
 
 ### OpenAI-compatible clients
 
-Use the `/v1` base URL. A client library may require a non-empty API-key value
-even when gateway authentication is disabled locally.
+Use the `/v1` base URL and a stored gateway or scoped inference credential.
 
 ```dotenv
 OPENAI_BASE_URL=http://127.0.0.1:4141/v1
-OPENAI_API_KEY=local-placeholder
+OPENAI_API_KEY=replace-with-gateway-key
 ```
 
-When gateway authentication is enabled, replace the placeholder with the
-configured gateway key.
+Ordinary inference routes require credentials even on loopback.
 
 Audio transcription uses the same `/v1` base URL and gateway key. It requires
-`GROQ_API_KEY` (or `groqApiKey` in `config.json`):
+a Groq API key stored through the dashboard:
 
 ```sh
 curl http://127.0.0.1:4141/v1/audio/transcriptions \
@@ -236,11 +239,11 @@ The Anthropic base URL does not include `/v1`:
 
 ```dotenv
 ANTHROPIC_BASE_URL=http://127.0.0.1:4141
-ANTHROPIC_AUTH_TOKEN=local-placeholder
+ANTHROPIC_AUTH_TOKEN=replace-with-gateway-key
 ```
 
-Select current primary and small-model IDs from `GET /v1/models`. For a
-protected gateway, `ANTHROPIC_AUTH_TOKEN` must be the gateway key.
+Select current primary and small-model IDs from `GET /v1/models`. Set
+`ANTHROPIC_AUTH_TOKEN` to the stored gateway or inference credential.
 
 The interactive helper can generate a Claude Code launch command after loading
 the current model list:
@@ -250,12 +253,12 @@ bunx --bun @ashsec/copilot-api@latest start --host 127.0.0.1 --claude-code
 ```
 
 The generated command always uses `dummy`. Before running it, replace that value
-with the gateway key whenever `--api-key-auth` is enabled.
+with a stored gateway or inference credential.
 
 ### Google-compatible clients
 
 Use the Google-compatible route and provide the gateway key through
-`x-goog-api-key` when authentication is enabled:
+`x-goog-api-key`:
 
 ```sh
 curl "http://127.0.0.1:4141/v1beta/models/MODEL_ID_FROM_V1_MODELS:generateContent" \
@@ -272,36 +275,28 @@ currently translated.
 
 Copilot API separates these credential boundaries:
 
-1. **GitHub credentials** authenticate the server to GitHub Copilot. Generate a
-   reusable entry with `auth`, supply one through `--github-token` or
-   `GITHUB_TOKENS`, manage stored accounts with `config`, or let `start` run its
-   legacy first-use GitHub.com device flow.
-2. **Gateway credentials** authenticate trusted data-plane clients and bootstrap
-   OAuth and the administrator account. `COPILOT_API_KEY_AUTH` is the gateway
-   key and sole environment-based gateway credential. Direct usage requires
-   `--api-key-auth` without a value; the Docker entrypoint supplies that flag.
-3. **OAuth and inference credentials** are independent, scoped credentials.
-   The OAuth flow never returns the gateway key. Claude Code receives a
-   one-hour opaque access token and a rotating 30-day refresh token; an API key
-   created through OAuth is a separate inference-only credential. Operators
-   can also register client-held inference secrets by placing only their
-   SHA-256 hex digests in `COPILOT_INFERENCE_CREDENTIAL_SHA256S`. Hash the
-   credential after trimming leading and trailing whitespace; the digest text
-   is not itself accepted as a credential. Registered secrets can call
-   inference routes but cannot bootstrap OAuth, read profile data, create API
-   keys, or access administrator routes.
-4. **Administrator sessions** are server-side sessions established with both
-   the gateway key and an administrator password. The browser stores a Secure,
-   HttpOnly session cookie and a separate SameSite-strict CSRF cookie, not the
-   gateway key.
+1. **GitHub credentials** authenticate the server to GitHub Copilot. Manage
+   accounts through the dashboard or the database-backed `config` CLI. `auth`
+   runs browser/device authentication, validates the account, and saves it in
+   the selected database without printing the credential. `start` never runs
+   a first-use device flow.
+2. **Gateway credentials** authenticate trusted data-plane clients and OAuth
+   authorization. Initial setup stores the chosen key as a digest; subsequent
+   keys are managed in the dashboard. Environment variables and the obsolete
+   `--api-key-auth` flag are not runtime credential sources.
+3. **OAuth and inference credentials** are independent, scoped database records.
+   The OAuth flow never returns the gateway key. Operators can register the
+   SHA-256 hex digest of a trimmed client-held secret in the dashboard. The
+   digest text itself is rejected. Such secrets receive `user:inference` only
+   and cannot bootstrap OAuth or access administrator routes.
+4. **Administrator sessions** are established with a stored gateway key and an
+   administrator password. The browser stores a Secure, HttpOnly session cookie
+   and a separate SameSite-strict CSRF cookie, not the gateway key. First setup
+   also requires a one-use code issued by `admin --setup-code`.
 
-For any non-loopback deployment, enable a long random startup gateway key:
-
-```sh
-bunx --bun @ashsec/copilot-api@latest start \
-  --host 0.0.0.0 \
-  --api-key-auth replace-with-a-long-random-key
-```
+For non-loopback access, configure the exact external dashboard origin and
+trusted proxy peers, complete setup, and keep the API behind the intended
+private listener or reverse proxy.
 
 Clients can send the key in any of these forms:
 
@@ -333,35 +328,34 @@ source and transparent-proxy permission. Later missing or wrong credentials
 still return `401` but cannot re-ban that IP during the session. Newly automatic
 entries do not authorize credential-free transparent proxy inference.
 
-`config.json` also supports `auth.apiKeys`. When no startup key is active, those
-keys protect globally guarded API routes. If neither source configures a gateway
-credential, the normal inference routes remain open; use that mode only on a
-trusted loopback network.
+Authentication reads the selected database. Missing database credentials do
+not enable anonymous inference. An unavailable database fails closed rather
+than accepting a cached environment or JSON credential.
 
 OAuth authorization accepts Claude Code's registered production client, exact
 manual or localhost callback URI, requested scopes, and S256 PKCE parameters.
 After the gateway key is entered in the browser, the server issues a random,
 one-use, two-minute authorization code bound to the client, redirect URI, state,
 scope, and PKCE challenge. Access, refresh, authorization-code, and generated
-inference secrets are persisted only as SHA-256 digests in
-`oauth_tokens.json`. Issued access and refresh credentials do not expire;
+inference secrets are persisted only as SHA-256 digests in the database.
+Issued access and refresh credentials do not expire;
 refresh is repeatable and race-safe, while explicit revocation remains
 available at `POST /v1/oauth/revoke`.
 
 The dashboard shell can be loaded before login, but every dashboard API requires
 an administrator session. Administrator passwords must be at least 4 characters
 and have no other content rules; numeric-only passwords are accepted. First-time
-local setup requires the gateway key and password, while
-`COPILOT_ADMIN_PASSWORD_HASH` can supply a precomputed Argon2id verifier. Normal
-login requires both the gateway key and password. Sessions have a 30-day
-absolute lifetime and 12-hour idle lifetime; mutations also require a CSRF token
-and an approved `Origin`. A local password change or environment-hash rotation
-revokes other sessions.
+setup requires the CLI-issued code, chosen gateway key, and password. Normal
+login requires the gateway key and password. Sessions have a 30-day absolute
+lifetime; mutations require a CSRF token and an approved `Origin`. Password
+changes and the local `admin --reset` command revoke dashboard sessions.
+`COPILOT_ADMIN_PASSWORD_HASH` is accepted only by explicit legacy import.
 
 Keep the application bound to loopback or a private container network even with
 these controls. Publish only the exact hostname/path set required by the clients
-you use. The sole public liveness route is exact `GET /health/health`; no session
-router is mounted below `/health`. Direct Connect is disabled unless
+you use. Public liveness is available at `GET /health` and `GET /health/health`;
+`GET /health/ready` separately reports database readiness. No session router is
+mounted below `/health`. Direct Connect is disabled unless
 `COPILOT_API_ENABLE_DIRECT_CONNECT=true`, and remains authenticated when enabled.
 
 ## Models, routing, and providers
@@ -406,42 +400,16 @@ The dashboard is the recommended interface for these controls:
 - **Model routing** enables or disables a model for an individual Copilot
   account.
 
-These settings persist in separate JSON files so they can be inspected and
-backed up independently.
+These settings persist in the selected database and can be inspected through
+the dashboard and sanitized configuration export.
 
 ### Custom OpenAI-compatible providers
 
-Custom providers can be managed in the dashboard or in `config.json`. Prefer an
-environment-variable reference over storing a provider key directly:
-
-```json
-{
-  "customProviders": [
-    {
-      "id": "example-provider",
-      "name": "Example Provider",
-      "type": "openai-compatible",
-      "baseUrl": "https://your-domain.example/v1",
-      "apiKeyEnv": "CUSTOM_PROVIDER_API_KEY",
-      "headers": {},
-      "models": [
-        {
-          "id": "example-chat-model",
-          "aliases": ["example-chat"],
-          "kind": "chat",
-          "passReasoningEffort": true
-        },
-        {
-          "id": "example-embedding-model",
-          "aliases": ["example-embedding"],
-          "kind": "embedding",
-          "dimensions": 1024
-        }
-      ]
-    }
-  ]
-}
-```
+Manage provider metadata, models, API keys, and custom headers through the
+dashboard. Credentials are stored in database secret records and remain
+write-only in dashboard listings. `apiKeyEnv` is a legacy import input, not a
+runtime reference; `storage import-legacy --from-env` resolves only the selected
+credential names referenced by imported providers.
 
 Provider coverage is intentionally scoped:
 
@@ -468,27 +436,27 @@ without exchanging them for a legacy token or persisting session-token maps.
 Model-session acquisition preserves caller-supplied model hints; refresh remains
 token-only.
 
-Multi-account mode activates only when at least two GitHub tokens are available.
-Configure accounts interactively:
+All accounts are stored in the database, including a single account.
+Multi-account selection activates when at least two accounts are available.
+Manage them through the dashboard or interactively:
 
 ```sh
-bunx --bun @ashsec/copilot-api@latest config
+bun src/main.ts config
 ```
 
-Or provide comma-separated tokens without writing token files. Prefix an
-enterprise token with its bare `*.ghe.com` instance domain; bare tokens default
-to GitHub.com. OAuth/user tokens (`gho_`, `ghu_`) are the supported default.
-Fine-grained personal access tokens (`github_pat_`) work only where GitHub has
-enabled direct Copilot API PAT authentication (currently a controlled/staff
-capability); classic `ghp_` tokens are not supported by the current Copilot SDK
-authentication contract:
+Choose GitHub.com or the account's GitHub Enterprise Cloud instance during
+admission. Legacy comma-separated `GITHUB_TOKENS` entries are supported only by
+explicit import with `--from-env`; setting them on the running server does not
+replace the durable account registry.
 
-```dotenv
-GITHUB_TOKENS=msft.ghe.com:first-enterprise-token,github.ghe.com:second-enterprise-token,public-github-token
-```
+Use **Refresh models** on an account to fetch its current catalog, or
+**Refresh all models** to process every account and show individual outcomes.
+Refresh preserves account enablement and model-routing settings. Disabled
+accounts can refresh without becoming enabled; a failed refresh retains the
+last catalog and does not stop the other accounts in a bulk refresh.
 
-At startup, both GitHub.com and GHE Cloud accounts validate their GitHub OAuth
-token through `/copilot_internal/user`, resolve the returned Copilot endpoint,
+Account admission and refresh validate GitHub.com and GHE Cloud OAuth
+tokens through `/copilot_internal/user`, resolve the returned Copilot endpoint,
 and use that same bearer for model discovery and inference. Each healthy account
 contributes its models to a shared eligibility index. Dashboard model-routing
 overrides can disable a model on a specific account.
@@ -500,7 +468,7 @@ selected account and are not retried with another identity. A `421` response
 refreshes that account's advertised Copilot endpoint and model catalog, then
 retries once on the same identity. Other eligible failover stays within the same
 GitHub instance, so GHE tenant boundaries are never crossed. Accounts that fail
-startup validation are marked unhealthy, while a runtime `429` does not change
+validation are marked unhealthy, while a runtime `429` does not change
 account health. A known model disabled for every account returns a local `403`;
 an unknown model falls back to the first healthy account. Multi-account mode is
 for availability, model coverage, and session affinity, not unrestricted load
@@ -522,54 +490,46 @@ Open `/dashboard` on the same host as the API. The dashboard includes:
 - managed IP allowlists and managed inference-only Codex JWT digests; and
 - settings inspection and ZIP export.
 
-On first use, the dashboard prompts for the gateway key and a new administrator
-password. Later logins require both. The browser receives a Secure, HttpOnly,
+On first use, the dashboard prompts for a CLI-issued setup code, a new gateway
+key, and an administrator password. Later logins require the key and password. The browser receives a Secure, HttpOnly,
 SameSite-strict session cookie plus a separate SameSite-strict CSRF cookie; it
 does not persist either login credential in `localStorage`. Set
 `COPILOT_ADMIN_ORIGIN` to the exact external dashboard origin before serving
 the dashboard through a reverse proxy.
 
-If the locally stored administrator password is lost, stop the running server,
-run `copilot-api admin --reset` from the trusted host console, and restart it.
-The command requires interactive confirmation, removes the local password
-verifier, and revokes all administrator sessions; the next dashboard visit
-performs first-use setup again with the gateway key. In environment-managed
-mode, update `COPILOT_ADMIN_PASSWORD_HASH` in the secret manager and restart the
-server instead; `admin --reset` also removes the environment-management marker
-and therefore returns the deployment to first-use setup if the variable is
-subsequently removed. There is deliberately no public password-reset endpoint.
+If the administrator password is lost, run `admin --reset` from the trusted
+host console against the same database. It prompts twice with hidden input,
+replaces the password, and revokes every dashboard session. The gateway key
+remains required for login. There is no public password-reset endpoint.
 
 With the tracked Compose service, use:
 
 ```sh
 docker compose stop copilot-api
-docker compose run --rm --no-deps --entrypoint bun copilot-api run dist/main.js admin --reset
+docker compose run --rm --no-deps copilot-api admin --reset
 docker compose up -d copilot-api
 ```
 
-LLM Debug records outbound Copilot attempts exactly as captured, including raw
-URLs, request and response headers, bodies, authorization, cookies, API keys,
-tokens, session identifiers, and other secret-bearing fields. Entries exist
-only in process memory, expire after ten minutes, and are pruned during
-debug-store operations. It observes Chat Completions, Responses, Embeddings,
-and Messages attempts. Replay is narrower and supports logged Chat Completions
-and Responses attempts only; replay execution obtains fresh server-side
-authorization and keeps the original configured provider destination. A removed
-or changed provider returns an explicit replay error. Debug
-detail, replay, provider-secret changes, configuration export, and other
-sensitive operations require the authenticated administrator session.
+LLM Debug stores bounded, sanitized outbound attempts in the database. URLs,
+headers, body fields, and recognized credential values are scrubbed before
+capture is queued. Successful captures expire after ten minutes; failed or
+interrupted captures after one hour. Capacity limits can evict entries sooner.
+Replay supports complete replayable Chat Completions and Responses captures,
+obtains fresh server-side credentials, and rejects redacted, omitted, expired,
+or interrupted captures and removed or changed providers.
 
-`GET /usage` returns current GitHub Copilot quota data. The dashboard's local
-usage view is a different tracker: minute/model aggregates are retained for
-seven days, while separate lifetime counters remain cumulative. Storage is
-pruned on load, record, and read and is written atomically.
+`GET /usage` returns current Copilot quota data. Dashboard utilization instead
+uses committed minute/model usage buckets and lifetime counters; committed old
+usage is retained. Diagnostic and routing detail has bounded retention. Pending
+telemetry is bounded to 2,000 records, 16 MiB, and five minutes; pressure and
+outages may omit diagnostic bodies or lose records. Collection-gap indicators
+report known loss and uncertainty instead of claiming complete history.
 
-Configuration exports omit GitHub token files, OAuth/admin stores, the startup
-gateway key, and local usage history. Secret-like keys and values in exported
-configuration—including provider keys, authorization headers, cookies, tokens,
-passwords, and credentials—are replaced with `[REDACTED]`. Provider secrets are
-also write-only through dashboard APIs: listings report whether a key is
-configured without returning the key or sensitive custom headers.
+Sanitized ZIP export excludes credential and history tables and replaces
+secret-like configuration values with `[REDACTED]`. It cannot restore secrets.
+For recovery or moving between SQLite and Turso, use the separate
+password-encrypted logical backup and restore commands in the
+[storage runbook](docs/turso-storage.md).
 
 ## Claude Code and Codex integrations
 
@@ -579,7 +539,7 @@ These are compatibility implementations, not hosted identity or cloud services.
 
 - The Anthropic Messages endpoint supports normal Claude Code model traffic.
 - The local OAuth facade implements opaque, scoped Claude Code credentials with
-  one-use authorization codes, S256 PKCE, refresh rotation, and revocation. It
+  one-use authorization codes, S256 PKCE, reusable refresh, and revocation. It
   is local gateway identity, not GitHub or Anthropic identity.
 - Code-session creation, bridge setup, session APIs, and user actions require an
   OAuth credential with the Claude Code session scope.
@@ -695,7 +655,8 @@ troubleshooting procedure is in
 [docs/codex-desktop-managed-auth.md](docs/codex-desktop-managed-auth.md).
 
 Set `GROQ_API_KEY` or the equivalent `groqApiKey` config field to enable speech
-transcription. Set `groqModel` in `config.json` to change the model used for
+transcription. Set `groqModel` in the database-backed application settings to
+change the model used for
 `whisper-1` and the Codex/voice paths. The voice WebSocket endpoint is
 `/api/ws/speech_to_text/voice_stream`. It authenticates the upgrade with an
 OAuth `voice:transcribe` entitlement (derived for Claude Code from
@@ -724,11 +685,12 @@ request pacing, body caps, or proxy timeouts.
 
 | Command | Purpose |
 | --- | --- |
-| `auth` | Acquire and print a reusable GitHub.com or GHE Cloud token entry without starting the server |
-| `start` | Authenticate if needed and start the gateway |
-| `admin` | Reset local administrator auth or generate an environment verifier |
+| `auth` | Authenticate with GitHub.com or GHE Cloud and save the validated account in the selected database without starting the server or printing its credential |
+| `start` | Open the selected database and start the gateway without account setup |
+| `admin` | Issue setup codes, replace the administrator password, or hash a legacy verifier |
+| `storage` | Preview/apply legacy import and create or restore encrypted logical backups |
 | `check-usage` | Print current GitHub Copilot quota information |
-| `debug` | Print version, runtime, data paths, and token-file status |
+| `debug` | Print version, runtime, storage kind, and stored-account presence |
 | `config` | Interactively manage replacements, stored accounts, and custom providers |
 
 Run a command with `--help` to inspect the installed version's current options.
@@ -742,13 +704,13 @@ Run a command with `--help` to inspect the installed version's current options.
 | `--verbose` | `-v` | off | Enable verbose logging |
 | `--account-type <type>` | `-a` | `individual` | `individual`, `business`, or `enterprise` Copilot routing |
 | `--manual` |  | off | Prompt before forwarding Chat Completions, Messages, Responses HTTP, and Google requests |
-| `--github-token <entry>` | `-g` | unset | Use one `instance_domain:token` entry or a bare GitHub.com token for this process |
+| `--github-token <entry>` | `-g` | unset | Rejected; admit accounts through the dashboard or explicit import |
 | `--claude-code` | `-c` | off | Generate a Claude Code launch command from the current model list |
 | `--show-token` |  | off | Print the full GitHub/Copilot OAuth credential; sensitive troubleshooting only |
 | `--proxy-env` |  | off | Reserved proxy initializer; currently ineffective because the supported Bun server path skips it |
 | `--insecure` |  | off | Disable TLS certificate verification; unsafe outside controlled debugging |
 | `--debug` | `-d` | off | Log raw incoming URLs, headers, and most top-level JSON fields; sensitive troubleshooting only |
-| `--api-key-auth <key>` |  | unset | Enable the startup gateway credential for data-plane auth, OAuth authorization, and administrator bootstrap/login |
+| `--api-key-auth <key>` |  | unset | Rejected; use database-backed setup and credential management |
 
 ### Other command options
 
@@ -758,48 +720,33 @@ Run a command with `--help` to inspect the installed version's current options.
 | `auth` | `--host <host>` | Skip the account picker and authenticate with GitHub.com or a `*.ghe.com` host |
 | `auth` | `--device-code` | Use the device-code flow |
 | `auth` | `--web-flow` | Use browser OAuth with a loopback callback |
-| `admin` | `--reset` | Interactively remove local admin auth and revoke every dashboard session |
-| `admin` | `--hash-password` | Prompt twice with hidden input and print an Argon2id verifier for `COPILOT_ADMIN_PASSWORD_HASH` |
+| `admin` | `--setup-code` | Issue a one-use 15-minute code for an unconfigured database |
+| `admin` | `--reset` | Interactively replace the administrator password and revoke every dashboard session |
+| `admin` | `--hash-password` | Prompt twice with hidden input and print an Argon2id verifier for explicit legacy import |
 | `debug` | `--json` | Emit diagnostic information as JSON |
 
 ## Configuration and persistent data
 
-The default data directory is `~/.local/share/copilot-api`. Override it with
-`DATA_DIR`. Docker sets it to `/app/data`.
+The default database is `copilot-api.sqlite` under `DATA_DIR`, which defaults
+to `~/.local/share/copilot-api` (`/app/data` in Docker). Mount the whole directory
+for SQLite's database, WAL, and SHM files. Setting both `TURSO_DATABASE_URL` and
+`TURSO_AUTH_TOKEN` selects remote Turso; setting just one is a configuration
+error. A remote outage never falls back to local SQLite.
 
-| File | Contents |
-| --- | --- |
-| `github_token` | Legacy/single GitHub token storage |
-| `github_tokens.json` | Stored GitHub accounts, instance domains, and optional labels |
-| `config.json` | Gateway keys, custom providers, prompt/model defaults, voice settings |
-| `replacements.json` | Request replacement rules |
-| `model_redirects.json` | Ordered model redirect rules |
-| `model_fallbacks.json` | HTTP 422 fallback rules and cache/notice settings; excludes conversation state |
-| `model_settings.json` | Per-model capability and behavior overrides |
-| `model_routing.json` | Per-account model enablement overrides |
-| `feature_flags.json` | GrowthBook/Claude Code flag overrides |
-| `statsig_overrides.json` | Codex/ChatGPT Statsig overrides |
-| `ip_allowlist.json` | Managed IP allowlist entries |
-| `trusted_jwt_digests.json` | Dashboard-managed SHA-256 digests for inference-only local Codex JWTs |
-| `oauth_tokens.json` | SHA-256 digests and metadata for OAuth codes, token families, and generated inference credentials |
-| `admin_auth.json` | Locally managed Argon2id verifier, or a non-secret marker that permanently records migration to environment-managed auth |
-| `admin_sessions.json` | Digested server-side administrator sessions and CSRF state |
-| `usage.json` | Complete minute/model aggregates and separate lifetime totals |
-
-When GitHub tokens come from environment variables or `--github-token`, the
-process uses environment-only token mode and does not read or write GitHub token
-files.
+Accounts, upstream/provider secrets, administrator and gateway/OAuth records,
+settings, IP policy, usage, and bounded diagnostic history share the selected
+database. Runtime JSON files are no longer read or written. Existing JSON
+files and selected environment credentials require `storage import-legacy`;
+source files remain untouched. See the [storage runbook](docs/turso-storage.md)
+for preview, apply, backup, restore, readiness, and storage-switch procedures.
 
 ### Environment variables
 
 | Variable | Scope | Purpose |
 | --- | --- | --- |
-| `GITHUB_TOKENS` | Direct and Docker | Comma-separated `instance_domain:token` or bare GitHub.com tokens; two or more enable multi-account mode |
 | `COPILOT_INTEGRATION_ID` | Direct and Docker | Copilot integration identifier; defaults to `copilot-developer-cli` for the stable Copilot CLI model catalog. Override it when the deployment has its own assigned integration ID. |
-| `DATA_DIR` | Direct and Docker | Override the persistent data directory |
-| `COPILOT_API_KEY_AUTH` | Direct and Docker | Gateway key and sole environment-based gateway credential; direct usage also requires the `--api-key-auth` flag without a value |
-| `COPILOT_INFERENCE_CREDENTIAL_SHA256S` | Direct and Docker | Optional comma-separated SHA-256 hex digests of trimmed client-held inference secrets; matching credentials receive only `user:inference` scope and digest text is rejected |
-| `COPILOT_ADMIN_PASSWORD_HASH` | Direct and Docker | Optional authoritative Argon2id PHC verifier for the administrator password; suitable for 1Password/Varlock |
+| `DATA_DIR` | Direct and Docker | Local SQLite directory; unused for persistence in Turso mode |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | Direct and Docker | Optional pair selecting remote Turso; neither selects local SQLite |
 | `COPILOT_ADMIN_ORIGIN` | Direct and Docker | Exact browser origin allowed for dashboard mutations; set this explicitly for a proxied deployment |
 | `COPILOT_TRUSTED_PROXY_CIDRS` | Direct and Docker | Comma-separated socket-peer CIDRs allowed to supply forwarding headers; defaults to loopback only |
 | `COPILOT_PUBLIC_BASE_URL` | Direct and Docker | Optional externally reachable absolute HTTP(S) base for bridge and Direct Connect callback URLs; may include a deployment path prefix |
@@ -809,8 +756,6 @@ files.
 | `SENTRY_DSN` | Direct and Docker | Enable Sentry tracing and error reporting |
 | `SENTRY_TRACES_SAMPLE_RATE` | Direct and Docker | Sentry trace sample rate |
 | `SENTRY_AI_RECORD_INPUTS` | Direct and Docker | Set to `false` to stop recording AI inputs/outputs in Sentry spans |
-| `GROQ_API_KEY` | Direct and Docker | Enable Groq-backed speech transcription |
-| `GH_TOKEN` | Docker entrypoint | Supply one GitHub token through the container entrypoint |
 | `COPILOT_HOST` | Docker entrypoint | Set the container listening host |
 | `COPILOT_VERBOSE` | Docker entrypoint | Add `--verbose` when set to `true` |
 | `COPILOT_DEBUG` | Docker entrypoint | Add `--debug` when set to `true` |
@@ -818,119 +763,69 @@ files.
 | `NODE_TLS_REJECT_UNAUTHORIZED` | Direct and Docker | Setting `0` disables outbound TLS verification process-wide; unsafe outside controlled debugging |
 | `CERT_DIR` | HTTPS proxy helper | Certificate directory used by `scripts/https-proxy.mjs` |
 
-Custom providers can reference any process environment variable through
-`apiKeyEnv`. Although `--proxy-env` is present in the CLI, it is currently a
+Legacy credential environment names, including provider `apiKeyEnv` references,
+are read only by explicit import with `--from-env`. Although `--proxy-env` is present in the CLI, it is currently a
 no-op in the supported Bun runtime; do not rely on it for outbound proxying.
 
 Use `--port` and update the container port mapping when changing the port.
 
 ## Docker
 
-The image stores persistent data in `/app/data`. The entrypoint already invokes
-the `start` command; do not append `start` to normal `docker run` arguments.
-
-### Build and authenticate
-
-```sh
-docker build -t copilot-api .
-docker run --rm -it copilot-api --auth
-```
-
-`--auth` is an image-entrypoint shortcut and must be the first image argument.
-It prints a reusable token entry but does not persist it. Add the printed value
-to `GITHUB_TOKENS` in the environment file used to start the service.
-
-### Start a protected container
-
-Create an environment file outside the repository/build context, for example
-`../copilot-api.env`:
-
-```dotenv
-COPILOT_HOST=0.0.0.0
-GITHUB_TOKENS=msft.ghe.com:replace-with-the-printed-token
-COPILOT_API_KEY_AUTH=replace-with-a-long-random-key
-COPILOT_ADMIN_ORIGIN=https://your-domain.example
-COPILOT_TRUSTED_PROXY_CIDRS=172.19.0.1/32,127.0.0.1/32,::1/128
-```
-
-Then start the container with the host port restricted to loopback:
-
-```sh
-docker run -d --name copilot-api --restart unless-stopped -p 127.0.0.1:4141:4141 --env-file ../copilot-api.env -v copilot-api-data:/app/data --health-cmd="wget --spider -q http://127.0.0.1:4141/health/health || exit 1" --health-interval=30s --health-timeout=5s --health-start-period=10s --health-retries=3 copilot-api
-```
-
-`GET /health/health` is the intentionally unauthenticated, metadata-free
-liveness route. No other health API or session route exists under `/health`.
-The image and Compose healthchecks both use this exact path.
+The image defaults to local SQLite in `/app/data`. Its entrypoint accepts
+`admin`, `storage`, `config`, `auth`, `debug`, and `check-usage` directly; other
+arguments start the server. No runtime GitHub or gateway environment credential
+is required.
 
 ### Docker Compose
 
-The tracked Compose file expects the fixed external
-`copilot-api_copilot-data` volume and a local `.env` file used by the existing
-automatic secret-management flow:
+The tracked Compose file creates the named `copilot-api_copilot-data` volume
+for new installations and preserves that name for existing data. `.env` is
+optional. For an existing JSON deployment, follow the explicit import procedure
+before starting the new server against the target database.
 
 ```sh
-docker volume create copilot-api_copilot-data
-docker compose run --rm copilot-api --auth
-# Add the printed entry to GITHUB_TOKENS in .env, then start the service.
-docker compose up -d --build
+docker compose build
+docker compose run --rm --no-deps copilot-api admin --setup-code
+docker compose up -d
 ```
 
-The resolved container environment must include `COPILOT_API_KEY_AUTH` as well
-as the deployment settings:
+Use the code in `/dashboard` to choose the initial gateway key and password,
+then add accounts and provider credentials. The host port is bound to loopback.
+Configure `COPILOT_ADMIN_ORIGIN` and exact `COPILOT_TRUSTED_PROXY_CIDRS` for an
+external reverse proxy. Optional `OP_TOKEN` and `OP_ENV_ID` preserve the bundled
+1Password/Varlock delivery path for deployment settings and the Turso pair.
 
 ```dotenv
 COPILOT_HOST=0.0.0.0
-GITHUB_TOKENS=msft.ghe.com:replace-with-the-printed-token
-COPILOT_API_KEY_AUTH=replace-with-a-long-random-key
 COPILOT_ADMIN_ORIGIN=https://your-domain.example
-# Set this to the exact host-side Docker bridge address observed by the app.
-COPILOT_TRUSTED_PROXY_CIDRS=172.19.0.1/32,127.0.0.1/32,::1/128
+# Replace with the actual reverse-proxy socket peer ranges.
+COPILOT_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+# Leave both unset for local SQLite.
+TURSO_DATABASE_URL=
+TURSO_AUTH_TOKEN=
 ```
 
-`OP_TOKEN` and `OP_ENV_ID` are optional and should be supplied together only
-when using the 1Password/Varlock integration. `COPILOT_API_KEY_AUTH` comes
-through this existing environment/secret-management flow; gateway-key file
-mounts are not supported.
+Image and Compose healthchecks use `/health/ready`: `200` means the selected
+database is available and no incomplete transfer blocks service; `503` means
+unavailable. `/health` and `/health/health` remain metadata-free liveness
+routes. A healthy container does not prove an upstream account is usable.
 
-To keep the administrator verifier in the same 1Password Environment, generate
-an Argon2id PHC string locally and store the exact output as
-`COPILOT_ADMIN_PASSWORD_HASH`:
+### Optional remote mode and read-only root filesystem
+
+With both Turso variables set, the application does not use `/app/data` for
+persistence and needs no data volume. The default Compose volume may remain
+mounted unused. A direct-container example is:
 
 ```sh
-copilot-api admin --hash-password > admin-password.phc
+docker run -d --name copilot-api --read-only --restart unless-stopped \
+  -p 127.0.0.1:4141:4141 --env-file ../copilot-api.env copilot-api
 ```
 
-This command prints only the PHC verifier. Copy `admin-password.phc` into
-1Password, then securely delete the temporary file. The password prompts use
-hidden interactive input and the verifier is written to stdout.
-
-The plaintext password is still what you enter in the dashboard. The PHC hash
-is authoritative, is never copied to `admin_auth.json`, and cannot be changed in
-the dashboard. To rotate it, replace the 1Password value and recreate/restart
-the service; existing administrator sessions then become invalid. On the first
-environment-managed startup, any old local verifier is replaced with a
-non-secret fingerprint marker. Removing or failing to inject the environment
-variable then fails closed instead of restoring that old password. The marker
-also makes hash rotations durable across restarts. Imported PHC
-strings must use Argon2id v19 with memory cost 65,536–1,048,576 KiB, time cost
-3–10, parallelism 1–16, a salt of at least 16 bytes, and a digest of at least 32
-bytes. If placing a PHC string in a Compose env file instead, single-quote the
-value so its `$` segments remain literal.
-
-For an externally proxied dashboard, set `COPILOT_ADMIN_ORIGIN` explicitly in
-the Compose environment. The tracked default leaves it unset, so only
-`localhost` and `127.0.0.1` browser origins are accepted. An external HTTPS
-dashboard origin is rejected until its exact origin is configured.
-
-The tracked `.dockerignore` excludes environment files, certificates, keys,
-the local `secrets/` directory, logs, and local data from the build context.
-The Compose healthcheck uses `/health/health`, and its port mapping binds to
-`127.0.0.1:4141` so the service is reachable only through the local host or
-reverse proxy.
-
-Do not put GitHub tokens into image build arguments. Supply them at runtime or
-persist them with the authentication step.
+Build the image first with `docker build -t copilot-api .`; include the paired
+Turso settings and `COPILOT_HOST=0.0.0.0` in that operator-owned environment
+file. Use the same pair when issuing the setup code. The storage runbook covers
+empty-target restore and migration. These examples describe this checkout;
+validate the image and deployment configuration in your environment.
 
 ### Updating a Compose checkout
 
@@ -956,9 +851,9 @@ and reload Nginx. A healthy rebuilt container does not prove that a new edge
 route is active.
 
 On Windows, `start.bat` starts the development server on `127.0.0.1` and opens
-the same-origin operator dashboard. Set `COPILOT_API_KEY_AUTH` in the invoking
-environment first; the launcher refuses to start without it. It no longer opens
-the inherited external usage viewer.
+the same-origin operator dashboard. Run `bun src/main.ts admin --setup-code`
+for first setup. The launcher does not require runtime credential environment
+variables.
 
 ## Reverse proxy deployment
 
@@ -1014,7 +909,7 @@ setting `COPILOT_API_ENABLE_DIRECT_CONNECT=true` does not make it appropriate
 for a public hostname.
 
 Templates are provided in `nginx/sites-available/`. Replace every template
-placeholder, keep `--api-key-auth` enabled, and validate the generated server
+placeholder, configure stored gateway credentials, and validate the generated server
 configuration before exposing it. See [nginx/README.md](nginx/README.md) for
 the template matrix, installation checks, Cloudflare CIDR maintenance, and
 WebSocket probes.
@@ -1029,11 +924,9 @@ returns `200` with `{ "text": "..." }`.
 
 - **Bind explicitly.** Use `--host 127.0.0.1` for local-only use. Bun otherwise
   listens on all interfaces by default.
-- **Layer remote controls.** Use startup `--api-key-auth`, with either a direct
-  value or the sole environment-based gateway credential
-  `COPILOT_API_KEY_AUTH`, for the data plane and OAuth/bootstrap boundary. Use
-  scoped OAuth, administrator sessions, WebSocket tickets, and bridge
-  capabilities for their respective routes.
+- **Layer remote controls.** Use stored gateway credentials for the data plane
+  and OAuth bootstrap. Use scoped OAuth, administrator sessions, WebSocket
+  tickets, and bridge capabilities for their respective routes.
 - **Trust IP headers only from exact proxy peers.** Configure
   `COPILOT_TRUSTED_PROXY_CIDRS` with the actual socket peers. Forwarding headers
   from every other peer are ignored. Successful authoritative inference auth
@@ -1045,8 +938,8 @@ returns `200` with `{ "text": "..." }`.
   restrictive permissions where the platform supports them.
 - **Exports are sanitized, not backups.** Dashboard ZIP exports redact
   secret-like configuration and require an authenticated administrator session.
-  Preserve full recovery backups through a separately protected filesystem
-  process.
+  Use the password-encrypted logical backup for full recovery; protect the
+  backup password and operator-owned output.
 - **Restrict attachment network authority.** Authenticated callers can cause
   attachment/file recovery to fetch any runtime-valid HTTP(S) destination and
   redirect, including internal and metadata-style targets. Only abort, timeout,
@@ -1057,12 +950,10 @@ returns `200` with `{ "text": "..." }`.
   to the client, ordinary logs, and Sentry with its status and content type.
   Protect their transport, retention, and access, and rotate credentials exposed
   through those channels.
-- **Treat LLM Debug as broader raw credential-bearing data.** It intentionally
-  preserves exact captured request and response URLs, headers, and bodies without
-  redaction, including credentials and session identifiers. Access requires an
-  administrator session, and records expire from process memory after ten
-  minutes. It is broader than the final-error-body passthrough above, not the
-  only channel where that response body may appear.
+- **Protect diagnostic history.** LLM Debug stores bounded, sanitized captures
+  in the database. Prompts and non-secret response content can still be
+  sensitive. Access requires an administrator session; capture retention and
+  replay eligibility are limited.
 - **Use Sentry deliberately.** When `SENTRY_DSN` is set, AI prompt and completion
   content is recorded by default. Set `SENTRY_AI_RECORD_INPUTS=false` before
   handling sensitive data.
@@ -1073,8 +964,8 @@ returns `200` with `{ "text": "..." }`.
   credentials in query parameters, and keep debug logs private.
 - **Keep TLS verification enabled.** Use `--insecure` only for controlled,
   temporary diagnosis of a trusted interception proxy.
-- **Use environment references.** Prefer custom-provider `apiKeyEnv` over
-  storing provider keys in `config.json`.
+- **Protect database credentials.** Upstream/provider secrets are recoverable
+  database values; restrict access to the database and its backups.
 - **Rotate exposed credentials and endpoints.** Removing a value from current
   documentation does not remove it from Git history, forks, caches, or logs.
 
@@ -1084,8 +975,9 @@ returns `200` with `{ "text": "..." }`.
 
 Check whether the route expects the gateway key, a scoped OAuth/inference
 credential, an administrator session, or a worker/environment capability.
-Expired OAuth access tokens must be refreshed with the latest rotated refresh
-token; replaying an older refresh token revokes its token family.
+OAuth refresh is reusable and race-safe; it issues an access token while
+retaining the same refresh credential. Check explicit revocation and required
+scopes when a stored credential is denied.
 
 ### Responses WebSocket gets an nginx `403`
 
@@ -1131,8 +1023,8 @@ automatically routed to custom providers.
 
 ### A protected Docker container is unhealthy
 
-Override the image healthcheck to use `/health/health`, as shown above. The
-tracked Compose file already uses that route.
+Check `/health/ready` and the selected database connection. A partial Turso
+pair, unavailable database, or incomplete import/restore prevents readiness.
 
 ### Authentication or path diagnostics
 

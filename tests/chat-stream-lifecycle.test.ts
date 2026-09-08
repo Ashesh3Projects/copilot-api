@@ -19,6 +19,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalModels = state.models
 const encoder = new TextEncoder()
@@ -577,15 +585,20 @@ test.each([
 
 function postChat(model: string): Promise<Response> {
   return Promise.resolve(
-    server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "hello" }],
-        stream: true,
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        }),
       }),
-    }),
+    ),
   )
 }
 

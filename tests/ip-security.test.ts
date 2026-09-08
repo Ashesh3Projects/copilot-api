@@ -1,10 +1,21 @@
+/* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-confusing-void-expression -- Bun async matchers have void types but must be awaited. */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { Hono } from "hono"
-import fs from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { mkdir, rm } from "node:fs/promises"
+import { resolve } from "node:path"
+
+import type { Storage } from "~/lib/storage/types"
 
 import { apiKeyGuard } from "~/lib/api-key-guard"
 import {
   listIpAllowlist,
+  upsertIpAllowlistEntry,
+  promoteAuthenticatedIpAllowlistEntry,
+  isManagedIpAllowed,
+  isManagedIpAllowedForTransparentProxy,
+  removeIpAllowlistEntry,
+  clearIpAllowlist,
   normalizeIpAddress,
   resetIpAllowlistForTest,
   setIpAllowlistForTest,
@@ -26,15 +37,36 @@ import {
   unwhitelistIp,
 } from "~/lib/ip-blocker"
 import { createAuthMiddleware } from "~/lib/request-auth"
-import { state } from "~/lib/state"
+import { credentialDigest } from "~/lib/storage/credentials-repository"
+import { withSettingsActor } from "~/lib/storage/domain-settings"
+import { StorageUnavailableError } from "~/lib/storage/errors"
+import { getStoreRevision } from "~/lib/storage/operations"
+import {
+  closeStorageRuntime,
+  initializeStorageRuntime,
+} from "~/lib/storage/runtime"
+
+import { createAuthStorageFixture } from "./helpers/auth-storage"
 
 const originalTrustedProxies = process.env.COPILOT_TRUSTED_PROXY_CIDRS
 const originalDateNow = Date.now
-const originalApiKeyAuth = state.apiKeyAuth
+let authFixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
 const DAY_MS = 24 * 60 * 60 * 1000
 let currentTime = 0
 
-beforeEach(() => {
+beforeEach(async () => {
+  authFixture = await createAuthStorageFixture()
+  await authFixture.storage.transaction((session) =>
+    session.execute({
+      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
+      args: [
+        randomUUID(),
+        credentialDigest("gateway-secret"),
+        "Test gateway",
+        Date.now(),
+      ],
+    }),
+  )
   resetIpSecurityForTest()
   setIpAllowlistForTest([])
 })
@@ -50,7 +82,7 @@ function createIpApp(): Hono {
   return app
 }
 
-afterEach(() => {
+afterEach(async () => {
   Date.now = originalDateNow
   if (originalTrustedProxies === undefined) {
     delete process.env.COPILOT_TRUSTED_PROXY_CIDRS
@@ -59,7 +91,7 @@ afterEach(() => {
   }
   resetIpSecurityForTest()
   setIpAllowlistForTest([])
-  state.apiKeyAuth = originalApiKeyAuth
+  await authFixture.close()
 })
 
 test("fails closed without Bun socket-peer metadata", async () => {
@@ -205,7 +237,6 @@ test("does not extend an active ban after a fourth failure", () => {
 
 test("route-permitted allowlist bypass does not record a failure", async () => {
   const ip = "198.51.100.55"
-  state.apiKeyAuth = "gateway-secret"
   setIpAllowlistForTest([{ ip, enabled: true }])
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
@@ -232,7 +263,6 @@ test("route-permitted allowlist bypass does not record a failure", async () => {
 test("credential-free transparent proxy allowlists bypass bans without clearing history", async () => {
   const managedIp = "198.51.100.57"
   const leasedIp = "198.51.100.58"
-  state.apiKeyAuth = "gateway-secret"
 
   for (const ip of [managedIp, leasedIp]) {
     recordFailedAttempt(ip)
@@ -267,7 +297,6 @@ test("credential-free transparent proxy allowlists bypass bans without clearing 
 
 test("global API-key guard accepts a valid credential from an actively leased banned IP", async () => {
   const ip = "198.51.100.60"
-  state.apiKeyAuth = "gateway-secret"
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
@@ -289,7 +318,6 @@ test("global API-key guard accepts a valid credential from an actively leased ba
 
 test("global API-key guard records missing credentials from an actively leased banned IP", async () => {
   const ip = "198.51.100.61"
-  state.apiKeyAuth = "gateway-secret"
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
@@ -310,7 +338,6 @@ test("global API-key guard records missing credentials from an actively leased b
 
 test("a valid gateway credential permanently exempts its normalized client IP from ban counting", async () => {
   const ip = "2001:0db8:0:0:0:0:0:70"
-  state.apiKeyAuth = "gateway-secret"
 
   const app = new Hono()
   app.use("*", apiKeyGuard)
@@ -337,7 +364,6 @@ test("a valid gateway credential permanently exempts its normalized client IP fr
 
 test("a valid gateway credential recovers an IP already banned by failed attempts", async () => {
   const ip = "198.51.100.71"
-  state.apiKeyAuth = "gateway-secret"
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
   recordFailedAttempt(ip)
@@ -355,7 +381,6 @@ test("a valid gateway credential recovers an IP already banned by failed attempt
 })
 
 test("authenticated trust is limited to the client IP that proved the credential", async () => {
-  state.apiKeyAuth = "gateway-secret"
   const trustedIp = "198.51.100.72"
   const untrustedIp = "198.51.100.73"
   const app = new Hono()
@@ -391,7 +416,6 @@ test("authenticated trust is limited to the client IP that proved the credential
 
 test("successful gateway authentication re-enables an operator IP without replacing its source", async () => {
   const ip = "198.51.100.74"
-  state.apiKeyAuth = "gateway-secret"
   setIpAllowlistForTest([{ ip, enabled: false, source: "manual" }])
   const app = new Hono()
   app.use("*", apiKeyGuard)
@@ -422,7 +446,6 @@ test("authenticated promotion preserves a dashboard-created source", async () =>
 })
 
 test("concurrent authenticated allowlist promotions retain every IP", async () => {
-  state.apiKeyAuth = "gateway-secret"
   const app = new Hono()
   app.use("*", apiKeyGuard)
   app.get("/protected", (c) => c.json({ ok: true }))
@@ -455,7 +478,6 @@ test("repeated authentication of an already trusted IP does not rewrite its dura
 })
 
 test("an untrusted peer cannot promote its spoofed forwarded client IP", async () => {
-  state.apiKeyAuth = "gateway-secret"
   const app = new Hono()
   app.use("*", apiKeyGuard)
   app.get("/protected", (c) => c.json({ ok: true }))
@@ -476,166 +498,125 @@ test("an untrusted peer cannot promote its spoofed forwarded client IP", async (
   ])
 })
 
-test("authenticated promotion keeps session trust when a malformed durable allowlist cannot load", async () => {
-  const readFile = spyOn(fs, "readFile").mockResolvedValue(
-    Buffer.from("{ malformed", "utf8"),
+async function withPolicyDatabase(
+  work: (storage: Storage, databasePath: string) => Promise<void>,
+): Promise<void> {
+  const directory = resolve(
+    ".superpowers/test-data",
+    `ip-policy-${randomUUID()}`,
   )
-  const writeFile = spyOn(fs, "writeFile").mockRejectedValue(
-    new Error("unexpected durable write"),
-  )
+  await mkdir(directory, { recursive: true })
+  await closeStorageRuntime()
+  const databasePath = resolve(directory, "copilot-api.sqlite")
+  const runtime = await initializeStorageRuntime({
+    config: { kind: "sqlite", path: databasePath },
+  })
+  resetIpAllowlistForTest()
   try {
-    resetIpAllowlistForTest()
+    await withSettingsActor("admin:ip-policy-test", () =>
+      work(runtime.storage, databasePath),
+    )
+  } finally {
+    await closeStorageRuntime()
+    setIpAllowlistForTest([])
+    await rm(directory, { recursive: true, force: true })
+  }
+}
 
-    const ip = "198.51.100.79"
-    state.apiKeyAuth = "gateway-secret"
-    const app = new Hono()
-    app.use("*", apiKeyGuard)
-    app.get("/protected", (c) => c.json({ ok: true }))
+test("database IP policies normalize and persist across reopen with source-specific access", async () => {
+  await withPolicyDatabase(async (storage, databasePath) => {
+    const entry = await upsertIpAllowlistEntry("[2001:0DB8::1]", {
+      source: "dashboard",
+      seen: true,
+    })
+    if (!entry) throw new Error("Expected normalized IP entry")
+    expect(entry).toMatchObject({
+      ip: "2001:db8::1",
+      source: "dashboard",
+      enabled: true,
+    })
+    const rows = await storage.read((session) =>
+      session.query({ sql: "SELECT * FROM capi_ip_allowlist", args: [] }),
+    )
+    expect(rows[0]?.created_at).toBe(Date.parse(entry.createdAt))
+    await closeStorageRuntime()
+    await initializeStorageRuntime({
+      config: { kind: "sqlite", path: databasePath },
+    })
+    expect(await listIpAllowlist()).toEqual([entry])
+    expect(await isManagedIpAllowedForTransparentProxy("2001:db8::1")).toBe(
+      true,
+    )
+    await promoteAuthenticatedIpAllowlistEntry("198.51.100.55")
+    expect(await isManagedIpAllowed("198.51.100.55")).toBe(true)
+    expect(await isManagedIpAllowedForTransparentProxy("198.51.100.55")).toBe(
+      false,
+    )
+  })
+})
 
-    expect(
-      (
-        await app.request("http://localhost/protected", {
-          headers: {
-            "x-api-key": "gateway-secret",
-            "x-copilot-peer-ip": ip,
-          },
-        })
-      ).status,
-    ).toBe(200)
-    expect(readFile).toHaveBeenCalledTimes(1)
-    expect(writeFile).not.toHaveBeenCalled()
+test("database IP authorization observes external disable and removal immediately", async () => {
+  await withPolicyDatabase(async (storage) => {
+    await upsertIpAllowlistEntry("198.51.100.56")
+    expect(await isManagedIpAllowed("198.51.100.56")).toBe(true)
+    await storage.transaction((session) =>
+      session.execute({
+        sql: "UPDATE capi_ip_allowlist SET enabled = 0 WHERE ip = ?",
+        args: ["198.51.100.56"],
+      }),
+    )
+    expect(await isManagedIpAllowed("198.51.100.56")).toBe(false)
+    await removeIpAllowlistEntry("198.51.100.56")
+    expect(await listIpAllowlist()).toEqual([])
+  })
+})
+
+test("database failed IP mutations leave durable policy and revision unchanged", async () => {
+  await withPolicyDatabase(async (storage) => {
+    const entry = await upsertIpAllowlistEntry("198.51.100.57", {
+      source: "manual",
+    })
+    if (!entry) throw new Error("Expected durable IP entry")
+    const revision = await getStoreRevision(storage)
+    const transaction = spyOn(storage, "transaction").mockRejectedValue(
+      new StorageUnavailableError(),
+    )
+    try {
+      await expect(
+        upsertIpAllowlistEntry("198.51.100.57", { enabled: false }),
+      ).rejects.toBeInstanceOf(StorageUnavailableError)
+      await expect(clearIpAllowlist()).rejects.toBeInstanceOf(
+        StorageUnavailableError,
+      )
+      await expect(
+        removeIpAllowlistEntry("198.51.100.57"),
+      ).rejects.toBeInstanceOf(StorageUnavailableError)
+    } finally {
+      transaction.mockRestore()
+    }
+    expect(await listIpAllowlist()).toEqual([entry])
+    expect(await getStoreRevision(storage)).toBe(revision)
+  })
+})
+
+test("database failed authenticated persistence retries and retains volatile trust", async () => {
+  await withPolicyDatabase(async (storage) => {
+    const ip = "198.51.100.58"
+    const transaction = spyOn(storage, "transaction").mockRejectedValueOnce(
+      new StorageUnavailableError(),
+    )
+    expect(await trustAuthenticatedIp(ip)).toBe(true)
+    transaction.mockRestore()
+    expect(await listIpAllowlist()).toEqual([])
     expect(isIpBlocked(ip)).toBe(false)
-  } finally {
-    readFile.mockRestore()
-    writeFile.mockRestore()
-  }
-})
-
-for (const [name, durableJson] of [
-  ["a valid JSON object", JSON.stringify({ entries: [] })],
-  [
-    "an array containing an invalid record",
-    JSON.stringify([{ ip: "198.51.100.90", enabled: true }, { ip: "bad" }]),
-  ],
-] as const) {
-  test(`authenticated promotion refuses to overwrite ${name}`, async () => {
-    const readFile = spyOn(fs, "readFile").mockResolvedValue(
-      Buffer.from(durableJson, "utf8"),
-    )
-    const writeFile = spyOn(fs, "writeFile").mockRejectedValue(
-      new Error("unexpected durable write"),
-    )
-    const mkdir = spyOn(fs, "mkdir").mockResolvedValue(undefined)
-    const chmod = spyOn(fs, "chmod").mockResolvedValue()
-    const rename = spyOn(fs, "rename").mockResolvedValue()
-    const rm = spyOn(fs, "rm").mockResolvedValue()
-    try {
-      resetIpAllowlistForTest()
-      expect(await trustAuthenticatedIp("198.51.100.91")).toBe(true)
-      expect(readFile).toHaveBeenCalledTimes(1)
-      expect(writeFile).not.toHaveBeenCalled()
-      expect(isIpBlocked("198.51.100.91")).toBe(false)
-    } finally {
-      readFile.mockRestore()
-      writeFile.mockRestore()
-      mkdir.mockRestore()
-      chmod.mockRestore()
-      rename.mockRestore()
-      rm.mockRestore()
-    }
+    expect(await trustAuthenticatedIp(ip)).toBe(true)
+    const entry = (await listIpAllowlist())[0]
+    expect(entry).toMatchObject({ ip, source: "authenticated", enabled: true })
+    const revision = await getStoreRevision(storage)
+    await trustAuthenticatedIp(ip)
+    expect((await listIpAllowlist())[0]).toEqual(entry)
+    expect(await getStoreRevision(storage)).toBe(revision)
   })
-}
-
-for (const [name, invalidEntry] of [
-  ["null object", null],
-  ["array object", []],
-  ["missing IP", { enabled: true }],
-  ["non-string IP", { ip: 123 }],
-  ["invalid IP", { ip: "not-an-ip" }],
-  ["non-boolean enabled", { ip: "198.51.100.92", enabled: "yes" }],
-  ["unknown source", { ip: "198.51.100.92", source: "imported" }],
-  ["non-string createdAt", { ip: "198.51.100.92", createdAt: 1 }],
-  ["non-string updatedAt", { ip: "198.51.100.92", updatedAt: null }],
-  ["non-string lastSeenAt", { ip: "198.51.100.92", lastSeenAt: false }],
-] as const) {
-  test(`authenticated promotion refuses a durable entry with ${name}`, async () => {
-    const readFile = spyOn(fs, "readFile").mockResolvedValue(
-      Buffer.from(JSON.stringify([invalidEntry]), "utf8"),
-    )
-    const writeFile = spyOn(fs, "writeFile").mockRejectedValue(
-      new Error("unexpected durable write"),
-    )
-    try {
-      resetIpAllowlistForTest()
-      expect(await trustAuthenticatedIp("198.51.100.93")).toBe(true)
-      expect(writeFile).not.toHaveBeenCalled()
-    } finally {
-      readFile.mockRestore()
-      writeFile.mockRestore()
-    }
-  })
-}
-
-test("a missing durable allowlist is the only load error treated as empty", async () => {
-  const missing = Object.assign(new Error("missing"), { code: "ENOENT" })
-  const readFile = spyOn(fs, "readFile").mockRejectedValue(missing)
-  const writeFile = spyOn(fs, "writeFile").mockResolvedValue()
-  const mkdir = spyOn(fs, "mkdir").mockResolvedValue(undefined)
-  const chmod = spyOn(fs, "chmod").mockResolvedValue()
-  const rename = spyOn(fs, "rename").mockResolvedValue()
-  try {
-    resetIpAllowlistForTest()
-    expect(await trustAuthenticatedIp("198.51.100.84")).toBe(true)
-    expect(readFile).toHaveBeenCalledTimes(1)
-    expect(writeFile).toHaveBeenCalledTimes(1)
-  } finally {
-    readFile.mockRestore()
-    writeFile.mockRestore()
-    mkdir.mockRestore()
-    chmod.mockRestore()
-    rename.mockRestore()
-  }
-})
-
-test("failed authenticated persistence retries on the next valid auth and stops after success", async () => {
-  const ip = "198.51.100.85"
-  setIpAllowlistForTest([])
-  const writeFile = spyOn(fs, "writeFile")
-    .mockRejectedValueOnce(
-      Object.assign(new Error("denied"), { code: "EACCES" }),
-    )
-    .mockResolvedValue(undefined)
-  const mkdir = spyOn(fs, "mkdir").mockResolvedValue(undefined)
-  const chmod = spyOn(fs, "chmod").mockResolvedValue()
-  const rename = spyOn(fs, "rename").mockResolvedValue()
-  const rm = spyOn(fs, "rm").mockResolvedValue()
-  try {
-    resetIpAllowlistForTest()
-    const readFile = spyOn(fs, "readFile").mockRejectedValue(
-      Object.assign(new Error("missing"), { code: "ENOENT" }),
-    )
-    try {
-      expect(await trustAuthenticatedIp(ip)).toBe(true)
-      expect(writeFile).toHaveBeenCalledTimes(1)
-      expect(await trustAuthenticatedIp(ip)).toBe(true)
-      expect(writeFile).toHaveBeenCalledTimes(2)
-      expect(await trustAuthenticatedIp(ip)).toBe(true)
-      expect(writeFile).toHaveBeenCalledTimes(2)
-    } finally {
-      readFile.mockRestore()
-    }
-  } finally {
-    writeFile.mockRestore()
-    mkdir.mockRestore()
-    chmod.mockRestore()
-    rename.mockRestore()
-    rm.mockRestore()
-  }
-
-  expect(isIpBlocked(ip)).toBe(false)
-  expect(await listIpAllowlist()).toMatchObject([
-    { ip, enabled: true, source: "authenticated" },
-  ])
 })
 
 test("operator removal succeeds for a volatile-only lease", async () => {
@@ -742,7 +723,6 @@ test("disable queued before authenticated trust ends enabled and exempt", async 
 
 test("invalid supplied credential cannot use transparent-proxy allowlist", async () => {
   const ip = "198.51.100.59"
-  state.apiKeyAuth = "gateway-secret"
   setIpAllowlistForTest([{ ip, enabled: true }])
 
   const app = new Hono()

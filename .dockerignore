@@ -25,3 +25,10 @@ tests/
 *.md
 
 .eslintcache
+
+.superpowers/
+ui/node_modules/
+ui/dist/
+*.sqlite
+*.sqlite-*
+*.capi

@@ -1,6 +1,7 @@
 /* eslint-disable max-lines -- integration coverage shares one server fixture */
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   expect,
@@ -18,7 +19,7 @@ import {
   type RoutingAffinity,
 } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
@@ -35,6 +36,13 @@ import {
   sanitizeResponsesStreamEvent,
   type ResponsesPayload,
 } from "../src/services/copilot/create-responses"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 test("fails closed when the terminal event name conflicts with its JSON type", () => {
   const privateMarker = "direct-terminal-private-marker"
@@ -1193,11 +1201,14 @@ beforeAll(() => {
 })
 
 afterAll(() => {
-  for (const accountId of addedAccountIds)
-    tokenPool.removeAccountForTest(accountId)
   state.models = originalModels
   state.isMultiToken = originalIsMultiToken
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
+})
+
+afterEach(() => {
+  for (const accountId of addedAccountIds)
+    tokenPool.removeAccountForTest(accountId)
 })
 
 beforeEach(() => {
@@ -1221,17 +1232,19 @@ beforeEach(() => {
 })
 
 test("removes service tier from already-prepared Responses transport payloads", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "hello",
-      service_tier: "priority",
-    },
-    {
-      vision: false,
-      initiator: "user",
-      prepared: true,
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "hello",
+        service_tier: "priority",
+      },
+      {
+        vision: false,
+        initiator: "user",
+        prepared: true,
+      },
+    ),
   )
 
   expect(requestBodies).toHaveLength(1)
@@ -1260,11 +1273,13 @@ test("retries one exact unsupported Responses control after store enforcement", 
   } as ResponsesPayload
   const source = structuredClone(payload)
 
-  await createResponses(payload, {
-    vision: false,
-    initiator: "user",
-    copilotSessionToken: "responses-session-fixed",
-  })
+  await seedProtocolDatabase().then(() =>
+    createResponses(payload, {
+      vision: false,
+      initiator: "user",
+      copilotSessionToken: "responses-session-fixed",
+    }),
+  )
 
   expect(payload).toEqual(source)
   expect(requestBodies).toHaveLength(2)
@@ -1277,7 +1292,7 @@ test("retries one exact unsupported Responses control after store enforcement", 
   expect(requestBodies[1]).not.toHaveProperty("top_p")
 })
 
-test("preserves native Responses failure identity and exact route bytes", async () => {
+test("preserves native Responses failure status, headers, and exact route bytes", async () => {
   state.models = responsesCapableModels
   const body = new TextEncoder().encode('{"error":"responses"}\r\n  ')
   const createUpstream = () =>
@@ -1288,21 +1303,38 @@ test("preserves native Responses failure identity and exact route bytes", async 
   const upstream = createUpstream()
   queuedResponses.push(upstream)
 
-  const error = await createResponses(
-    { model: "gpt-4o", input: "hello" },
-    { vision: false, initiator: "user" },
-  ).catch((caught: unknown) => caught)
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      createResponses(
+        { model: "gpt-4o", input: "hello" },
+        { vision: false, initiator: "user" },
+      ),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const failedResponse = (error as HTTPError).response
+  expect(failedResponse.status).toBe(upstream.status)
+  expect(failedResponse.statusText).toBe(upstream.statusText)
+  expect(Object.fromEntries(failedResponse.headers)).toEqual(
+    Object.fromEntries(upstream.headers),
+  )
+  expect(failedResponse.bodyUsed).toBe(false)
+  expect(
+    Array.from(new Uint8Array(await failedResponse.arrayBuffer())),
+  ).toEqual(Array.from(body))
 
   queuedResponses.push(createUpstream())
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
+    }),
+  )
   expect(response.status).toBe(409)
   expect(response.headers.get("content-type")).toBe("application/problem+json")
   expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual(
@@ -1357,25 +1389,34 @@ function invalidSessionTokens(model: string): Array<string> {
 test("forwards only matching model-scoped session tokens on Responses inference", async () => {
   state.models = responsesCapableModels
   const matchingToken = sessionToken({ selected_model: "gpt-4o" })
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": matchingToken,
-    },
-    body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
-  })
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": matchingToken,
+      },
+      body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
+    }),
+  )
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(matchingToken)
 
   const binaryToken = binarySessionToken({ selected_model: "gpt-4o" })
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": binaryToken,
-    },
-    body: JSON.stringify({ model: "gpt-4o", input: "binary opaque segments" }),
-  })
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": binaryToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: "binary opaque segments",
+      }),
+    }),
+  )
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(binaryToken)
 
   for (const token of [
@@ -1383,14 +1424,17 @@ test("forwards only matching model-scoped session tokens on Responses inference"
     "malformed-token",
     ...invalidSessionTokens("gpt-4o"),
   ]) {
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": token,
-      },
-      body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": token,
+        },
+        body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
+      }),
+    )
     expect(response.status).toBe(200)
     expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
     expect(lastUpstreamHeaders?.get("authorization")).toBe(
@@ -1416,14 +1460,17 @@ test("forwards only matching model-scoped session tokens on Responses inference"
     selected_model: "gpt-redirected",
     available_models: ["gpt-4o", "gpt-redirected"],
   })
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": redirectedToken,
-    },
-    body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
-  })
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": redirectedToken,
+      },
+      body: JSON.stringify({ model: "gpt-4o", input: "hello" }),
+    }),
+  )
   expect(lastRequestBody?.model).toBe("gpt-redirected")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
 
@@ -1435,14 +1482,17 @@ test("forwards only matching model-scoped session tokens on Responses inference"
   }
   state.models = { object: "list", data: [aliasModel] }
   const aliasToken = sessionToken({ selected_model: "gpt-4.1" })
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({ model: "gpt-4-1", input: "ordinary alias" }),
-  })
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({ model: "gpt-4-1", input: "ordinary alias" }),
+    }),
+  )
   expect(lastRequestBody?.model).toBe("gpt-4.1")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(aliasToken)
 
@@ -1460,17 +1510,20 @@ test("forwards only matching model-scoped session tokens on Responses inference"
       enabled: true,
     },
   ])
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({
-      model: "gpt-4-1",
-      input: "configured alias redirect",
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({
+        model: "gpt-4-1",
+        input: "configured alias redirect",
+      }),
     }),
-  })
+  )
   expect(lastRequestBody?.model).toBe("gpt-4.1")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
 })
@@ -1512,15 +1565,20 @@ test("routes repeated Responses metadata sessions to stable accounts", async () 
   }
   expect(keys).toHaveLength(2)
   const request = (key: string) =>
-    server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: modelId,
-        input: "hello",
-        client_metadata: { session_id: key },
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: modelId,
+          input: "hello",
+          client_metadata: { session_id: key },
+        }),
       }),
-    })
+    )
 
   await request(keys[0] ?? "")
   await request(keys[0] ?? "")
@@ -1589,15 +1647,20 @@ test("returns a structured conflict when a bound Responses account still rejects
     new Response("Unauthorized", { status: 401 }),
   )
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      client_metadata: { session_id: sessionId },
-      input: "continue the conversation",
-      model: modelId,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        client_metadata: { session_id: sessionId },
+        input: "continue the conversation",
+        model: modelId,
+      }),
     }),
-  })
+  )
   const body = (await response.json()) as Record<string, unknown>
 
   expect(response.status).toBe(409)
@@ -1624,15 +1687,20 @@ test("installs Responses client metadata affinity before provider dispatch", asy
       typeof clientMetadata === "string" ?
         "responses-string-session"
       : "responses-object-session"
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        input: "hello",
-        client_metadata: clientMetadata,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          input: "hello",
+          client_metadata: clientMetadata,
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(200)
     expect(capturedAffinity).toEqual({
       key: expectedKey,
@@ -1662,24 +1730,27 @@ test("routes Codex forks through the parent account and upstream session", async
   tokenPool.rebuildModelIndex()
   state.isMultiToken = true
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "session-id": "fork-child-1",
-    },
-    body: JSON.stringify({
-      model: modelId,
-      input: "continue the fork",
-      client_metadata: {
-        session_id: "fork-child-1",
-        thread_id: "fork-child-1",
-        "x-codex-turn-metadata": JSON.stringify({
-          forked_from_thread_id: "fork-parent-0",
-        }),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "session-id": "fork-child-1",
       },
+      body: JSON.stringify({
+        model: modelId,
+        input: "continue the fork",
+        client_metadata: {
+          session_id: "fork-child-1",
+          thread_id: "fork-child-1",
+          "x-codex-turn-metadata": JSON.stringify({
+            forked_from_thread_id: "fork-parent-0",
+          }),
+        },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(capturedAffinity).toEqual({
@@ -1697,32 +1768,40 @@ test("routes Codex forks through the parent account and upstream session", async
 
 test("keeps Responses header affinity over metadata and ignores malformed metadata", async () => {
   state.models = responsesCapableModels
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": "header-session",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: "hello",
-      client_metadata: { session_id: "body-session" },
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": "header-session",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: "hello",
+        client_metadata: { session_id: "body-session" },
+      }),
     }),
-  })
+  )
   expect(capturedAffinity).toEqual({
     key: "header-session",
     source: "copilot_session",
   })
 
-  await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: "hello",
-      client_metadata: "not json",
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: "hello",
+        client_metadata: "not json",
+      }),
     }),
-  })
+  )
   expect(capturedAffinity).toBeUndefined()
 })
 
@@ -1743,11 +1822,16 @@ test("preserves native Responses state, context, future fields, and tools", asyn
     store: true,
   }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies).toHaveLength(1)
@@ -1779,15 +1863,20 @@ test("routes priority Responses requests to an available fast model", async () =
   }
   state.models = { object: "list", data: [normalModel, fastModel] }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies).toHaveLength(1)
@@ -1803,15 +1892,20 @@ test("removes non-priority service tiers without changing the model", async () =
   }
   state.models = { object: "list", data: [normalModel] }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "standard",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "standard",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(normalModel.id)
@@ -1826,15 +1920,20 @@ test("keeps the normal model when no fast variant is available", async () => {
   }
   state.models = { object: "list", data: [normalModel] }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(normalModel.id)
@@ -1871,15 +1970,20 @@ test("applies priority fast routing after configured model redirects", async () 
     },
   ])
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: requestedModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: requestedModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(fastModel.id)
@@ -1907,16 +2011,21 @@ test("does not change reasoning effort when routing to the fast model", async ()
   }
   state.models = { object: "list", data: [normalModel, fastModel] }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      reasoning: { effort: "high" },
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        reasoning: { effort: "high" },
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(fastModel.id)
@@ -1944,15 +2053,20 @@ test("keeps the normal model when every fast-model account is disabled", async (
   tokenPool.rebuildModelIndex()
   state.isMultiToken = true
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(normalModel.id)
@@ -1979,15 +2093,20 @@ test("keeps the normal model when a fast catalog entry has no enabled account", 
   tokenPool.rebuildModelIndex()
   state.isMultiToken = true
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(normalModel.id)
@@ -2002,15 +2121,20 @@ test("does not append a second fast suffix", async () => {
   }
   state.models = { object: "list", data: [fastModel] }
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: fastModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: fastModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(fastModel.id)
@@ -2031,18 +2155,21 @@ test("suppresses model-scoped session tokens after priority fast routing", async
   state.models = { object: "list", data: [normalModel, fastModel] }
   const fastToken = sessionToken({ selected_model: fastModel.id })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": fastToken,
-    },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": fastToken,
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(requestBodies[0]?.model).toBe(fastModel.id)
@@ -2080,15 +2207,20 @@ test("routes priority mode before selecting a chat fallback endpoint", async () 
     }),
   )
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: normalModel.id,
-      input: "Hello",
-      service_tier: "priority",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: normalModel.id,
+        input: "Hello",
+        service_tier: "priority",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRequestBody?.model).toBe(fastModel.id)
@@ -2132,15 +2264,20 @@ test.each([
       }),
     )
 
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "chat-only-responses-model",
-        input: "Hello",
-        ...extra,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "chat-only-responses-model",
+          input: "Hello",
+          ...extra,
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(200)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(lastRequestBody).toMatchObject({
@@ -2182,14 +2319,19 @@ test("contextualizes omitted function output before chat fallback reaches upstre
     }),
   )
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: modelId,
-      input: [{ type: "function_call_output", call_id: "call_1" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelId,
+        input: [{ type: "function_call_output", call_id: "call_1" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -2202,23 +2344,25 @@ test("preserves prompt and conversation_id when sending Responses API requests",
     variables: { task: "greeting" },
   }
 
-  await createResponses(
-    {
-      model: "gpt-4o",
-      prompt,
-      conversation_id: "conv_abc",
-    } as {
-      model: string
-      prompt: {
-        id: string
-        variables: { task: string }
-      }
-      conversation_id: string
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        prompt,
+        conversation_id: "conv_abc",
+      } as {
+        model: string
+        prompt: {
+          id: string
+          variables: { task: string }
+        }
+        conversation_id: string
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.prompt).toEqual(prompt)
@@ -2231,28 +2375,30 @@ test("fits explicitly marked compaction payloads at the transport boundary", asy
     + "x".repeat(COMPACTION_PAYLOAD_MAX_BYTES + 2 * 1024 * 1024)
     + "\nEND-TRANSPORT"
 
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          type: "custom_tool_call",
-          call_id: "call_transport",
-          name: "exec",
-          input: "run transport diagnostic",
-        },
-        {
-          type: "custom_tool_call_output",
-          call_id: "call_transport",
-          output: oversizedOutput,
-        },
-      ],
-    },
-    {
-      compaction: true,
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            type: "custom_tool_call",
+            call_id: "call_transport",
+            name: "exec",
+            input: "run transport diagnostic",
+          },
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_transport",
+            output: oversizedOutput,
+          },
+        ],
+      },
+      {
+        compaction: true,
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   const serialized = JSON.stringify(lastRequestBody)
@@ -2267,18 +2413,20 @@ test("fits explicitly marked compaction payloads at the transport boundary", asy
 })
 
 test("injects runtime-style default reasoning settings for direct Responses requests", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Hello",
-    } as {
-      model: string
-      input: string
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Hello",
+      } as {
+        model: string
+        input: string
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.store).toBe(false)
@@ -2290,16 +2438,18 @@ test("injects runtime-style default reasoning settings for direct Responses requ
 })
 
 test("clamps Responses max_output_tokens to Copilot's minimum", async () => {
-  await createResponses(
-    {
-      model: "gpt-5.5",
-      input: "Probe the selected model.",
-      max_output_tokens: 1,
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.5",
+        input: "Probe the selected model.",
+        max_output_tokens: 1,
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.max_output_tokens).toBe(16)
@@ -2329,20 +2479,22 @@ test("preserves explicit string effort for implicit-default Responses models", a
     },
   ])
 
-  await createResponses(
-    {
-      model: "claude-implicit-medium",
-      input: "Hello",
-      reasoning: { effort: "high" },
-    } as {
-      model: string
-      input: string
-      reasoning: { effort: "high" }
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "claude-implicit-medium",
+        input: "Hello",
+        reasoning: { effort: "high" },
+      } as {
+        model: string
+        input: string
+        reasoning: { effort: "high" }
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.reasoning).toEqual({
@@ -2367,17 +2519,22 @@ test("preserves explicit none for implicit-default Responses models", async () =
     },
   ])
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: model.id,
-      input: "Hello",
-      reasoning: { effort: "none" },
-      temperature: 0.3,
-      top_p: 0.8,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: model.id,
+        input: "Hello",
+        reasoning: { effort: "none" },
+        temperature: 0.3,
+        top_p: 0.8,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRequestBody?.reasoning).toEqual({ effort: "none" })
@@ -2437,15 +2594,20 @@ test("keeps numeric Responses redirects model-only across the HTTP route", async
   const infoSpy = spyOn(console, "info")
 
   try {
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: sourceModel.id,
-        input: "Hello",
-        reasoning: { effort: 2048 },
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: sourceModel.id,
+          input: "Hello",
+          reasoning: { effort: 2048 },
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     expect(lastRequestBody?.model).toBe(finalModel.id)
@@ -2484,18 +2646,23 @@ test("overrides Responses verbosity without replacing other text controls", asyn
     },
   ])
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: "Explain the result.",
-      text: {
-        verbosity: "low",
-        format: { type: "json_object" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
       },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: "Explain the result.",
+        text: {
+          verbosity: "low",
+          format: { type: "json_object" },
+        },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRequestBody?.model).toBe("gpt-4o")
@@ -2508,15 +2675,20 @@ test("overrides Responses verbosity without replacing other text controls", asyn
 test("dispatches zero from the top-level Responses reasoning alias", async () => {
   state.models = responsesCapableModels
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: "Hello",
-      reasoning_effort: 0,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: "Hello",
+        reasoning_effort: 0,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRequestBody?.reasoning).toEqual({ effort: 0, summary: "auto" })
@@ -2524,17 +2696,19 @@ test("dispatches zero from the top-level Responses reasoning alias", async () =>
 
 for (const model of ["gpt-5.4-mini", "gpt-5.5"]) {
   test(`omits built-in unsupported request parameters for ${model} Responses models`, async () => {
-    await createResponses(
-      {
-        model,
-        input: "Hello",
-        temperature: 0.3,
-        top_p: 0.8,
-      },
-      {
-        vision: false,
-        initiator: "user",
-      },
+    await seedProtocolDatabase().then(() =>
+      createResponses(
+        {
+          model,
+          input: "Hello",
+          temperature: 0.3,
+          top_p: 0.8,
+        },
+        {
+          vision: false,
+          initiator: "user",
+        },
+      ),
     )
 
     expect(lastRequestBody).not.toHaveProperty("temperature")
@@ -2543,17 +2717,19 @@ for (const model of ["gpt-5.4-mini", "gpt-5.5"]) {
 }
 
 test("keeps supported request parameters for other Responses models", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Hello",
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Hello",
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.temperature).toBe(0.3)
@@ -2568,17 +2744,19 @@ test("omits configured unsupported request parameters for Responses models", asy
     },
   ])
 
-  await createResponses(
-    {
-      model: "no-temperature-model",
-      input: "Hello",
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "no-temperature-model",
+        input: "Hello",
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody).not.toHaveProperty("temperature")
@@ -2606,10 +2784,12 @@ test("normalizes Responses function tool parameter schemas before forwarding", a
     ],
   }
 
-  await createResponses(payload, {
-    vision: false,
-    initiator: "user",
-  })
+  await seedProtocolDatabase().then(() =>
+    createResponses(payload, {
+      vision: false,
+      initiator: "user",
+    }),
+  )
 
   expect(lastRequestBody?.tools).toEqual([
     {
@@ -2629,42 +2809,44 @@ test("normalizes Responses function tool parameter schemas before forwarding", a
 })
 
 test("preserves optional and open json_schema response format object schemas", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Extract entities.",
-      text: {
-        format: {
-          type: "json_schema",
-          name: "ExtractedEntities",
-          schema: {
-            type: "object",
-            properties: {
-              episode_indices: {
-                type: "array",
-                items: { type: "number" },
-              },
-              entities: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    name: { type: "string" },
-                    type: { type: "string" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Extract entities.",
+        text: {
+          format: {
+            type: "json_schema",
+            name: "ExtractedEntities",
+            schema: {
+              type: "object",
+              properties: {
+                episode_indices: {
+                  type: "array",
+                  items: { type: "number" },
+                },
+                entities: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      type: { type: "string" },
+                    },
+                    required: ["name", "type"],
                   },
-                  required: ["name", "type"],
                 },
               },
+              required: ["entities"],
             },
-            required: ["entities"],
           },
         },
       },
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.text).toEqual({
@@ -2697,19 +2879,21 @@ test("preserves optional and open json_schema response format object schemas", a
 })
 
 test("adds JSON mode input instruction when input lacks json", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Extract entities.",
-      instructions: "Return only JSON.",
-      text: {
-        format: { type: "json_object" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Extract entities.",
+        instructions: "Return only JSON.",
+        text: {
+          format: { type: "json_object" },
+        },
       },
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.input).toEqual([
@@ -2728,24 +2912,26 @@ test("adds JSON mode input instruction when input lacks json", async () => {
 })
 
 test("does not add JSON mode input instruction when input already mentions json", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          type: "message",
-          role: "user",
-          content: "Return JSON.",
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "Return JSON.",
+          },
+        ],
+        text: {
+          format: { type: "json_object" },
         },
-      ],
-      text: {
-        format: { type: "json_object" },
       },
-    },
-    {
-      vision: false,
-      initiator: "user",
-    },
+      {
+        vision: false,
+        initiator: "user",
+      },
+    ),
   )
 
   expect(lastRequestBody?.input).toEqual([
@@ -2766,37 +2952,41 @@ test("does not mutate and retry a changed-ceiling upstream 413", async () => {
     createSuccessResponse(),
   )
 
-  const error = await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      createResponses(
         {
-          role: "user",
-          content: [
-            { type: "input_text", text: "Describe this image" },
+          model: "gpt-4o",
+          input: [
             {
-              type: "input_image",
-              image_url: "data:image/png;base64,abc",
-              detail: "high",
+              role: "user",
+              content: [
+                { type: "input_text", text: "Describe this image" },
+                {
+                  type: "input_image",
+                  image_url: "data:image/png;base64,abc",
+                  detail: "high",
+                },
+              ],
             },
           ],
+        } as {
+          model: string
+          input: Array<{
+            role: string
+            content: Array<
+              | { type: "input_text"; text: string }
+              | { type: "input_image"; image_url: string; detail: string }
+            >
+          }>
         },
-      ],
-    } as {
-      model: string
-      input: Array<{
-        role: string
-        content: Array<
-          | { type: "input_text"; text: string }
-          | { type: "input_image"; image_url: string; detail: string }
-        >
-      }>
-    },
-    {
-      vision: true,
-      initiator: "user",
-    },
-  ).catch((caught: unknown) => caught)
+        {
+          vision: true,
+          initiator: "user",
+        },
+      ),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
   expect((error as HTTPError).response.status).toBe(413)
@@ -2839,37 +3029,41 @@ test("does not retry changed-ceiling 413 Responses requests with image-only inpu
     createSuccessResponse(),
   )
 
-  const error = await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      createResponses(
         {
-          role: "user",
-          content: [
+          model: "gpt-4o",
+          input: [
             {
-              type: "input_image",
-              image_url: "data:image/png;base64,abc",
-              detail: "high",
+              role: "user",
+              content: [
+                {
+                  type: "input_image",
+                  image_url: "data:image/png;base64,abc",
+                  detail: "high",
+                },
+              ],
             },
           ],
+        } as {
+          model: string
+          input: Array<{
+            role: string
+            content: Array<{
+              type: "input_image"
+              image_url: string
+              detail: string
+            }>
+          }>
         },
-      ],
-    } as {
-      model: string
-      input: Array<{
-        role: string
-        content: Array<{
-          type: "input_image"
-          image_url: string
-          detail: string
-        }>
-      }>
-    },
-    {
-      vision: true,
-      initiator: "user",
-    },
-  ).catch((caught: unknown) => caught)
+        {
+          vision: true,
+          initiator: "user",
+        },
+      ),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
   expect((error as HTTPError).response.status).toBe(413)

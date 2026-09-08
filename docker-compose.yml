@@ -9,17 +9,21 @@ services:
     volumes:
       - copilot-data:/app/data
     environment:
-      - OP_TOKEN=${OP_TOKEN}
-      - OP_ENV_ID=${OP_ENV_ID}
+      - OP_TOKEN=${OP_TOKEN:-}
+      - OP_ENV_ID=${OP_ENV_ID:-}
+      # Both optional: neither uses the local SQLite volume; both select Turso.
+      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL:-}
+      - TURSO_AUTH_TOKEN=${TURSO_AUTH_TOKEN:-}
       # Set the exact host-side proxy peer for reverse-proxied deployments.
       - COPILOT_TRUSTED_PROXY_CIDRS=${COPILOT_TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
       # Leave unset for localhost; set the exact external dashboard origin.
       - COPILOT_ADMIN_ORIGIN=${COPILOT_ADMIN_ORIGIN:-}
     env_file:
-      - .env
+      - path: .env
+        required: false
     healthcheck:
       test:
-        ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4141/health/health"]
+        ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4141/health/ready"]
       interval: 30s
       timeout: 5s
       start_period: 10s
@@ -27,8 +31,5 @@ services:
 
 volumes:
   copilot-data:
-    # Create once before first `compose up` (see README: Docker Compose).
-    # so compose treats it as external — won't try to create or delete it,
-    # and won't warn about the missing compose labels.
+    # New installations create this automatically. Existing data is preserved.
     name: copilot-api_copilot-data
-    external: true

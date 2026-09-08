@@ -1,4 +1,12 @@
-import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  expect,
+  mock,
+  test,
+} from "bun:test"
 
 import type { ResponseInputItem } from "~/services/copilot/create-responses"
 
@@ -14,6 +22,14 @@ import {
   CAPI_RESPONSES_MAX_REQUEST_BYTES,
   RESPONSES_RECOVERY_MARGIN_BYTES,
 } from "~/services/copilot/responses-payload-recovery"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -72,10 +88,13 @@ beforeAll(() => {
 })
 
 afterAll(() => {
-  for (const accountId of compactAccountIds)
-    tokenPool.removeAccountForTest(accountId)
   state.models = originalModels
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
+})
+
+afterEach(() => {
+  for (const accountId of compactAccountIds)
+    tokenPool.removeAccountForTest(accountId)
 })
 
 beforeEach(() => {
@@ -117,16 +136,22 @@ function compactRequest(
   headers: Record<string, string> = {},
   input: Array<ResponseInputItem> = [],
 ) {
-  return server.request("/v1/responses/compact", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify({
-      model: "gpt-compact",
-      input,
-      prompt_cache_key: "must-not-be-affinity",
-      client_metadata: clientMetadata,
+  return seedProtocolDatabase().then(() =>
+    server.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify({
+        model: "gpt-compact",
+        input,
+        prompt_cache_key: "must-not-be-affinity",
+        client_metadata: clientMetadata,
+      }),
     }),
-  })
+  )
 }
 
 function compressedCompactRequest(
@@ -141,14 +166,17 @@ function compressedCompactRequest(
       client_metadata: clientMetadata,
     }),
   )
-  return server.request("/v1/responses/compact", {
-    method: "POST",
-    headers: {
-      "content-encoding": "zstd",
-      "content-type": "application/json",
-    },
-    body,
-  })
+  return seedProtocolDatabase().then(() =>
+    server.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-encoding": "zstd",
+        "content-type": "application/json",
+      },
+      body,
+    }),
+  )
 }
 
 test("compact decodes zstd-compressed Codex resume requests", async () => {
@@ -165,18 +193,21 @@ test("compact decodes zstd-compressed Codex resume requests", async () => {
 })
 
 test("compact returns a fixed 400 for malformed zstd JSON", async () => {
-  const response = await server.request("/v1/responses/compact", {
-    method: "POST",
-    headers: {
-      "content-encoding": "zstd",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-compact",
-      input: [],
-      client_metadata: { session_id: "not-compressed" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-encoding": "zstd",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-compact",
+        input: [],
+        client_metadata: { session_id: "not-compressed" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(400)
   expect(await response.json()).toEqual({
@@ -198,11 +229,16 @@ test.each([
   async ({ contentEncoding }) => {
     const headers = new Headers({ "content-type": "application/json" })
     if (contentEncoding) headers.set("content-encoding", contentEncoding)
-    const response = await server.request("/v1/responses/compact", {
-      method: "POST",
-      headers,
-      body: "{",
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses/compact", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          ...Object.fromEntries(new Headers(headers)),
+        },
+        body: "{",
+      }),
+    )
 
     expect(response.status).toBe(500)
     expect(await response.json()).toEqual({
@@ -383,31 +419,36 @@ test("direct Responses HTTP fallback fits oversized compaction turns", async () 
     + "x".repeat(COMPACTION_PAYLOAD_MAX_BYTES + 2 * 1024 * 1024)
     + "\nEND-HTTP-FALLBACK"
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-compact",
-      input: [
-        {
-          type: "custom_tool_call",
-          call_id: "call_http_fallback",
-          name: "exec",
-          input: "run http fallback diagnostic",
-        },
-        {
-          type: "custom_tool_call_output",
-          call_id: "call_http_fallback",
-          output: oversizedOutput,
-        },
-      ],
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify({
-          request_kind: "compaction",
-        }),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
       },
+      body: JSON.stringify({
+        model: "gpt-compact",
+        input: [
+          {
+            type: "custom_tool_call",
+            call_id: "call_http_fallback",
+            name: "exec",
+            input: "run http fallback diagnostic",
+          },
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_http_fallback",
+            output: oversizedOutput,
+          },
+        ],
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "compaction",
+          }),
+        },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRequestUrl).toEndWith("/chat/completions")
@@ -427,27 +468,32 @@ test("direct Responses returns the safe local compaction error code", async () =
   if (model) model.supported_endpoints = ["/responses"]
   const callsBefore = fetchMock.mock.calls.length
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-compact",
-      input: [
-        {
-          type: "message",
-          role: "developer",
-          content: "preserved context ".repeat(
-            Math.ceil((COMPACTION_PAYLOAD_MAX_BYTES + 1024) / 18),
-          ),
-        },
-      ],
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify({
-          request_kind: "compaction",
-        }),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
       },
+      body: JSON.stringify({
+        model: "gpt-compact",
+        input: [
+          {
+            type: "message",
+            role: "developer",
+            content: "preserved context ".repeat(
+              Math.ceil((COMPACTION_PAYLOAD_MAX_BYTES + 1024) / 18),
+            ),
+          },
+        ],
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "compaction",
+          }),
+        },
+      }),
     }),
-  })
+  )
   const body = (await response.json()) as {
     error?: { code?: string; message?: string; type?: string }
   }
@@ -468,30 +514,35 @@ test(
       + "\nEND-HTTP-ORDINARY"
     const inlineFile = `data:application/pdf;base64,${"A".repeat(7 * 1024 * 1024)}`
 
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-compact",
-        input: [
-          {
-            type: "custom_tool_call_output",
-            call_id: "call_http_ordinary",
-            output: [
-              { type: "input_text", text: preservedOutput },
-              {
-                type: "input_file",
-                filename: "ordinary.pdf",
-                file_data: inlineFile,
-              },
-            ],
-          },
-        ],
-        client_metadata: {
-          "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
         },
+        body: JSON.stringify({
+          model: "gpt-compact",
+          input: [
+            {
+              type: "custom_tool_call_output",
+              call_id: "call_http_ordinary",
+              output: [
+                { type: "input_text", text: preservedOutput },
+                {
+                  type: "input_file",
+                  filename: "ordinary.pdf",
+                  file_data: inlineFile,
+                },
+              ],
+            },
+          ],
+          client_metadata: {
+            "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }),
+          },
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -510,23 +561,28 @@ test(
 
 test("direct Responses HTTP rejects unrecoverable ordinary turns locally", async () => {
   const callsBefore = fetchMock.mock.calls.length
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-compact",
-      input: [
-        {
-          type: "message",
-          role: "developer",
-          content: "preserved".repeat(4 * 1024 * 1024),
-        },
-      ],
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
       },
+      body: JSON.stringify({
+        model: "gpt-compact",
+        input: [
+          {
+            type: "message",
+            role: "developer",
+            content: "preserved".repeat(4 * 1024 * 1024),
+          },
+        ],
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }),
+        },
+      }),
     }),
-  })
+  )
   const body = (await response.json()) as {
     error?: { code?: string; type?: string }
   }

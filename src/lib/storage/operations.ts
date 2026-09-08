@@ -217,6 +217,23 @@ async function findOperation<T>(
   return { value: value as T, revision: row.committed_revision }
 }
 
+/** Lookup/reconcile a known request identity without replaying its mutation body. */
+export async function readCommittedMutation<T>(
+  storage: Storage,
+  context: MutationContext,
+): Promise<Committed<T> | undefined> {
+  validateContext(context)
+  return withStorageDeadline(Date.now() + 30_000, async () => {
+    const state = states.get(storage)
+    if (state?.pending) {
+      if (state.pending.operationId !== context.operationId)
+        throw new StorageCommitUnknownError(state.pending.operationId)
+      return reconcile<T>(storage, context, state)
+    }
+    return storage.read((session) => findOperation<T>(session, context))
+  })
+}
+
 async function reconcile<T>(
   storage: Storage,
   context: MutationContext,

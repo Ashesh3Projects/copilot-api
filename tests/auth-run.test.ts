@@ -9,6 +9,7 @@ import {
 } from "bun:test"
 
 import { runAuth } from "../src/auth"
+import { useProtocolDatabase } from "./helpers/protocol-database"
 
 const originalFetch = globalThis.fetch
 const responses: Array<Response> = []
@@ -26,6 +27,8 @@ const fetchMock = mock(
     return Promise.resolve(response)
   },
 )
+
+useProtocolDatabase()
 
 beforeAll(() => {
   globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -51,11 +54,11 @@ function queuePublicDeviceLogin(): void {
       verification_uri: "https://github.com/login/device",
     }),
     Response.json({ access_token: "gho_public" }),
-    Response.json({ login: "octocat" }),
+    Response.json({ id: 123, login: "octocat" }),
   )
 }
 
-test("runAuth validates a public device login with direct OAuth before printing it", async () => {
+test("runAuth validates and stores a public OAuth account without printing the token", async () => {
   queuePublicDeviceLogin()
   responses.push(
     Response.json({
@@ -85,8 +88,7 @@ test("runAuth validates a public device login with direct OAuth before printing 
     ])
     expect(requests[3]?.headers.get("authorization")).toBe("Bearer gho_public")
     expect(requests[4]?.headers.get("authorization")).toBe("Bearer gho_public")
-    expect(stdout).toHaveBeenCalledTimes(1)
-    expect(stdout.mock.calls[0]?.[0]).toBe("gho_public\n")
+    expect(stdout).not.toHaveBeenCalled()
   } finally {
     stdout.mockRestore()
   }

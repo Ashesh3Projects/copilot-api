@@ -5,15 +5,20 @@ import { createConsola } from "consola"
 import { createInterface } from "node:readline"
 
 import {
+  getAccountsService,
+  createAccountMutationContext,
+} from "./lib/accounts-service"
+import {
   DEFAULT_GITHUB_DOMAIN,
-  formatGitHubCredential,
   normalizeGitHubDomain,
 } from "./lib/github-instance"
+import {
+  initializeStorageRuntime,
+  closeStorageRuntime,
+} from "./lib/storage/runtime"
 import { loginViaWebFlow } from "./services/github/auth-flow"
 import { getDeviceCode } from "./services/github/get-device-code"
-import { getGitHubUser } from "./services/github/get-user"
 import { pollAccessToken } from "./services/github/poll-access-token"
-import { resolveCopilotOAuth } from "./services/github/resolve-copilot-oauth"
 
 const authLogger = createConsola({
   stderr: process.stderr,
@@ -194,18 +199,23 @@ export async function runAuth(options: RunAuthOptions): Promise<void> {
         authLogger.info("Opening GitHub authorization in your browser...")
         authLogger.info(`If the browser does not open, visit: ${url}`)
       })
-  const user = await getGitHubUser(token, instanceDomain)
-  await resolveCopilotOAuth({
-    accountType:
-      instanceDomain === DEFAULT_GITHUB_DOMAIN ? "individual" : "enterprise",
-    githubToken: token,
-    instanceDomain,
-  })
-  const envEntry = formatGitHubCredential({ instanceDomain, token })
-
-  authLogger.success(`Signed in as ${user.login} on ${instanceDomain}`)
-  authLogger.info("Add this entry to GITHUB_TOKENS:")
-  process.stdout.write(`${envEntry}\n`)
+  const runtime = await initializeStorageRuntime()
+  try {
+    const service = getAccountsService()
+    const input = { token, instanceDomain }
+    const context = await createAccountMutationContext(
+      runtime.storage,
+      "account.create",
+      input,
+      "owner:cli",
+    )
+    const created = await service.create(input, context)
+    authLogger.success(
+      `Saved account #${created.value.id} (${created.value.login ?? "GitHub"} on ${instanceDomain}) to ${runtime.config.kind}`,
+    )
+  } finally {
+    await closeStorageRuntime()
+  }
 }
 
 export const auth = defineCommand({

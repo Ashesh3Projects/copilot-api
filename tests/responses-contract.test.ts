@@ -14,6 +14,10 @@ import {
   prepareResponsesRequest,
 } from "~/services/copilot/responses-contract"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 function prepareLegacyResponsesRequestForTest(payload: ResponsesPayload) {
   return finalizeResponsesRequest(payload, { implicitDefault: false })
 }

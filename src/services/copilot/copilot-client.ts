@@ -2,17 +2,24 @@ import * as Sentry from "@sentry/bun"
 import consola from "consola"
 import { randomUUID } from "node:crypto"
 
+import { getActiveAccount } from "~/lib/account-lease-context"
 import { markCopilotContractResponseMetadataAvailable } from "~/lib/copilot-contract-observability"
 import {
   type CopilotRequestAttribution,
   getCopilotRequestAttribution,
   mergeCopilotRequestAttribution,
 } from "~/lib/copilot-request-context"
+import {
+  captureDebugResponseBody,
+  DEBUG_CAPTURE_MAX_BYTES,
+  type CapturedBody,
+} from "~/lib/debug-capture"
 import { resolveCopilotApiBaseUrl } from "~/lib/github-instance"
 import {
   abortLlmDebugLog,
   failLlmDebugLog,
   finishLlmDebugLog,
+  getLlmDebugCaptureSignal,
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
@@ -30,6 +37,7 @@ import {
   type UpstreamSendReason,
 } from "~/lib/routing-telemetry"
 import { state } from "~/lib/state"
+import { tokenPool } from "~/lib/token-pool"
 import { deriveUpstreamSessionId } from "~/lib/upstream-session-affinity"
 import {
   collectSafeCopilotResponseHeaders,
@@ -92,10 +100,11 @@ export function setHttpRetrySleepForTest(sleep?: HttpRetrySleep): void {
 // --- Base URL ---
 
 export function copilotBaseUrl(): string {
+  const account = getActiveAccount()
   return resolveCopilotApiBaseUrl(
-    state.githubInstanceDomain,
-    state.copilotApiBaseUrl,
-    state.accountType,
+    account?.githubInstanceDomain ?? state.githubInstanceDomain,
+    account?.copilotApiBaseUrl ?? state.copilotApiBaseUrl,
+    account?.accountType ?? state.accountType,
   )
 }
 
@@ -168,13 +177,21 @@ function assignTypedOptionHeaders(
   })
 }
 
-export function copilotHeaders(
-  options?: CopilotHeaderOptions,
-): Record<string, string> {
-  const token = options?.copilotToken ?? state.copilotToken
+function resolveCopilotHeaderToken(options?: CopilotHeaderOptions): string {
+  const token =
+    options?.copilotToken
+    ?? getActiveAccount()?.copilotToken
+    ?? state.copilotToken
   if (!token) {
     throw new Error("Copilot token is not set. Cannot build request headers.")
   }
+  return token
+}
+
+export function copilotHeaders(
+  options?: CopilotHeaderOptions,
+): Record<string, string> {
+  const token = resolveCopilotHeaderToken(options)
 
   const initiator = options?.initiator ?? "user"
   const affinityKey = getClientSessionId()
@@ -323,34 +340,54 @@ function isLlmDebugPath(path: string): boolean {
 
 type DebuggableBody = RequestInit["body"]
 
-function isTypedArrayBody(value: unknown): value is NodeJS.TypedArray {
-  return ArrayBuffer.isView(value)
-}
-
-function getBodyTypeName(body: object): string {
-  return body.constructor.name || "object"
-}
-
-function bodyToDebugString(body: DebuggableBody): string | null {
-  if (body === null || body === undefined) return null
-  if (typeof body === "string") return body
-  if (body instanceof URLSearchParams) return body.toString()
-  if (body instanceof ArrayBuffer) return new TextDecoder().decode(body)
-  if (isTypedArrayBody(body)) {
-    return new TextDecoder().decode(body)
+function bodyToDebugCapture(body: DebuggableBody): CapturedBody {
+  if (body === null || body === undefined) return { body: null, bodyBytes: 0 }
+  if (typeof body === "string") {
+    const bodyBytes = Buffer.byteLength(body)
+    return bodyBytes > DEBUG_CAPTURE_MAX_BYTES ?
+        { body: null, bodyBytes, truncated: true, omittedReason: "size-limit" }
+      : { body, bodyBytes }
   }
-  return `[unavailable body type: ${getBodyTypeName(body)}]`
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    const bodyBytes = body.byteLength
+    if (bodyBytes > DEBUG_CAPTURE_MAX_BYTES)
+      return {
+        body: null,
+        bodyBytes,
+        truncated: true,
+        omittedReason: "size-limit",
+      }
+    try {
+      return {
+        body: new TextDecoder(undefined, { fatal: true }).decode(body),
+        bodyBytes,
+      }
+    } catch {
+      return { body: null, bodyBytes, omittedReason: "unsupported" }
+    }
+  }
+  return {
+    body: null,
+    bodyBytes: 0,
+    bodyBytesComplete: false,
+    omittedReason: "unsupported",
+  }
 }
 
 async function captureLlmDebugResponse(
   logId: string,
   response: Response,
+  signal?: AbortSignal,
 ): Promise<void> {
   const responseHeaders = Object.fromEntries(response.headers.entries())
   try {
-    const body = await response.clone().text()
+    const captureSignal = getLlmDebugCaptureSignal(logId)
+    const body = await captureDebugResponseBody(
+      response,
+      signal ? AbortSignal.any([signal, captureSignal]) : captureSignal,
+    )
     finishLlmDebugLog(logId, {
-      body,
+      ...body,
       headers: responseHeaders,
       status: response.status,
       statusText: response.statusText,
@@ -358,6 +395,7 @@ async function captureLlmDebugResponse(
   } catch (error) {
     const debugResponse = {
       body: null,
+      omittedReason: "read-error" as const,
       bodyReadError: toLlmDebugLogError(error),
       headers: responseHeaders,
       status: response.status,
@@ -381,11 +419,13 @@ function startLlmDebugAttempt(opts: {
   const { headers, path, requestInit, url } = opts
   if (!isLlmDebugPath(path)) return undefined
 
+  const requestCapture = bodyToDebugCapture(requestInit?.body)
   return startLlmDebugLog({
+    requestCapture,
     upstream: { kind: "copilot", accountId: opts.accountId },
     method: requestInit?.method ?? "GET",
     path,
-    requestBody: bodyToDebugString(requestInit?.body),
+    requestBody: requestCapture.body,
     requestHeaders: headers,
     requestId: headers["X-Request-Id"] ?? headers["x-request-id"],
     url,
@@ -395,9 +435,10 @@ function startLlmDebugAttempt(opts: {
 function captureLlmDebugAttemptResponse(
   logId: string | undefined,
   response: Response,
+  signal?: AbortSignal,
 ): void {
   if (!logId) return
-  void captureLlmDebugResponse(logId, response)
+  void captureLlmDebugResponse(logId, response, signal)
 }
 
 function failLlmDebugAttempt(logId: string | undefined, error: unknown): void {
@@ -414,14 +455,17 @@ function isRetryableStatus(response: Response): boolean {
 }
 
 async function rediscoverSingleTokenEndpoint(): Promise<string | undefined> {
-  if (state.isMultiToken || !state.githubToken) return undefined
+  const account = getActiveAccount()
+  const githubToken = account?.githubToken ?? state.githubToken
+  if (!githubToken || (!account && state.isMultiToken)) return undefined
 
   try {
     return await rediscoverCopilotOAuthBaseUrl({
-      accountType: state.accountType,
+      accountType: account?.accountType ?? state.accountType,
       currentBaseUrl: copilotBaseUrl(),
-      githubToken: state.githubToken,
-      instanceDomain: state.githubInstanceDomain,
+      githubToken,
+      instanceDomain:
+        account?.githubInstanceDomain ?? state.githubInstanceDomain,
     })
   } catch (error) {
     consola.warn("Failed to rediscover Copilot endpoint after HTTP 421", {
@@ -693,7 +737,9 @@ async function applyRetryResponseAction(options: {
   if (action.kind === "rediscover-endpoint") {
     const baseUrl = await rediscoverSingleTokenEndpoint()
     if (!baseUrl) return undefined
-    state.copilotApiBaseUrl = baseUrl
+    const account = getActiveAccount()
+    if (account) tokenPool.publishRecoveredBaseUrl(account, baseUrl)
+    else state.copilotApiBaseUrl = baseUrl
     return {
       requestInit: refreshRequestIdForRetry(requestInit),
       retryBackoffExtraSeconds,
@@ -775,7 +821,11 @@ export async function copilotFetch(
         url,
       })
 
-      captureLlmDebugAttemptResponse(debugLogId, response)
+      captureLlmDebugAttemptResponse(
+        debugLogId,
+        response,
+        requestInit?.signal ?? undefined,
+      )
       logQuotaSnapshot(response)
 
       const action = await classifyResponse({

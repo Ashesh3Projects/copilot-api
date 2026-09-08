@@ -1,13 +1,18 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
 import { state } from "~/lib/state"
 
 import {
+  useIntegrationFixture,
   initializeTestState,
   postJSON,
   collectSSEEvents,
   TEST_TIMEOUT,
 } from "./setup"
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

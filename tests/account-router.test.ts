@@ -29,10 +29,16 @@ import {
   runWithRequestDiagnostics,
   suppressRequestModelDiagnostics,
 } from "../src/lib/request-session"
-/* eslint-disable max-lines -- account-router integration variants share singleton fixtures */
 import { runWithRoutingAffinity } from "../src/lib/routing-affinity"
+/* eslint-disable max-lines -- account-router integration variants share singleton fixtures */
 import { state } from "../src/lib/state"
 import { tokenPool } from "../src/lib/token-pool"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 type FetchResultFactory = (
@@ -187,10 +193,12 @@ async function routedFetchWithMetadataStore(modelId: string): Promise<{
     {},
     async () =>
       await runWithCopilotContractObservabilityScope(async () => {
-        const result = await routedFetch(
-          "/chat/completions",
-          { method: "POST" },
-          { maxHttpRetryDelaySeconds: 0, modelId },
+        const result = await seedProtocolDatabase().then(() =>
+          routedFetch(
+            "/chat/completions",
+            { method: "POST" },
+            { maxHttpRetryDelaySeconds: 0, modelId },
+          ),
         )
         return { result, headers: { ...getCopilotResponseHeaders() } }
       }),
@@ -261,6 +269,7 @@ test("routes control-plane policy through raw advertised model membership", asyn
           runWithRoutingAffinity(
             { key: affinityKey, source: "copilot_session" },
             async () => {
+              await seedProtocolDatabase()
               const routed = await routedControlPlaneFetch({
                 modelId,
                 path: `/models/${encodeURIComponent(modelId)}/policy`,
@@ -301,12 +310,14 @@ test("forwards typed control-plane body, session token, and abort signal", async
   const result = await runWithRoutingAffinity(
     { key: "control-plane-session", source: "copilot_session" },
     async () =>
-      await routedControlPlaneFetch({
-        body: { auto_mode: { model_hints: ["auto"] } },
-        copilotSessionToken: matchingSessionToken,
-        path: "/models/session",
-        signal: controller.signal,
-      }),
+      await seedProtocolDatabase().then(() =>
+        routedControlPlaneFetch({
+          body: { auto_mode: { model_hints: ["auto"] } },
+          copilotSessionToken: matchingSessionToken,
+          path: "/models/session",
+          signal: controller.signal,
+        }),
+      ),
   )
 
   expect(result.account?.id).toBe(13_011)
@@ -327,10 +338,12 @@ test("returns local 503 without sending when no account advertises a policy mode
   registerAccount(13_021, "different-model", "unrelated-token")
   tokenPool.rebuildModelIndex()
 
-  const { account, response } = await routedControlPlaneFetch({
-    modelId: "missing-policy-model",
-    path: "/models/missing-policy-model/policy",
-  })
+  const { account, response } = await seedProtocolDatabase().then(() =>
+    routedControlPlaneFetch({
+      modelId: "missing-policy-model",
+      path: "/models/missing-policy-model/policy",
+    }),
+  )
 
   expect(account).toBeUndefined()
   expect(response.status).toBe(503)
@@ -361,12 +374,14 @@ test("returns a selected control-plane 401 without reinitialization or cross-acc
   const { account, response } = await runWithRoutingAffinity(
     { key: affinityKey, source: "copilot_session" },
     async () =>
-      await routedControlPlaneFetch({
-        copilotSessionToken: `e30.${Buffer.from(
-          JSON.stringify({ sub: "control-plane-issuer" }),
-        ).toString("base64url")}.c2ln`,
-        path: "/models/session",
-      }),
+      await seedProtocolDatabase().then(() =>
+        routedControlPlaneFetch({
+          copilotSessionToken: `e30.${Buffer.from(
+            JSON.stringify({ sub: "control-plane-issuer" }),
+          ).toString("base64url")}.c2ln`,
+          path: "/models/session",
+        }),
+      ),
   )
 
   expect(response.status).toBe(401)
@@ -407,14 +422,18 @@ test("rediscovers a selected control-plane account after a 421", async () => {
 
   const result = await runWithRoutingAffinity(
     { key: affinityKey, source: "copilot_session" },
-    async () => await routedControlPlaneFetch({ path: "/models/session" }),
+    async () =>
+      await seedProtocolDatabase().then(() =>
+        routedControlPlaneFetch({ path: "/models/session" }),
+      ),
   )
 
   expect(result.response.status).toBe(200)
   expect(result.account?.id).toBe(account.id)
-  expect(account.copilotApiBaseUrl).toBe(
-    "https://api.business.githubcopilot.com",
-  )
+  expect(
+    tokenPool.getAllAccounts().find((current) => current.id === account.id)
+      ?.copilotApiBaseUrl,
+  ).toBe("https://api.business.githubcopilot.com")
   expect(capturedRequests.map(({ url }) => url)).toEqual([
     "https://api.githubcopilot.com/models/session",
     "https://api.github.com/copilot_internal/user",
@@ -447,10 +466,12 @@ test("does not resend a control-plane request after the selected account rejects
   const result = await runWithRoutingAffinity(
     { key: affinityKey, source: "copilot_session" },
     async () =>
-      await routedControlPlaneFetch({
-        copilotSessionToken: matchingSessionToken,
-        path: "/models/session",
-      }),
+      await seedProtocolDatabase().then(() =>
+        routedControlPlaneFetch({
+          copilotSessionToken: matchingSessionToken,
+          path: "/models/session",
+        }),
+      ),
   )
 
   expect(result.response.status).toBe(401)
@@ -468,9 +489,11 @@ test("uses the configured token for single-token control-plane calls", async () 
   state.copilotToken = "single-control-plane-token"
   queuedResults.push(Response.json({ session: "created" }))
 
-  const result = await routedControlPlaneFetch({ path: "/models/session" })
+  const result = await seedProtocolDatabase().then(() =>
+    routedControlPlaneFetch({ path: "/models/session" }),
+  )
 
-  expect(result.account).toBeUndefined()
+  expect(result.account?.copilotToken).toBe("single-control-plane-token")
   expect(
     new Headers(capturedRequests[0]?.init?.headers).get("authorization"),
   ).toBe("Bearer single-control-plane-token")
@@ -489,7 +512,9 @@ test("rediscovers a single-token control-plane endpoint after 421", async () => 
     Response.json({ refreshed: true }),
   )
 
-  const result = await routedControlPlaneFetch({ path: "/models/session" })
+  const result = await seedProtocolDatabase().then(() =>
+    routedControlPlaneFetch({ path: "/models/session" }),
+  )
 
   expect(result.response.status).toBe(200)
   expect(capturedRequests.map(({ url }) => url)).toEqual([
@@ -497,14 +522,18 @@ test("rediscovers a single-token control-plane endpoint after 421", async () => 
     "https://api.github.com/copilot_internal/user",
     "https://api.business.githubcopilot.com/models/session",
   ])
-  expect(state.copilotApiBaseUrl).toBe("https://api.business.githubcopilot.com")
+  expect(tokenPool.getAllAccounts()[0]?.copilotApiBaseUrl).toBe(
+    "https://api.business.githubcopilot.com",
+  )
 })
 
 async function routedFetchWithAffinity(modelId: string, key: string) {
   return await runWithRoutingAffinity(
     { key, source: "copilot_session" },
     async () =>
-      await routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      await seedProtocolDatabase().then(() =>
+        routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      ),
   )
 }
 
@@ -622,10 +651,12 @@ test("keeps identified 429 retries on the hashed account", async () => {
   const result = await runWithRoutingAffinity(
     { key, source: "copilot_session" },
     async () =>
-      await routedFetch(
-        "/chat/completions",
-        { method: "POST" },
-        { maxHttpRetryDelaySeconds: 0, modelId },
+      await seedProtocolDatabase().then(() =>
+        routedFetch(
+          "/chat/completions",
+          { method: "POST" },
+          { maxHttpRetryDelaySeconds: 0, modelId },
+        ),
       ),
   )
 
@@ -691,7 +722,9 @@ test("preserves legacy WebSocket affinity and typed affinity precedence", async 
   const legacyResult = await clientSessionStorage.run(
     legacyKey,
     async () =>
-      await routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      await seedProtocolDatabase().then(() =>
+        routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      ),
   )
   expect(legacyResult.account?.id).toBe(legacyPreferred.id)
 
@@ -707,10 +740,8 @@ test("preserves legacy WebSocket affinity and typed affinity precedence", async 
       await runWithRoutingAffinity(
         { key: typedKey, source: "copilot_session" },
         async () =>
-          await routedFetch(
-            "/chat/completions",
-            { method: "POST" },
-            { modelId },
+          await seedProtocolDatabase().then(() =>
+            routedFetch("/chat/completions", { method: "POST" }, { modelId }),
           ),
       ),
   )
@@ -730,10 +761,8 @@ test("preserves an unidentified public OAuth account after a 401", async () => {
     }),
   )
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(401)
@@ -753,10 +782,8 @@ test("preserves an enterprise account and instance after a 401", async () => {
 
   queuedResults.push(new Response("Unauthorized", { status: 401 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(401)
@@ -789,18 +816,20 @@ test("rediscovers a 421 endpoint and retries the same account once", async () =>
     new Response("{}", { status: 200 }),
   )
 
-  const { response, account: usedAccount } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account: usedAccount } = await seedProtocolDatabase().then(
+    () => routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(200)
   expect(usedAccount?.id).toBe(1005)
-  expect(account.copilotApiBaseUrl).toBe(
-    "https://api.enterprise.githubcopilot.com",
-  )
-  expect(account.githubUsername).toBe("primary-user")
+  expect(
+    tokenPool.getAllAccounts().find((current) => current.id === account.id)
+      ?.copilotApiBaseUrl,
+  ).toBe("https://api.enterprise.githubcopilot.com")
+  expect(
+    tokenPool.getAllAccounts().find((current) => current.id === account.id)
+      ?.githubUsername,
+  ).toBe("primary-user")
   expect(capturedRequests.map(({ url }) => url)).toEqual([
     "https://api.githubcopilot.com/chat/completions",
     "https://api.github.com/copilot_internal/user",
@@ -833,10 +862,8 @@ test("bounds repeated 421 responses to one same-account recovery", async () => {
     new Response("second misdirect", { status: 421 }),
   )
 
-  const { response, account: usedAccount } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account: usedAccount } = await seedProtocolDatabase().then(
+    () => routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(421)
@@ -871,16 +898,17 @@ test("returns the original 421 when endpoint rediscovery fails", async () => {
     new Response("discovery unavailable", { status: 503 }),
   )
 
-  const { response, account: usedAccount } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account: usedAccount } = await seedProtocolDatabase().then(
+    () => routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(421)
   expect(await response.text()).toBe("Misdirected Request")
   expect(usedAccount?.id).toBe(1007)
-  expect(account.copilotApiBaseUrl).toBe("https://api.githubcopilot.com")
+  expect(
+    tokenPool.getAllAccounts().find((current) => current.id === account.id)
+      ?.copilotApiBaseUrl,
+  ).toBe("https://api.githubcopilot.com")
   expect(account.models).toBe(originalModels)
   expect(account.modelsData).toBe(originalModelsData)
   expect(capturedRequests.map(({ url }) => url)).toEqual([
@@ -910,11 +938,11 @@ test("does not resend a 421 after rediscovery removes endpoint authority", async
     Response.json({ data: [refreshedModel], object: "list" }),
   )
 
-  const error = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
-  ).catch((caught: unknown) => caught)
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(LocalHTTPError)
   expect((error as LocalHTTPError).response.status).toBe(400)
@@ -1067,10 +1095,12 @@ test("records final response metadata once when affinity rejection throws", asyn
               await runWithRoutingAffinity(
                 { key, source: "copilot_session" },
                 async () =>
-                  await routedFetch(
-                    "/chat/completions",
-                    { method: "POST" },
-                    { modelId },
+                  await seedProtocolDatabase().then(() =>
+                    routedFetch(
+                      "/chat/completions",
+                      { method: "POST" },
+                      { modelId },
+                    ),
                   ),
               ),
           ),
@@ -1155,10 +1185,12 @@ test("returns the second encrypted Responses compaction failure after one select
       {},
       async () =>
         await runWithCopilotContractObservabilityScope(async () => {
-          const result = await routedFetch(
-            "/responses",
-            { body: requestBody, method: "POST" },
-            { modelId },
+          const result = await seedProtocolDatabase().then(() =>
+            routedFetch(
+              "/responses",
+              { body: requestBody, method: "POST" },
+              { modelId },
+            ),
           )
           return { result, headers: { ...getCopilotResponseHeaders() } }
         }),
@@ -1212,10 +1244,8 @@ test("returns a public OAuth 401 without token exchange or retry", async () => {
     }),
   )
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(401)
@@ -1311,7 +1341,9 @@ test("does not fail over aborted multi-token requests", async () => {
 
   let thrownError: unknown
   try {
-    await routedFetch("/chat/completions", { method: "POST" }, { modelId })
+    await seedProtocolDatabase().then(() =>
+      routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+    )
   } catch (error) {
     thrownError = error
   }
@@ -1340,16 +1372,18 @@ test("applies headerOptions when multi-token falls back with no matching account
 
   queuedResults.push(new Response("{}", { status: 200 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    {
-      modelId,
-      headerOptions: {
-        initiator: "agent",
-        vision: true,
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch(
+      "/chat/completions",
+      { method: "POST" },
+      {
+        modelId,
+        headerOptions: {
+          initiator: "agent",
+          vision: true,
+        },
       },
-    },
+    ),
   )
 
   expect(response.status).toBe(200)
@@ -1372,7 +1406,9 @@ test("omits fallback model diagnostics only inside a suppressed request scope", 
   try {
     await runWithRequestDiagnostics(async () => {
       suppressRequestModelDiagnostics()
-      await routedFetch("/responses", { method: "POST" }, { modelId })
+      await seedProtocolDatabase().then(() =>
+        routedFetch("/responses", { method: "POST" }, { modelId }),
+      )
     })
     const suppressedOutput = JSON.stringify(warnSpy.mock.calls)
     expect(suppressedOutput).toContain("Using Account #10212 as fallback")
@@ -1381,7 +1417,9 @@ test("omits fallback model diagnostics only inside a suppressed request scope", 
 
     warnSpy.mockClear()
     queuedResults.push(new Response("{}", { status: 200 }))
-    await routedFetch("/responses", { method: "POST" }, { modelId })
+    await seedProtocolDatabase().then(() =>
+      routedFetch("/responses", { method: "POST" }, { modelId }),
+    )
     expect(JSON.stringify(warnSpy.mock.calls)).toContain(modelId)
   } finally {
     warnSpy.mockRestore()
@@ -1404,10 +1442,8 @@ test("preserves the fallback account after a public OAuth 401", async () => {
     }),
   )
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(401)
@@ -1427,10 +1463,8 @@ test("does not expose last used account globally outside request context", async
 
   queuedResults.push(new Response("{}", { status: 200 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(200)
@@ -1447,10 +1481,8 @@ test("routes a model only to accounts where the model is enabled", async () => {
 
   queuedResults.push(new Response("{}", { status: 200 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(200)
@@ -1470,10 +1502,12 @@ test("routes a model that only one account advertises to that account", async ()
 
   queuedResults.push(new Response("{}", { status: 200 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId: exclusiveModelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch(
+      "/chat/completions",
+      { method: "POST" },
+      { modelId: exclusiveModelId },
+    ),
   )
 
   expect(response.status).toBe(200)
@@ -1493,10 +1527,8 @@ test("does not fail over to an account where the model is disabled", async () =>
 
   queuedResults.push(new Response("Unauthorized", { status: 401 }))
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(401)
@@ -1513,10 +1545,8 @@ test("returns a routing error when every known account for a model is disabled",
   setModelRoutingOverridesForTest({ [modelId]: { "1010": false } })
   tokenPool.rebuildModelIndex()
 
-  const { response, account } = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const { response, account } = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(response.status).toBe(403)
@@ -1545,7 +1575,9 @@ test("does not switch accounts on a transport connection error", async () => {
 
   let thrownError: unknown
   try {
-    await routedFetch("/chat/completions", { method: "POST" }, { modelId })
+    await seedProtocolDatabase().then(() =>
+      routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+    )
   } catch (error) {
     thrownError = error
   }
@@ -1571,10 +1603,8 @@ test("stops after the first public OAuth 401 without consuming retry budget", as
     new Response("unauthorized: token expired\n", { status: 401 }),
   )
 
-  const result = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const result = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
   expect(result.response.status).toBe(401)
   expect(result.account?.id).toBe(1105)
@@ -1608,7 +1638,9 @@ test("caps total sends across a 429 failover and a transport retry", async () =>
 
   let thrownError: unknown
   try {
-    await routedFetch("/chat/completions", { method: "POST" }, { modelId })
+    await seedProtocolDatabase().then(() =>
+      routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+    )
   } catch (error) {
     thrownError = error
   }

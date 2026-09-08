@@ -21,11 +21,13 @@ import {
 } from "~/lib/storage/operation-budget"
 
 export class LocalSqliteStorage implements Storage {
+  private readonly databasePath: string
   private readonly db: Database
   private readonly queue = new SerialQueue()
   private closed = false
 
   constructor(path: string) {
+    this.databasePath = path
     let db: Database | undefined
     try {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -142,6 +144,55 @@ export class LocalSqliteStorage implements Storage {
 
   read<T>(work: (session: SqlSession) => Promise<T>): Promise<T> {
     return this.operate(work, true)
+  }
+
+  async readSnapshot<T>(
+    work: (session: SqlSession) => Promise<T>,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<T> {
+    assertNotNested(this)
+    if (this.closed) throw new StorageUnavailableError()
+    options.signal?.throwIfAborted()
+    const database = new Database(this.databasePath, {
+      readonly: true,
+      strict: true,
+      safeIntegers: true,
+    })
+    const expires = Date.now() + (options.timeoutMs ?? 1_800_000)
+    database.run("PRAGMA query_only=ON; PRAGMA busy_timeout=5000; BEGIN")
+    const scope = scopedSession(
+      {
+        query: async (statement) =>
+          await Promise.resolve(
+            normalizeRows(database.query(statement.sql).all(...statement.args)),
+          ),
+        execute: () => Promise.reject(new StorageUnavailableError()),
+      },
+      true,
+    )
+    let aborted: (() => void) | undefined
+    const abort = new Promise<never>((_resolve, reject) => {
+      aborted = () => {
+        scope.revoke()
+        reject(new StorageUnavailableError())
+      }
+      options.signal?.addEventListener("abort", aborted, { once: true })
+    })
+    try {
+      const result = await deadlinePromise(
+        Promise.race([work(scope.session), abort]),
+        expires,
+      )
+      await scope.finish()
+      database.run("COMMIT")
+      return result
+    } finally {
+      scope.revoke()
+      if (aborted) options.signal?.removeEventListener("abort", aborted)
+      await scope.finish().catch(() => {})
+      if (database.inTransaction) database.run("ROLLBACK")
+      database.close()
+    }
   }
   transaction<T>(work: (session: SqlSession) => Promise<T>): Promise<T> {
     return this.operate(work, false)

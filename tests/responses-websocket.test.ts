@@ -1,5 +1,5 @@
-/* eslint-disable max-lines, max-lines-per-function */
 import * as Sentry from "@sentry/bun"
+/* eslint-disable max-lines, max-lines-per-function */
 import {
   afterAll,
   afterEach,
@@ -37,7 +37,7 @@ import {
   type RoutingAffinity,
 } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
@@ -65,6 +65,12 @@ import {
   RESPONSES_RECOVERY_MARGIN_BYTES,
 } from "../src/services/copilot/responses-payload-recovery"
 import { sanitizeResponsesStreamEvent } from "../src/services/copilot/responses-terminal-sanitizer"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalApiKeyAuth = state.apiKeyAuth
 const originalFetch = globalThis.fetch
@@ -241,34 +247,40 @@ describe("responses websocket upgrade handling", () => {
     }
 
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: {
-            authorization: "Bearer route-secret",
-            upgrade: "websocket",
-            "x-client-request-id": "req-1",
-          },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: {
+              authorization: "Bearer route-secret",
+              upgrade: "websocket",
+              "x-client-request-id": "req-1",
+            },
+          }),
+          server,
+        ),
       ),
     ).toBe("upgraded")
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/v1/responses", {
-          headers: {
-            authorization: "Bearer route-secret",
-            upgrade: "websocket",
-          },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/v1/responses", {
+            headers: {
+              authorization: "Bearer route-secret",
+              upgrade: "websocket",
+            },
+          }),
+          server,
+        ),
       ),
     ).toBe("upgraded")
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/v1/chat/completions", {
-          headers: { upgrade: "websocket" },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/v1/chat/completions", {
+            headers: { upgrade: "websocket" },
+          }),
+          server,
+        ),
       ),
     ).toBe("no_match")
     expect(upgraded[0]?.requestId).toBe("req-1")
@@ -284,19 +296,21 @@ describe("responses websocket upgrade handling", () => {
       ["thread-id", "thread", "codex_thread"],
     ] as const) {
       let upgraded: ResponsesWebSocketData | undefined
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: {
-            authorization: "Bearer route-secret",
-            [header]: key,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: {
+              authorization: "Bearer route-secret",
+              [header]: key,
+            },
+          }),
+          {
+            upgrade(_request, options): boolean {
+              upgraded = (options as { data: ResponsesWebSocketData }).data
+              return true
+            },
           },
-        }),
-        {
-          upgrade(_request, options): boolean {
-            upgraded = (options as { data: ResponsesWebSocketData }).data
-            return true
-          },
-        },
+        ),
       )
       expect(upgraded?.affinity).toEqual({ key, source })
     }
@@ -332,16 +346,18 @@ describe("responses websocket upgrade handling", () => {
     state.apiKeyAuth = "route-secret"
     let upgraded: ResponsesWebSocketData | undefined
     const upgrade = async (headers: Record<string, string>) => {
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: { authorization: "Bearer route-secret", ...headers },
-        }),
-        {
-          upgrade(_request, options): boolean {
-            upgraded = (options as { data: ResponsesWebSocketData }).data
-            return true
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: { authorization: "Bearer route-secret", ...headers },
+          }),
+          {
+            upgrade(_request, options): boolean {
+              upgraded = (options as { data: ResponsesWebSocketData }).data
+              return true
+            },
           },
-        },
+        ),
       )
       return upgraded
     }
@@ -387,7 +403,8 @@ describe("responses websocket upgrade handling", () => {
     ).toBeUndefined()
   })
 
-  test("enforces cli and config api keys before upgrade", async () => {
+  test("enforces stored gateway and inference keys before upgrade", async () => {
+    await seedProtocolDatabase({ inferenceKeys: ["config-secret"] })
     const server = {
       upgrade(): boolean {
         return true
@@ -396,41 +413,49 @@ describe("responses websocket upgrade handling", () => {
 
     state.apiKeyAuth = "cli-secret"
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: { upgrade: "websocket" },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: { upgrade: "websocket" },
+          }),
+          server,
+        ),
       ),
     ).toBe("auth_failed")
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: {
-            authorization: "Bearer cli-secret",
-            upgrade: "websocket",
-          },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: {
+              authorization: "Bearer cli-secret",
+              upgrade: "websocket",
+            },
+          }),
+          server,
+        ),
       ),
     ).toBe("upgraded")
 
     state.apiKeyAuth = undefined
     setConfigForTest({ auth: { apiKeys: ["config-secret"] } })
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: { upgrade: "websocket", "x-api-key": "wrong" },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: { upgrade: "websocket", "x-api-key": "wrong" },
+          }),
+          server,
+        ),
       ),
     ).toBe("auth_failed")
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: { upgrade: "websocket", "x-api-key": "config-secret" },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: { upgrade: "websocket", "x-api-key": "config-secret" },
+          }),
+          server,
+        ),
       ),
     ).toBe("upgraded")
   })
@@ -447,24 +472,28 @@ describe("responses websocket upgrade handling", () => {
       })
       if (apiKey) headers.set("x-api-key", apiKey)
       expect(
-        await tryUpgradeResponsesWebSocket(
-          new Request("http://localhost/responses", { headers }),
-          server,
+        await seedProtocolDatabase().then(() =>
+          tryUpgradeResponsesWebSocket(
+            new Request("http://localhost/responses", { headers }),
+            server,
+          ),
         ),
       ).toBe("auth_failed")
     }
 
     expect(isIpBlocked(clientIp)).toBe(true)
     expect(
-      await tryUpgradeResponsesWebSocket(
-        new Request("http://localhost/responses", {
-          headers: {
-            "x-api-key": "cli-secret",
-            upgrade: "websocket",
-            "x-copilot-peer-ip": clientIp,
-          },
-        }),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(
+          new Request("http://localhost/responses", {
+            headers: {
+              "x-api-key": "cli-secret",
+              upgrade: "websocket",
+              "x-copilot-peer-ip": clientIp,
+            },
+          }),
+          server,
+        ),
       ),
     ).toBe("upgraded")
     expect(isIpBlocked(clientIp)).toBe(false)
@@ -475,9 +504,8 @@ describe("responses websocket upgrade handling", () => {
     const server = { upgrade: () => true }
     for (let index = 0; index < 5; index += 1) {
       expect(
-        await tryUpgradeResponsesWebSocket(
-          authenticatedResponsesRequest(),
-          server,
+        await seedProtocolDatabase().then(() =>
+          tryUpgradeResponsesWebSocket(authenticatedResponsesRequest(), server),
         ),
       ).toBe("upgraded")
     }
@@ -488,9 +516,11 @@ describe("responses websocket message handling", () => {
   test("rejects response.processed without starting a turn", async () => {
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({ type: "response.processed", response_id: "resp_1" }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({ type: "response.processed", response_id: "resp_1" }),
+      ),
     )
 
     expect(ws.data.nextTurnSequence).toBe(0)
@@ -512,18 +542,16 @@ describe("responses websocket message handling", () => {
       },
     }
     expect(
-      await tryUpgradeResponsesWebSocket(
-        authenticatedResponsesRequest(),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(authenticatedResponsesRequest(), server),
       ),
     ).toBe("upgraded")
     if (!upgraded) throw new Error("Expected upgraded socket data")
     responsesWebSocket.close({ data: upgraded })
     responsesWebSocket.close({ data: upgraded })
     expect(
-      await tryUpgradeResponsesWebSocket(
-        authenticatedResponsesRequest(),
-        server,
+      await seedProtocolDatabase().then(() =>
+        tryUpgradeResponsesWebSocket(authenticatedResponsesRequest(), server),
       ),
     ).toBe("upgraded")
   })
@@ -531,14 +559,16 @@ describe("responses websocket message handling", () => {
   test("accepts frames larger than the former local frame boundary", async () => {
     state.models = responsesCapableModels
     const ws = createTestWebSocket()
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "x".repeat(4 * 1024 * 1024 + 1),
-        generate: false,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "x".repeat(4 * 1024 * 1024 + 1),
+          generate: false,
+        }),
+      ),
     )
 
     expect(
@@ -567,13 +597,15 @@ describe("responses websocket message handling", () => {
         sequence: index,
       })
     }
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        generate: false,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          generate: false,
+        }),
+      ),
     )
 
     expect(
@@ -590,17 +622,23 @@ describe("responses websocket message handling", () => {
     state.models = responsesCapableModels
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(ws, new Uint8Array([1, 2, 3]))
-    await responsesWebSocket.message(ws, "{")
-    await responsesWebSocket.message(ws, JSON.stringify({ type: "unknown" }))
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "still usable",
-        generate: false,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(ws, new Uint8Array([1, 2, 3])),
+    )
+    await seedProtocolDatabase().then(() => responsesWebSocket.message(ws, "{"))
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(ws, JSON.stringify({ type: "unknown" })),
+    )
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "still usable",
+          generate: false,
+        }),
+      ),
     )
 
     const frames = ws.sent.slice(0, 3).map(
@@ -646,7 +684,9 @@ describe("responses websocket message handling", () => {
       state.models = responsesCapableModels
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(ws, JSON.stringify({ type }))
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(ws, JSON.stringify({ type })),
+      )
 
       expect(ws.data.nextTurnSequence).toBe(0)
       expect(JSON.parse(ws.sent[0] ?? "{}")).toMatchObject({
@@ -655,13 +695,15 @@ describe("responses websocket message handling", () => {
         error: { message: "Unsupported message type" },
       })
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          generate: false,
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            generate: false,
+          }),
+        ),
       )
 
       expect(
@@ -679,14 +721,16 @@ describe("responses websocket message handling", () => {
     state.models = responsesCapableModels
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "do not start",
-        stream: false,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "do not start",
+          stream: false,
+        }),
+      ),
     )
 
     expect(ws.data.nextTurnSequence).toBe(1)
@@ -699,14 +743,16 @@ describe("responses websocket message handling", () => {
       ),
     ).toBe(true)
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "continue",
-        generate: false,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "continue",
+          generate: false,
+        }),
+      ),
     )
 
     expect(
@@ -724,20 +770,22 @@ describe("responses websocket message handling", () => {
     const ws = createTestWebSocket()
     queuedResponses.push(createResponsesSseResponse("resp_attribution"))
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        headers: {
-          Authorization: "Bearer frame-secret",
-          "Copilot-Session-Token": "frame-session-secret",
-        },
-        initiator: "agent",
-        agent_task_id: "task-frame",
-        parent_agent_id: "parent-frame",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          headers: {
+            Authorization: "Bearer frame-secret",
+            "Copilot-Session-Token": "frame-session-secret",
+          },
+          initiator: "agent",
+          agent_task_id: "task-frame",
+          parent_agent_id: "parent-frame",
+        }),
+      ),
     )
 
     expect(capturedUpstreamHeaders[0]?.get("x-initiator")).toBe("agent")
@@ -784,23 +832,25 @@ describe("responses websocket message handling", () => {
         parentAgentId: "parent-two",
       },
     ]) {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          agent_task_id: turn.agentTaskId,
-          headers: {
-            Authorization: `Bearer spoof-${turn.input}`,
-            "Copilot-Session-Token": `session-spoof-${turn.input}`,
-            "X-Copilot-Client-Exp-Assignment-Context": turn.clientExperiment,
-            "X-Client-Machine-Id": turn.clientMachineId,
-            "X-GitHub-User": `user-spoof-${turn.input}`,
-            "X-Interaction-Type": turn.interactionType,
-          },
-          input: turn.input,
-          model: "gpt-5.4",
-          parent_agent_id: turn.parentAgentId,
-          type: "response.create",
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            agent_task_id: turn.agentTaskId,
+            headers: {
+              Authorization: `Bearer spoof-${turn.input}`,
+              "Copilot-Session-Token": `session-spoof-${turn.input}`,
+              "X-Copilot-Client-Exp-Assignment-Context": turn.clientExperiment,
+              "X-Client-Machine-Id": turn.clientMachineId,
+              "X-GitHub-User": `user-spoof-${turn.input}`,
+              "X-Interaction-Type": turn.interactionType,
+            },
+            input: turn.input,
+            model: "gpt-5.4",
+            parent_agent_id: turn.parentAgentId,
+            type: "response.create",
+          }),
+        ),
       )
     }
 
@@ -910,18 +960,20 @@ describe("responses websocket message handling", () => {
       const ws = createTestWebSocket()
       queuedResponses.push(createResponsesSseResponse("resp_precedence"))
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "hello",
-          headers: {
-            "X-Agent-Task-Id": "task-header",
-            "X-Parent-Agent-Id": "parent-header",
-          },
-          ...frameFields,
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "hello",
+            headers: {
+              "X-Agent-Task-Id": "task-header",
+              "X-Parent-Agent-Id": "parent-header",
+            },
+            ...frameFields,
+          }),
+        ),
       )
 
       expect(capturedUpstreamHeaders[0]?.get("x-agent-task-id")).toBe(
@@ -939,14 +991,16 @@ describe("responses websocket message handling", () => {
     const ws = createTestWebSocket()
     queuedResponses.push(createChatCompletionsSseResponse())
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        initiator: "agent",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          initiator: "agent",
+        }),
+      ),
     )
 
     expect(capturedUpstreamHeaders[0]?.get("x-initiator")).toBe("agent")
@@ -1001,13 +1055,15 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(new Response("Unauthorized", { status: 401 }))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        input: "continue",
-        model: modelId,
-        type: "response.create",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          input: "continue",
+          model: modelId,
+          type: "response.create",
+        }),
+      ),
     )
 
     const errorFrame = JSON.parse(ws.sent[0] ?? "{}") as {
@@ -1106,14 +1162,16 @@ describe("responses websocket message handling", () => {
     const sentryLogSpy = spyOn(Sentry.logger, "info")
 
     try {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: [],
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: [],
+            tools: [],
+          }),
+        ),
       )
       const frame = JSON.parse(ws.sent.at(-1) ?? "{}") as {
         error?: { code?: string; message?: string; type?: string }
@@ -1183,20 +1241,22 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createResponsesSseResponse("resp_ws"))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [
-          {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: "Hello" }],
-          },
-        ],
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "Hello" }],
+            },
+          ],
+          tools: [],
+        }),
+      ),
     )
 
     const eventTypes = ws.sent.map(
@@ -1225,17 +1285,19 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createResponsesSseResponse("resp_ws_verbosity"))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Explain this.",
-        text: {
-          verbosity: "low",
-          format: { type: "json_object" },
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Explain this.",
+          text: {
+            verbosity: "low",
+            format: { type: "json_object" },
+          },
+        }),
+      ),
     )
 
     expect(lastRequestBody?.text).toEqual({
@@ -1262,14 +1324,16 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createResponsesSseResponse("resp_ws_priority"))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: normalModel.id,
-        input: "Use fast mode",
-        service_tier: "priority",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: normalModel.id,
+          input: "Use fast mode",
+          service_tier: "priority",
+        }),
+      ),
     )
 
     expect(lastRequestBody?.model).toBe(fastModel.id)
@@ -1312,15 +1376,17 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createResponsesSseResponse("resp_ws_priority_effort"))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: normalModel.id,
-        input: "Use fast mode",
-        reasoning: { effort: "high" },
-        service_tier: "priority",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: normalModel.id,
+          input: "Use fast mode",
+          reasoning: { effort: "high" },
+          service_tier: "priority",
+        }),
+      ),
     )
 
     expect(lastRequestBody?.model).toBe(fastModel.id)
@@ -1347,24 +1413,28 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: normalModel.id,
-        input: "First",
-        service_tier: "priority",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: normalModel.id,
+          input: "First",
+          service_tier: "priority",
+        }),
+      ),
     )
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: normalModel.id,
-        input: "Continue",
-        previous_response_id: "resp_ws_priority_parent",
-        service_tier: "priority",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: normalModel.id,
+          input: "Continue",
+          previous_response_id: "resp_ws_priority_parent",
+          service_tier: "priority",
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -1403,14 +1473,16 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createResponsesSseResponse("resp_ws_normal"))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: normalModel.id,
-        input: "Use supported WebSocket routing",
-        service_tier: "priority",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: normalModel.id,
+          input: "Use supported WebSocket routing",
+          service_tier: "priority",
+        }),
+      ),
     )
 
     expect(lastRequestBody?.model).toBe(normalModel.id)
@@ -1435,14 +1507,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        temperature: 1,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          temperature: 1,
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -1470,14 +1544,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        temperature: 1,
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          temperature: 1,
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -1517,20 +1593,22 @@ describe("responses websocket message handling", () => {
     const infoSpy = spyOn(console, "info").mockImplementation(() => undefined)
 
     try {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: [
-            {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "Hello" }],
-            },
-          ],
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: [
+              {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: "Hello" }],
+              },
+            ],
+            tools: [],
+          }),
+        ),
       )
 
       const frames = ws.sent.map(
@@ -1578,14 +1656,16 @@ describe("responses websocket message handling", () => {
     )
     const metadataOnly = createTestWebSocket()
     metadataOnly.data.affinity = undefined
-    await responsesWebSocket.message(
-      metadataOnly,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        client_metadata: { session_id: "frame-session" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        metadataOnly,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          client_metadata: { session_id: "frame-session" },
+        }),
+      ),
     )
     expect(capturedAffinity).toEqual({
       key: "frame-session",
@@ -1597,27 +1677,31 @@ describe("responses websocket message handling", () => {
       key: "handshake-session",
       source: "copilot_session",
     }
-    await responsesWebSocket.message(
-      handshake,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        client_metadata: { session_id: "conflicting-frame-session" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        handshake,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          client_metadata: { session_id: "conflicting-frame-session" },
+        }),
+      ),
     )
     expect(capturedAffinity).toEqual(handshake.data.affinity)
 
     const malformed = createTestWebSocket()
     malformed.data.affinity = undefined
-    await responsesWebSocket.message(
-      malformed,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "hello",
-        client_metadata: "not json",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        malformed,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "hello",
+          client_metadata: "not json",
+        }),
+      ),
     )
     expect(capturedAffinity).toBeUndefined()
   })
@@ -1654,20 +1738,22 @@ describe("responses websocket message handling", () => {
       key: "fork-child-1",
       source: "codex_session",
     }
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model,
-        input: "continue the fork",
-        client_metadata: {
-          session_id: "fork-child-1",
-          thread_id: "fork-child-1",
-          "x-codex-turn-metadata": JSON.stringify({
-            forked_from_thread_id: "fork-parent-0",
-          }),
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model,
+          input: "continue the fork",
+          client_metadata: {
+            session_id: "fork-child-1",
+            thread_id: "fork-child-1",
+            "x-codex-turn-metadata": JSON.stringify({
+              forked_from_thread_id: "fork-parent-0",
+            }),
+          },
+        }),
+      ),
     )
 
     expect(capturedAffinity).toEqual({
@@ -1682,17 +1768,19 @@ describe("responses websocket message handling", () => {
       "81e3167a-de1a-5ffa-8c20-f832dc0e2909",
     )
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model,
-        input: "continue after the first fork turn",
-        client_metadata: {
-          session_id: "fork-child-1",
-          thread_id: "fork-child-1",
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model,
+          input: "continue after the first fork turn",
+          client_metadata: {
+            session_id: "fork-child-1",
+            thread_id: "fork-child-1",
+          },
+        }),
+      ),
     )
 
     expect(capturedAuthorization).toEqual([
@@ -1718,20 +1806,22 @@ describe("responses websocket message handling", () => {
       source: "copilot_session",
     }
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "independent request",
-        client_metadata: {
-          session_id: "fork-child",
-          thread_id: "fork-child",
-          "x-codex-turn-metadata": JSON.stringify({
-            forked_from_thread_id: "fork-parent",
-          }),
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "independent request",
+          client_metadata: {
+            session_id: "fork-child",
+            thread_id: "fork-child",
+            "x-codex-turn-metadata": JSON.stringify({
+              forked_from_thread_id: "fork-parent",
+            }),
+          },
+        }),
+      ),
     )
 
     expect(capturedAffinity).toEqual({
@@ -1750,26 +1840,30 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
     ws.data.affinity = undefined
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "first",
-        client_metadata: { session_id: "snapshot-session" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "first",
+          client_metadata: { session_id: "snapshot-session" },
+        }),
+      ),
     )
     expect(ws.data.responseSnapshots.has("resp_affinity_parent")).toBe(true)
 
     capturedAffinity = undefined as RoutingAffinity | undefined
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "follow-up",
-        previous_response_id: "resp_affinity_parent",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "follow-up",
+          previous_response_id: "resp_affinity_parent",
+        }),
+      ),
     )
 
     expect(capturedAffinity).toEqual({
@@ -1815,24 +1909,28 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: modelA,
-        input: "first",
-        text: { verbosity: "low" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: modelA,
+          input: "first",
+          text: { verbosity: "low" },
+        }),
+      ),
     )
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: modelA,
-        input: "follow-up",
-        previous_response_id: "resp_verbosity_cycle_parent",
-        text: { verbosity: "low" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: modelA,
+          input: "follow-up",
+          previous_response_id: "resp_verbosity_cycle_parent",
+          text: { verbosity: "low" },
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -1885,26 +1983,30 @@ describe("responses websocket message handling", () => {
     const ws = createTestWebSocket()
     ws.data.affinity = undefined
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: modelA,
-        input: "first",
-        client_metadata: { session_id: firstAffinity },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: modelA,
+          input: "first",
+          client_metadata: { session_id: firstAffinity },
+        }),
+      ),
     )
     expect(capturedAuthorization).toEqual(["Bearer ws-continuation-token-a"])
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: modelB,
-        input: "must reject",
-        client_metadata: { session_id: modelBReplacementAffinity },
-        previous_response_id: "resp_ws_consistent_parent",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: modelB,
+          input: "must reject",
+          client_metadata: { session_id: modelBReplacementAffinity },
+          previous_response_id: "resp_ws_consistent_parent",
+        }),
+      ),
     )
 
     const rejection = JSON.parse(ws.sent.at(-1) ?? "{}") as {
@@ -1934,14 +2036,16 @@ describe("responses websocket message handling", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(ws.data.closed).toBe(false)
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        input: "valid continuation",
-        client_metadata: { session_id: replacementAffinity },
-        previous_response_id: "resp_ws_consistent_parent",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          input: "valid continuation",
+          client_metadata: { session_id: replacementAffinity },
+          previous_response_id: "resp_ws_consistent_parent",
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -1994,34 +2098,38 @@ describe("responses websocket message handling", () => {
     const ws = createTestWebSocket()
     ws.data.affinity = undefined
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model,
-        input: "first history item",
-        client_metadata: JSON.stringify({
-          session_id: firstAffinity,
-          thread_id: "original-thread",
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model,
+          input: "first history item",
+          client_metadata: JSON.stringify({
+            session_id: firstAffinity,
+            thread_id: "original-thread",
+          }),
         }),
-      }),
+      ),
     )
     expect(capturedAuthorization).toEqual([
       "Bearer ws-string-continuation-token-a",
     ])
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        input: "valid continuation",
-        client_metadata: JSON.stringify({
-          session_id: replacementAffinity,
-          thread_id: "replacement-thread",
-          request_kind: "compaction",
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          input: "valid continuation",
+          client_metadata: JSON.stringify({
+            session_id: replacementAffinity,
+            thread_id: "replacement-thread",
+            request_kind: "compaction",
+          }),
+          previous_response_id: "resp_ws_string_parent",
         }),
-        previous_response_id: "resp_ws_string_parent",
-      }),
+      ),
     )
 
     expect(capturedAuthorization).toEqual([
@@ -2203,13 +2311,15 @@ describe("responses websocket message handling", () => {
       )
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          input: "metadata",
-          model: "gpt-5.4",
-          type: "response.create",
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            input: "metadata",
+            model: "gpt-5.4",
+            type: "response.create",
+          }),
+        ),
       )
 
       const frames = ws.sent.map(
@@ -2252,21 +2362,25 @@ describe("responses websocket message handling", () => {
     }
     const ws = createTestWebSocket()
 
-    const first = responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        input: "first",
-        model: "gpt-5.4",
-        type: "response.create",
-      }),
+    const first = seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          input: "first",
+          model: "gpt-5.4",
+          type: "response.create",
+        }),
+      ),
     )
-    const second = responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        input: "second",
-        model: "gpt-5.4",
-        type: "response.create",
-      }),
+    const second = seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          input: "second",
+          model: "gpt-5.4",
+          type: "response.create",
+        }),
+      ),
     )
     await waitFor(() => resolvers.length === 2)
 
@@ -2392,14 +2506,16 @@ describe("responses websocket message handling", () => {
     })
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+          tools: [],
+        }),
+      ),
     )
 
     expect(upstreamSignal).toBeInstanceOf(AbortSignal)
@@ -2448,13 +2564,15 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -2480,13 +2598,15 @@ describe("responses websocket message handling", () => {
       "x-request-id": "req-ws-native",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     const headers = capturedUpstreamHeaders[0]
@@ -2510,29 +2630,33 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "one",
-        headers: {
-          "anthropic-beta": "beta-one,beta-one",
-          "anthropic-version": "2024-01-01",
-          "x-model-provider-preference": "anthropic",
-          authorization: "Bearer must-not-pass",
-          "copilot-session-token": "must-not-pass",
-          "x-agent-task-id": "task-first",
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "one",
+          headers: {
+            "anthropic-beta": "beta-one,beta-one",
+            "anthropic-version": "2024-01-01",
+            "x-model-provider-preference": "anthropic",
+            authorization: "Bearer must-not-pass",
+            "copilot-session-token": "must-not-pass",
+            "x-agent-task-id": "task-first",
+          },
+        }),
+      ),
     )
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "two",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "two",
+        }),
+      ),
     )
 
     expect(capturedUpstreamHeaders).toHaveLength(2)
@@ -2578,13 +2702,15 @@ describe("responses websocket message handling", () => {
       "x-request-id": "req-ws-redirect",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: requestedModel,
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: requestedModel,
+          input: "Hello",
+        }),
+      ),
     )
 
     expect(lastRequestBody?.model).toBe(targetModel)
@@ -2626,13 +2752,15 @@ describe("responses websocket message handling", () => {
       "x-request-id": "req-ws-retry",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     expect(capturedUpstreamHeaders).toHaveLength(2)
@@ -2653,13 +2781,15 @@ describe("responses websocket message handling", () => {
       "x-model-provider-preference": "p".repeat(1025),
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     const headers = capturedUpstreamHeaders[0]
@@ -2685,13 +2815,15 @@ describe("responses websocket message handling", () => {
       "x-model-provider-preference": "anthropic",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     const headers = capturedUpstreamHeaders[0]
@@ -2709,13 +2841,15 @@ describe("responses websocket message handling", () => {
       "x-model-provider-preference": "anthropic",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     const headers = capturedUpstreamHeaders[0]
@@ -2736,13 +2870,15 @@ describe("responses websocket message handling", () => {
     }
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+        }),
+      ),
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
@@ -2760,16 +2896,18 @@ describe("responses websocket message handling", () => {
     state.models = responsesCapableModels
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "Hello",
-        store: true,
-        tools: [{ type: "code_interpreter", future: { retained: true } }],
-        context_management: [{ type: "future_unknown" }],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "Hello",
+          store: true,
+          tools: [{ type: "code_interpreter", future: { retained: true } }],
+          context_management: [{ type: "future_unknown" }],
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -2797,25 +2935,27 @@ describe("responses websocket message handling", () => {
     const ws = createTestWebSocket()
     queuedResponses.push(createChatCompletionsSseResponse())
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [
-          {
-            type: "reasoning",
-            encrypted_content: "private-encrypted-state",
-            summary: [{ type: "summary_text", text: "visible summary" }],
-          },
-          { type: "future_item", payload: "future-private-value" },
-          {
-            type: "item_reference",
-            id: "item-reference-private-value",
-          },
-          { type: "message", role: "user", content: "finish" },
-        ],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [
+            {
+              type: "reasoning",
+              encrypted_content: "private-encrypted-state",
+              summary: [{ type: "summary_text", text: "visible summary" }],
+            },
+            { type: "future_item", payload: "future-private-value" },
+            {
+              type: "item_reference",
+              id: "item-reference-private-value",
+            },
+            { type: "message", role: "user", content: "finish" },
+          ],
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -2853,14 +2993,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "search and synthesize",
-        tools: [{ type: "web_search", max_uses: 2 }],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "search and synthesize",
+          tools: [{ type: "web_search", max_uses: 2 }],
+        }),
+      ),
     )
 
     expect(searches).toHaveLength(2)
@@ -2892,14 +3034,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "do not partially search",
-        tools: [{ type: "web_search", max_uses: 1 }],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "do not partially search",
+          tools: [{ type: "web_search", max_uses: 1 }],
+        }),
+      ),
     )
 
     expect(searches).toBe(0)
@@ -2953,19 +3097,21 @@ describe("responses websocket message handling", () => {
       }),
     )
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        previous_response_id: "resp_ws_fallback",
-        input: [],
-        client_metadata: {
-          "x-codex-turn-metadata": JSON.stringify({
-            request_kind: "compaction",
-          }),
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          previous_response_id: "resp_ws_fallback",
+          input: [],
+          client_metadata: {
+            "x-codex-turn-metadata": JSON.stringify({
+              request_kind: "compaction",
+            }),
+          },
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -2995,23 +3141,27 @@ describe("responses websocket message handling", () => {
     }
     const ws = createTestWebSocket()
 
-    const first = responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "first",
-        tools: [],
-      }),
+    const first = seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "first",
+          tools: [],
+        }),
+      ),
     )
-    const second = responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "second",
-        tools: [],
-      }),
+    const second = seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "second",
+          tools: [],
+        }),
+      ),
     )
     await waitFor(() => resolvers.length === 2)
 
@@ -3048,14 +3198,16 @@ describe("responses websocket message handling", () => {
     }
 
     try {
-      const pending = responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "keep streaming",
-          tools: [],
-        }),
+      const pending = seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "keep streaming",
+            tools: [],
+          }),
+        ),
       )
       await waitFor(() => upstreamSignal !== undefined)
 
@@ -3111,14 +3263,16 @@ describe("responses websocket message handling", () => {
       const sentryLogSpy = spyOn(Sentry.logger, "info")
 
       try {
-        await responsesWebSocket.message(
-          ws,
-          JSON.stringify({
-            type: "response.create",
-            model: "gpt-5.4",
-            input: "fail",
-            tools: [],
-          }),
+        await seedProtocolDatabase().then(() =>
+          responsesWebSocket.message(
+            ws,
+            JSON.stringify({
+              type: "response.create",
+              model: "gpt-5.4",
+              input: "fail",
+              tools: [],
+            }),
+          ),
         )
 
         const clientOutput = ws.sent.join("\n")
@@ -3177,14 +3331,16 @@ describe("responses websocket message handling", () => {
       )
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          input: "terminal usage",
-          model: "gpt-5.4",
-          tools: [],
-          type: "response.create",
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            input: "terminal usage",
+            model: "gpt-5.4",
+            tools: [],
+            type: "response.create",
+          }),
+        ),
       )
 
       const terminal = JSON.parse(ws.sent.at(-1) ?? "{}") as {
@@ -3215,14 +3371,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "fail",
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "fail",
+          tools: [],
+        }),
+      ),
     )
 
     const terminal = JSON.parse(ws.sent.at(-1) ?? "{}") as {
@@ -3258,14 +3416,16 @@ describe("responses websocket message handling", () => {
     queuedResponses.push(createRawResponsesTerminalSseResponse(data))
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "fail",
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "fail",
+          tools: [],
+        }),
+      ),
     )
 
     const output = ws.sent.join("\n")
@@ -3306,14 +3466,16 @@ describe("responses websocket message handling", () => {
       )
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "fail",
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "fail",
+            tools: [],
+          }),
+        ),
       )
 
       const terminal = JSON.parse(ws.sent.at(-1) ?? "{}") as { type?: string }
@@ -3345,14 +3507,16 @@ describe("responses websocket message handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "fail",
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "fail",
+          tools: [],
+        }),
+      ),
     )
 
     const terminal = JSON.parse(ws.sent.at(-1) ?? "{}") as {
@@ -3387,14 +3551,16 @@ describe("responses websocket message handling", () => {
     }
 
     try {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "finish",
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "finish",
+            tools: [],
+          }),
+        ),
       )
       await new Promise((resolve) => setTimeout(resolve, 0))
       expect(
@@ -3414,15 +3580,17 @@ describe("responses websocket message handling", () => {
     const debugSpy = spyOn(consola, "debug")
 
     try {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          previous_response_id: "missing",
-          input: [],
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            previous_response_id: "missing",
+            input: [],
+            tools: [],
+          }),
+        ),
       )
 
       const errorFrame = JSON.parse(ws.sent[0] ?? "{}") as {
@@ -3449,13 +3617,15 @@ describe("responses websocket message handling", () => {
       expect(ws.data.closed).toBe(false)
 
       queuedResponses.push(createResponsesSseResponse("resp_after_stale"))
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "new local thread",
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "new local thread",
+          }),
+        ),
       )
 
       expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -3483,15 +3653,17 @@ describe("responses websocket message handling", () => {
       state.models = responsesCapableModels
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          previous_response_id: previousResponseId,
-          input: [],
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            previous_response_id: previousResponseId,
+            input: [],
+            tools: [],
+          }),
+        ),
       )
 
       expect(fetchMock).not.toHaveBeenCalled()
@@ -3547,34 +3719,36 @@ describe("responses websocket upstream handling", () => {
         }),
       )
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          previous_response_id: "resp_before_ordinary",
-          input: [
-            {
-              type: "function_call_output",
-              call_id: "call_ws_current",
-              output: [
-                {
-                  type: "computer_screenshot",
-                  image_url: inlineScreenshot,
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            previous_response_id: "resp_before_ordinary",
+            input: [
+              {
+                type: "function_call_output",
+                call_id: "call_ws_current",
+                output: [
+                  {
+                    type: "computer_screenshot",
+                    image_url: inlineScreenshot,
+                  },
+                ],
+                internal_chat_message_metadata_passthrough: {
+                  turn_id: "turn_current",
                 },
-              ],
-              internal_chat_message_metadata_passthrough: {
-                turn_id: "turn_current",
               },
+            ],
+            client_metadata: {
+              "x-codex-turn-metadata": JSON.stringify({
+                request_kind: "turn",
+                turn_id: "turn_current",
+              }),
             },
-          ],
-          client_metadata: {
-            "x-codex-turn-metadata": JSON.stringify({
-              request_kind: "turn",
-              turn_id: "turn_current",
-            }),
-          },
-        }),
+          }),
+        ),
       )
 
       expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -3632,20 +3806,22 @@ describe("responses websocket upstream handling", () => {
       }),
     )
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        previous_response_id: "resp_before_compaction",
-        input: [],
-        tools: [],
-        client_metadata: {
-          "x-codex-turn-metadata": JSON.stringify({
-            request_kind: "compaction",
-          }),
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          previous_response_id: "resp_before_compaction",
+          input: [],
+          tools: [],
+          client_metadata: {
+            "x-codex-turn-metadata": JSON.stringify({
+              request_kind: "compaction",
+            }),
+          },
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -3691,19 +3867,21 @@ describe("responses websocket upstream handling", () => {
       }),
     )
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        previous_response_id: "resp_preserved_only",
-        input: [],
-        client_metadata: {
-          "x-codex-turn-metadata": JSON.stringify({
-            request_kind: "compaction",
-          }),
-        },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          previous_response_id: "resp_preserved_only",
+          input: [],
+          client_metadata: {
+            "x-codex-turn-metadata": JSON.stringify({
+              request_kind: "compaction",
+            }),
+          },
+        }),
+      ),
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
@@ -3755,21 +3933,23 @@ describe("responses websocket upstream handling", () => {
       }),
     )
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        previous_response_id: "resp_with_reasoning",
-        input: [
-          {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: "Follow up" }],
-          },
-        ],
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          previous_response_id: "resp_with_reasoning",
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "Follow up" }],
+            },
+          ],
+          tools: [],
+        }),
+      ),
     )
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -3797,14 +3977,16 @@ describe("responses websocket upstream handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [],
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [],
+          tools: [],
+        }),
+      ),
     )
 
     const errorFrame = JSON.parse(ws.sent[0] ?? "{}") as {
@@ -3849,13 +4031,15 @@ describe("responses websocket upstream handling", () => {
       input: [],
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "eof",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "eof",
+        }),
+      ),
     )
 
     const types = ws.sent.map(
@@ -3917,13 +4101,15 @@ describe("responses websocket upstream handling", () => {
       )
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: status,
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: status,
+          }),
+        ),
       )
 
       expect(
@@ -3962,13 +4148,15 @@ describe("responses websocket upstream handling", () => {
     )
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "incomplete",
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "incomplete",
+        }),
+      ),
     )
 
     expect(ws.data.responseSnapshots.has("resp_embedded_incomplete")).toBe(true)
@@ -3988,13 +4176,15 @@ describe("responses websocket upstream handling", () => {
     })
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [],
+        }),
+      ),
     )
 
     expect(JSON.parse(ws.sent[0] ?? "{}")).toMatchObject({
@@ -4042,14 +4232,16 @@ describe("responses websocket upstream handling", () => {
     )
 
     try {
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: [],
-          tools: [],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: [],
+            tools: [],
+          }),
+        ),
       )
       const errorFrame = JSON.parse(ws.sent.at(-1) ?? "{}") as {
         error?: { code?: string; message?: string }
@@ -4142,15 +4334,17 @@ describe("responses websocket warmup handling", () => {
       configure()
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          input: "warmup",
-          generate: false,
-          ...payload,
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            input: "warmup",
+            generate: false,
+            ...payload,
+          }),
+        ),
       )
 
       expect(fetchMock).not.toHaveBeenCalled()
@@ -4175,20 +4369,22 @@ describe("responses websocket warmup handling", () => {
     }
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [
-          { type: "future_item", payload: "private-future-value" },
-          { type: "message", role: "user", content: "warmup" },
-        ],
-        generate: false,
-        tools: [],
-        tool_choice: "none",
-        reasoning: { effort: "none" },
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [
+            { type: "future_item", payload: "private-future-value" },
+            { type: "message", role: "user", content: "warmup" },
+          ],
+          generate: false,
+          tools: [],
+          tool_choice: "none",
+          reasoning: { effort: "none" },
+        }),
+      ),
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
@@ -4211,18 +4407,20 @@ describe("responses websocket warmup handling", () => {
     installWebSocketEndpoint("/chat/completions")
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [
-          { type: "future_item", payload: "private-future-value" },
-          { type: "message", role: "user", content: "warmup" },
-        ],
-        generate: false,
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [
+            { type: "future_item", payload: "private-future-value" },
+            { type: "message", role: "user", content: "warmup" },
+          ],
+          generate: false,
+          tools: [],
+        }),
+      ),
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
@@ -4246,28 +4444,30 @@ describe("responses websocket warmup handling", () => {
     installWebSocketEndpoint("/chat/completions")
     const ws = createTestWebSocket()
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: [
-          { type: "future_item", payload: "private-future-value" },
-          {
-            type: "message",
-            role: "user",
-            content: [
-              { type: "input_text", text: "warmup" },
-              {
-                type: "input_image",
-                image_url: "https://attachments.invalid/private.png",
-              },
-            ],
-          },
-        ],
-        generate: false,
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: [
+            { type: "future_item", payload: "private-future-value" },
+            {
+              type: "message",
+              role: "user",
+              content: [
+                { type: "input_text", text: "warmup" },
+                {
+                  type: "input_image",
+                  image_url: "https://attachments.invalid/private.png",
+                },
+              ],
+            },
+          ],
+          generate: false,
+          tools: [],
+        }),
+      ),
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
@@ -4289,15 +4489,17 @@ describe("responses websocket warmup handling", () => {
       "x-request-id": "req-ws-warmup",
     })
 
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        input: "warmup",
-        generate: false,
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          input: "warmup",
+          generate: false,
+          tools: [],
+        }),
+      ),
     )
     expect(fetchMock).not.toHaveBeenCalled()
     const warmupId = ws.sent
@@ -4306,15 +4508,17 @@ describe("responses websocket warmup handling", () => {
     if (!warmupId) throw new Error("Expected synthetic warmup response id")
 
     queuedResponses.push(createAnthropicMessageResponse("msg_ws_warmup"))
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({
-        type: "response.create",
-        model: "gpt-5.4",
-        previous_response_id: warmupId,
-        input: "Continue",
-        tools: [],
-      }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.4",
+          previous_response_id: warmupId,
+          input: "Continue",
+          tools: [],
+        }),
+      ),
     )
 
     const headers = capturedUpstreamHeaders[0]
@@ -4459,31 +4663,35 @@ describe("responses websocket continuation handling", () => {
       )
       const ws = createTestWebSocket()
 
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          instructions: "Keep the stable instructions.",
-          input: "first prompt",
-          metadata: { nested: { source: "first-turn" } },
-          tools: [
-            {
-              type: "function",
-              name: "run",
-              parameters: { type: "object", properties: {} },
-            },
-          ],
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            instructions: "Keep the stable instructions.",
+            input: "first prompt",
+            metadata: { nested: { source: "first-turn" } },
+            tools: [
+              {
+                type: "function",
+                name: "run",
+                parameters: { type: "object", properties: {} },
+              },
+            ],
+          }),
+        ),
       )
-      await responsesWebSocket.message(
-        ws,
-        JSON.stringify({
-          type: "response.create",
-          model: "gpt-5.4",
-          previous_response_id: "resp_string_parent",
-          input: "current delta",
-        }),
+      await seedProtocolDatabase().then(() =>
+        responsesWebSocket.message(
+          ws,
+          JSON.stringify({
+            type: "response.create",
+            model: "gpt-5.4",
+            previous_response_id: "resp_string_parent",
+            input: "current delta",
+          }),
+        ),
       )
 
       expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -4810,20 +5018,22 @@ async function createUpgradedTestWebSocket(
 ): Promise<ReturnType<typeof createTestWebSocket>> {
   state.apiKeyAuth = "cli-secret"
   let data: ResponsesWebSocketData | undefined
-  const result = await tryUpgradeResponsesWebSocket(
-    new Request("http://localhost/responses", {
-      headers: {
-        authorization: "Bearer cli-secret",
-        upgrade: "websocket",
-        ...headers,
+  const result = await seedProtocolDatabase().then(() =>
+    tryUpgradeResponsesWebSocket(
+      new Request("http://localhost/responses", {
+        headers: {
+          authorization: "Bearer cli-secret",
+          upgrade: "websocket",
+          ...headers,
+        },
+      }),
+      {
+        upgrade(_request, options): boolean {
+          data = (options as { data: ResponsesWebSocketData }).data
+          return true
+        },
       },
-    }),
-    {
-      upgrade(_request, options): boolean {
-        data = (options as { data: ResponsesWebSocketData }).data
-        return true
-      },
-    },
+    ),
   )
   if (result !== "upgraded" || !data) {
     throw new Error("Expected Responses WebSocket upgrade")

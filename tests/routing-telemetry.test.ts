@@ -1,7 +1,7 @@
 import { beforeEach, expect, test } from "bun:test"
 
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   isRoutingWindow,
   recordRoutingRequest,
   recordRoutingSelection,

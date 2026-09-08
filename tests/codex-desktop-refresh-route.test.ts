@@ -1,12 +1,19 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 
 import { shouldOmitRequestBodyFromDiagnostics } from "../src/lib/request-diagnostics"
 import { trustedJwtDigestStore } from "../src/lib/trusted-jwt-digests"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-const CREATED_AT = "2026-09-02T00:00:00.000Z"
 
 function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url")
@@ -44,17 +51,12 @@ function createRefreshToken(jwt: string): string {
   return `local_codex_v1.${Buffer.from(jwt, "utf8").toString("base64url")}`
 }
 
-function registerJwt(jwt: string, enabled = true): void {
-  trustedJwtDigestStore.replaceForTest([
-    {
-      id: "11111111-1111-4111-8111-111111111111",
-      label: "Codex Desktop",
-      digest: createHash("sha256").update(jwt, "utf8").digest("hex"),
-      enabled,
-      createdAt: CREATED_AT,
-      updatedAt: CREATED_AT,
-    },
-  ])
+async function registerJwt(jwt: string, enabled = true): Promise<void> {
+  const entry = await trustedJwtDigestStore.add({
+    label: "Codex Desktop",
+    digest: createHash("sha256").update(jwt, "utf8").digest("hex"),
+  })
+  if (!enabled) await trustedJwtDigestStore.setEnabled(entry.id, false)
 }
 
 async function refreshRequest(
@@ -69,7 +71,7 @@ async function refreshRequest(
 }
 
 beforeEach(() => {
-  trustedJwtDigestStore.replaceForTest([])
+  trustedJwtDigestStore.resetAfterTest()
 })
 
 afterAll(() => {
@@ -79,7 +81,7 @@ afterAll(() => {
 test("refreshes an enabled managed Codex Desktop JWT without rotating secrets", async () => {
   const jwt = createSyntheticJwt()
   const refreshToken = createRefreshToken(jwt)
-  registerJwt(jwt)
+  await registerJwt(jwt)
 
   const response = await refreshRequest({
     client_id: CLIENT_ID,
@@ -104,7 +106,7 @@ test.each([
   "rejects an %s managed JWT as invalid_grant",
   async (_name, disabled) => {
     const jwt = createSyntheticJwt()
-    if (disabled) registerJwt(jwt, false)
+    if (disabled) await registerJwt(jwt, false)
 
     const response = await refreshRequest({
       client_id: CLIENT_ID,
@@ -202,7 +204,7 @@ test("requires JSON and valid JSON", async () => {
 
 test("rejects unexpected refresh request fields", async () => {
   const jwt = createSyntheticJwt()
-  registerJwt(jwt)
+  await registerJwt(jwt)
 
   const response = await refreshRequest({
     client_id: CLIENT_ID,
@@ -232,7 +234,15 @@ test.each([null, [], "refresh_token"])(
 )
 
 test("does not expose the refresh route through unsupported methods", async () => {
-  const response = await server.request("/v1/codex/auth/refresh")
+  const anonymous = await server.request("/v1/codex/auth/refresh")
+  expect(anonymous.status).toBe(401)
+  await seedProtocolDatabase({
+    gatewayKeys: ["refresh-method-test-key"],
+    singleAccount: false,
+  })
+  const response = await server.request("/v1/codex/auth/refresh", {
+    headers: { authorization: "Bearer refresh-method-test-key" },
+  })
 
   expect(response.status).toBe(404)
 })

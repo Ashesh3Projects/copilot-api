@@ -20,6 +20,13 @@ import { setModelSettingsForTest } from "../src/lib/model-settings"
 import { setSsePreflushDeadlineForTest } from "../src/lib/sse-lifecycle"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 
@@ -454,19 +461,24 @@ afterEach(() => {
 })
 
 test("routes legacy chat completions requests for responses-only models through /responses", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [
-        { role: "system", content: "Be concise." },
-        { role: "user", content: "Say hello." },
-      ],
-      max_tokens: 32,
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [
+          { role: "system", content: "Be concise." },
+          { role: "user", content: "Say hello." },
+        ],
+        max_tokens: 32,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -519,16 +531,21 @@ test("applies redirect verbosity only to the Responses candidate", async () => {
     },
   ])
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Say hello." }],
-      response_format: { type: "json_object" },
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Say hello." }],
+        response_format: { type: "json_object" },
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -541,21 +558,24 @@ test("applies redirect verbosity only to the Responses candidate", async () => {
 test("passes explicit native beta, version, and provider preference through Chat to Messages", async () => {
   state.models = messagesOnlyModels
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "beta-one, beta-two, beta-one",
-      "anthropic-version": "2023-06-01",
-      "x-model-provider-preference": "anthropic",
-    },
-    body: JSON.stringify({
-      model: "claude-messages-only",
-      messages: [{ role: "user", content: "Say hello." }],
-      max_tokens: 32,
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "beta-one, beta-two, beta-one",
+        "anthropic-version": "2023-06-01",
+        "x-model-provider-preference": "anthropic",
+      },
+      body: JSON.stringify({
+        model: "claude-messages-only",
+        messages: [{ role: "user", content: "Say hello." }],
+        max_tokens: 32,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/v1/messages")
@@ -567,20 +587,23 @@ test("passes explicit native beta, version, and provider preference through Chat
 })
 
 test("does not pass native Messages headers through Chat to Responses", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "beta-one",
-      "anthropic-version": "2024-01-01",
-      "x-model-provider-preference": "anthropic",
-    },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Say hello." }],
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "beta-one",
+        "anthropic-version": "2024-01-01",
+        "x-model-provider-preference": "anthropic",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Say hello." }],
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -593,15 +616,20 @@ test("records one endpoint fallback event for a translated Chat request", async 
   const infoSpy = spyOn(console, "info").mockImplementation(() => undefined)
 
   try {
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        messages: [{ role: "user", content: "Say hello." }],
-        stream: false,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          messages: [{ role: "user", content: "Say hello." }],
+          stream: false,
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     const fallbackEvents = infoSpy.mock.calls.filter(
@@ -617,35 +645,45 @@ test("records one endpoint fallback event for a translated Chat request", async 
 })
 
 test("degrades a lossy Chat to Responses fallback and dispatches", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [
-        { role: "user", content: "Run the tool." },
-        { role: "tool", content: "private" },
-      ],
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [
+          { role: "user", content: "Run the tool." },
+          { role: "tool", content: "private" },
+        ],
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
 })
 
 test("omits tool controls when a chat fallback request has no tools", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Reply without tools." }],
-      tools: null,
-      parallel_tool_calls: true,
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Reply without tools." }],
+        tools: null,
+        parallel_tool_calls: true,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -655,27 +693,32 @@ test("omits tool controls when a chat fallback request has no tools", async () =
 })
 
 test("preserves tool controls when a chat fallback request has tools", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Call the weather tool." }],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "get_weather",
-            description: "Read the weather",
-            parameters: { type: "object", properties: {} },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Call the weather tool." }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "get_weather",
+              description: "Read the weather",
+              parameters: { type: "object", properties: {} },
+            },
           },
-        },
-      ],
-      tool_choice: "auto",
-      parallel_tool_calls: false,
-      stream: false,
+        ],
+        tool_choice: "auto",
+        parallel_tool_calls: false,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   const tools = lastUpstreamPayload?.tools as
@@ -694,23 +737,28 @@ test("preserves tool controls when a chat fallback request has tools", async () 
 })
 
 test("normalizes deprecated Chat controls before Responses fallback translation", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Call the legacy lookup." }],
-      functions: [
-        {
-          name: "legacy_lookup",
-          description: "Legacy lookup",
-          parameters: {},
-        },
-      ],
-      function_call: { name: "legacy_lookup" },
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Call the legacy lookup." }],
+        functions: [
+          {
+            name: "legacy_lookup",
+            description: "Legacy lookup",
+            parameters: {},
+          },
+        ],
+        function_call: { name: "legacy_lookup" },
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -733,17 +781,22 @@ test("normalizes deprecated Chat controls before Responses fallback translation"
 })
 
 test("omits unsupported sampling parameters for responses-only fallback models", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Return JSON." }],
-      temperature: 0.3,
-      top_p: 0.8,
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Return JSON." }],
+        temperature: 0.3,
+        top_p: 0.8,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -752,24 +805,29 @@ test("omits unsupported sampling parameters for responses-only fallback models",
 })
 
 test("omits unsupported temperature for gpt-5.4-mini chat fallback", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.4-mini",
-      messages: [
-        {
-          role: "user",
-          content:
-            'Rewrite this memory recall query into up to 3 concise search queries. Return JSON only: {"queries":[...]}.',
-        },
-      ],
-      temperature: 0,
-      max_tokens: 512,
-      response_format: { type: "json_object" },
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4-mini",
+        messages: [
+          {
+            role: "user",
+            content:
+              'Rewrite this memory recall query into up to 3 concise search queries. Return JSON only: {"queries":[...]}.',
+          },
+        ],
+        temperature: 0,
+        max_tokens: 512,
+        response_format: { type: "json_object" },
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -783,31 +841,36 @@ test("omits unsupported temperature for gpt-5.4-mini chat fallback", async () =>
 })
 
 test("routes chat json_schema as json_object with schema instruction for responses fallback", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [
-        { role: "system", content: "Return only JSON." },
-        { role: "user", content: "Classify this." },
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "RouteDecision",
-          schema: {
-            type: "object",
-            properties: {
-              intent: { type: "string" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [
+          { role: "system", content: "Return only JSON." },
+          { role: "user", content: "Classify this." },
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "RouteDecision",
+            schema: {
+              type: "object",
+              properties: {
+                intent: { type: "string" },
+              },
+              required: ["intent"],
             },
-            required: ["intent"],
           },
         },
-      },
-      stream: false,
+        stream: false,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -838,15 +901,20 @@ test("uses Responses output message text when output_text is empty", async () =>
   Object.assign(responsesResult, emptyOutputTextResponsesResult)
 
   try {
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        messages: [{ role: "user", content: "Return JSON." }],
-        stream: false,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          messages: [{ role: "user", content: "Return JSON." }],
+          stream: false,
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     const body = (await response.json()) as {
@@ -859,15 +927,20 @@ test("uses Responses output message text when output_text is empty", async () =>
 })
 
 test("streams responses-only models back as chat completion chunks", async () => {
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Say hello." }],
-      stream: true,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Say hello." }],
+        stream: true,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/responses")
@@ -921,15 +994,20 @@ test.each(["error", "failed"] as const)(
     const marker = `chat-responses-${kind}-private-marker`
     nextResponsesStreamError = { kind, marker }
 
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        messages: [{ role: "user", content: "Fail safely." }],
-        stream: true,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          messages: [{ role: "user", content: "Fail safely." }],
+          stream: true,
+        }),
       }),
-    })
+    )
     const body = await response.text()
 
     expect(body).toContain(marker)
@@ -1069,15 +1147,20 @@ test.each(["http-text", "http-binary"] as const)(
 )
 
 async function postStreamingResponsesChat(): Promise<Response> {
-  return await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Say hello." }],
-      stream: true,
+  return await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Say hello." }],
+        stream: true,
+      }),
     }),
-  })
+  )
 }
 
 function chatDataFrames(body: string): Array<Record<string, unknown>> {
@@ -1153,33 +1236,38 @@ interface SseReader {
 test("commits a keepalive while the buffered web-search fallback is pending", async () => {
   setSsePreflushDeadlineForTest(20)
   delayBufferedWebSearchResponse = true
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      messages: [{ role: "user", content: "Search current news." }],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "web_search",
-            parameters: {
-              type: "object",
-              properties: {
-                blocked_domains: {
-                  type: "array",
-                  items: { type: "string" },
-                  default: ["example.com"],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "Search current news." }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "web_search",
+              parameters: {
+                type: "object",
+                properties: {
+                  blocked_domains: {
+                    type: "array",
+                    items: { type: "string" },
+                    default: ["example.com"],
+                  },
                 },
               },
             },
           },
-        },
-      ],
-      stream: true,
+        ],
+        stream: true,
+      }),
     }),
-  })
+  )
   const body = response.body
   if (!body) throw new Error("Expected an SSE response body")
   const reader = body.getReader()

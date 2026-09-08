@@ -140,7 +140,8 @@ export function rowsAffected(value: unknown): number {
 export function scopedSession(driver: SqlSession, readOnly: boolean) {
   let active = true
   let revoked = false
-  const pending: Array<Promise<unknown>> = []
+  const pending = new Set<Promise<unknown>>()
+  let firstFailure: { error: unknown } | undefined
   const queue = new SerialQueue()
   function run<T>(
     statement: SqlStatement,
@@ -169,9 +170,18 @@ export function scopedSession(driver: SqlSession, readOnly: boolean) {
         throw error
       }
     })
-    pending.push(result)
-    // Track a rejected unawaited call until finish without an unhandled rejection.
-    void result.catch(() => {})
+    pending.add(result)
+    // Retain only unsettled work; a long read snapshot must not retain every
+    // result row through settled promises. Preserve the first unawaited error.
+    void result.then(
+      () => {
+        pending.delete(result)
+      },
+      (error: unknown) => {
+        firstFailure ??= { error }
+        pending.delete(result)
+      },
+    )
     return result
   }
   return {
@@ -183,10 +193,8 @@ export function scopedSession(driver: SqlSession, readOnly: boolean) {
     } satisfies SqlSession,
     async finish() {
       active = false
-      const outcomes = await Promise.allSettled(pending)
-      for (const outcome of outcomes) {
-        if (outcome.status === "rejected") throw outcome.reason
-      }
+      await Promise.allSettled(pending)
+      if (firstFailure) throw firstFailure.error
     },
     revoke() {
       active = false

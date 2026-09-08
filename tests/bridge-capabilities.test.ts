@@ -27,6 +27,10 @@ import {
   listEnvironments,
 } from "../src/routes/environments/environment-store"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
 
 const GATEWAY_KEY = "bridge-test-gateway-key-with-enough-entropy"
 const originalPublicBase = process.env.COPILOT_PUBLIC_BASE_URL
@@ -39,13 +43,16 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }
 
-beforeEach(() => {
+useProtocolDatabase()
+
+beforeEach(async () => {
   setIpAllowlistForTest([])
   state.apiKeyAuth = GATEWAY_KEY
+  await seedProtocolDatabase()
   resetIpSecurityForTest()
   setOAuthStoreForTest(new OAuthStore())
   resetBridgeCapabilitiesForTest()
-  trustedJwtDigestStore.replaceForTest([])
+  trustedJwtDigestStore.resetAfterTest()
   delete process.env.COPILOT_PUBLIC_BASE_URL
 })
 
@@ -364,11 +371,11 @@ test("managed JWT rows reserve issued bridge capabilities until deleted", async 
     await authorizeEnvironmentCapability(environmentRequest, environmentId),
   ).toBe(true)
 
-  const workerEntry = trustedJwtDigestStore.add({
+  const workerEntry = await trustedJwtDigestStore.add({
     label: "Worker collision",
     digest: sha256Hex(worker),
   })
-  const environmentEntry = trustedJwtDigestStore.add({
+  const environmentEntry = await trustedJwtDigestStore.add({
     label: "Environment collision",
     digest: sha256Hex(environment),
   })
@@ -396,8 +403,8 @@ test("managed JWT rows reserve issued bridge capabilities until deleted", async 
     ),
   ).toBe(false)
 
-  trustedJwtDigestStore.setEnabled(workerEntry.id, false)
-  trustedJwtDigestStore.setEnabled(environmentEntry.id, false)
+  await trustedJwtDigestStore.setEnabled(workerEntry.id, false)
+  await trustedJwtDigestStore.setEnabled(environmentEntry.id, false)
   expect(
     await authorizeWorkerCapability(workerRequest, workerSessionId),
   ).toBeNull()
@@ -405,8 +412,8 @@ test("managed JWT rows reserve issued bridge capabilities until deleted", async 
     await authorizeEnvironmentCapability(environmentRequest, environmentId),
   ).toBe(false)
 
-  trustedJwtDigestStore.remove(workerEntry.id)
-  trustedJwtDigestStore.remove(environmentEntry.id)
+  await trustedJwtDigestStore.remove(workerEntry.id)
+  await trustedJwtDigestStore.remove(environmentEntry.id)
   expect(
     await authorizeWorkerCapability(workerRequest, workerSessionId),
   ).not.toBeNull()

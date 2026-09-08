@@ -6,7 +6,7 @@
 **Architecture:** A deterministic selector chooses one local bun:sqlite or remote Turso adapter. Shared repositories/migrations own SQL and publish immutable snapshots only after durable commit.
 **Tech Stack:** Bun 1.4.0+, strict TypeScript, @tursodatabase/serverless 1.4.0, existing Zod/Hono and Bun tests.
 **Spec:** ../specs/2026-09-08-database-persistence-design.md
-**Status:** Proposed; execute only after user approves the complete plan set.
+**Status:** Implemented and reviewed. Final evidence and operational limits: [acceptance record](2026-09-08-database-persistence-acceptance.md).
 
 ## Global Constraints
 

@@ -1,12 +1,10 @@
 import { randomUUID } from "node:crypto"
-import fs from "node:fs"
 
-import { PATHS } from "~/lib/paths"
+import { getHistoryRuntime, getTelemetryWriter } from "~/lib/telemetry-writer"
 
 const STORAGE_VERSION = 2
 const MINUTE_MS = 60_000
 const SEVEN_DAY_MS = 7 * 24 * 60 * MINUTE_MS
-const WRITE_DELAY_MS = 250
 
 interface LegacyUsageRecord {
   timestamp: number
@@ -43,10 +41,7 @@ const EMPTY_LIFETIME: LifetimeUsage = {
   firstRequestAt: null,
 }
 
-let cached: UsageData | null = null
-let dirty = false
-let writeInProgress = false
-let writeTimer: ReturnType<typeof setTimeout> | undefined
+let testData: UsageData | undefined
 
 function finiteNonnegative(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ?
@@ -235,79 +230,8 @@ export function parseUsageData(raw: unknown, now = Date.now()): UsageData {
   }
 }
 
-function readFromDisk(): UsageData {
-  try {
-    const raw = fs.readFileSync(PATHS.USAGE_PATH, "utf8")
-    if (!raw.trim()) return emptyUsageData()
-    const parsed = JSON.parse(raw) as unknown
-    const migrated = parseUsageData(parsed)
-    if (
-      typeof parsed !== "object"
-      || parsed === null
-      || !("version" in parsed)
-      || parsed.version !== STORAGE_VERSION
-    ) {
-      dirty = true
-    }
-    return migrated
-  } catch {
-    return emptyUsageData()
-  }
-}
-
-function writeToDisk(data: UsageData): void {
-  const temporaryPath = `${PATHS.USAGE_PATH}.${process.pid}.${randomUUID()}.tmp`
-  fs.mkdirSync(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-  fs.chmodSync(PATHS.APP_DIR, 0o700)
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(data)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    })
-    fs.chmodSync(temporaryPath, 0o600)
-    fs.renameSync(temporaryPath, PATHS.USAGE_PATH)
-    fs.chmodSync(PATHS.USAGE_PATH, 0o600)
-  } catch (error) {
-    fs.rmSync(temporaryPath, { force: true })
-    throw error
-  }
-}
-
-function getData(): UsageData {
-  if (!cached) {
-    cached = readFromDisk()
-    if (dirty) scheduleWrite()
-  }
-  return cached
-}
-
-function scheduleWrite(): void {
-  dirty = true
-  if (writeTimer) return
-  writeTimer = setTimeout(() => {
-    writeTimer = undefined
-    try {
-      flushUsage()
-    } catch (error) {
-      console.error("Failed to persist usage telemetry", error)
-    }
-  }, WRITE_DELAY_MS)
-  writeTimer.unref()
-}
-
-export function flushUsage(): void {
-  if (!dirty || !cached || writeInProgress) return
-  writeInProgress = true
-  const dataToWrite = cached
-  dirty = false
-  try {
-    writeToDisk(dataToWrite)
-  } catch (error) {
-    dirty = true
-    throw error
-  } finally {
-    writeInProgress = false
-  }
+export function flushUsage(): Promise<void> {
+  return getTelemetryWriter()?.flush() ?? Promise.resolve()
 }
 
 export function recordUsage(
@@ -315,37 +239,37 @@ export function recordUsage(
   outputTokens: number,
   model?: string,
 ): void {
-  const input = finiteNonnegative(inputTokens)
-  const output = finiteNonnegative(outputTokens)
-  if (input === null || output === null) return
-
-  const now = Date.now()
-  const data = getData()
-  const timestamp = minuteFor(now)
-  const normalizedModel = normalizeModel(model)
-  const existing = data.buckets.find(
-    (bucket) =>
-      bucket.timestamp === timestamp && bucket.model === normalizedModel,
-  )
-  if (existing) {
-    existing.inputTokens += input
-    existing.outputTokens += output
-    existing.requestCount += 1
-  } else {
-    data.buckets.push({
-      timestamp,
+  try {
+    const input = finiteNonnegative(inputTokens),
+      output = finiteNonnegative(outputTokens)
+    if (input === null || output === null) return
+    const now = Date.now(),
+      normalizedModel = normalizeModel(model)
+    const bucket = {
+      timestamp: minuteFor(now),
       inputTokens: input,
       outputTokens: output,
       requestCount: 1,
       ...(normalizedModel ? { model: normalizedModel } : {}),
+    }
+    if (testData) {
+      testData.buckets.push(bucket)
+      testData.lifetime.inputTokens += input
+      testData.lifetime.outputTokens += output
+      testData.lifetime.requestCount++
+      testData.lifetime.firstRequestAt ??= now
+      return
+    }
+    getTelemetryWriter()?.enqueue({
+      id: randomUUID(),
+      kind: "usage",
+      generation: 0,
+      recordedAt: now,
+      payload: { ...bucket, firstRequestAt: now },
     })
+  } catch {
+    /* Collection cannot interrupt inference. */
   }
-
-  data.lifetime.inputTokens += input
-  data.lifetime.outputTokens += output
-  data.lifetime.requestCount += 1
-  data.lifetime.firstRequestAt ??= now
-  scheduleWrite()
 }
 
 function sumBuckets(buckets: Array<UsageBucket>): {
@@ -361,9 +285,17 @@ function sumBuckets(buckets: Array<UsageBucket>): {
   )
 }
 
-export function getUsageResponse(): Record<string, unknown> {
-  const data = getData()
+export async function getUsageResponse(): Promise<Record<string, unknown>> {
   const now = Date.now()
+  const runtime = testData ? undefined : getHistoryRuntime()
+  const data =
+    testData
+    ?? (await getHistoryRuntime().writer.read((pending) =>
+      getHistoryRuntime().repository.readUsage(
+        minuteFor(now - SEVEN_DAY_MS),
+        pending,
+      ),
+    ))
 
   const fiveHoursAgo = minuteFor(now - 5 * 60 * MINUTE_MS)
   const sevenDaysAgo = minuteFor(now - SEVEN_DAY_MS)
@@ -388,6 +320,14 @@ export function getUsageResponse(): Record<string, unknown> {
       tokens_used: sevenDay.tokens,
       request_count: sevenDay.requests,
     },
+    ...(runtime ?
+      {
+        collection: {
+          ...runtime.writer.status(),
+          ...(await runtime.repository.collectionStatus()),
+        },
+      }
+    : {}),
     lifetime: {
       total_input_tokens: data.lifetime.inputTokens,
       total_output_tokens: data.lifetime.outputTokens,
@@ -401,12 +341,10 @@ export function getUsageResponse(): Record<string, unknown> {
   }
 }
 
+/** Explicit in-memory fixture only; production always uses the selected database. */
 export function resetUsageForTest(): void {
-  if (writeTimer) clearTimeout(writeTimer)
-  writeTimer = undefined
-  cached = null
-  dirty = false
-  writeInProgress = false
+  testData = emptyUsageData()
 }
-
-process.once("beforeExit", flushUsage)
+export function enableDatabaseUsageForTest(): void {
+  testData = undefined
+}

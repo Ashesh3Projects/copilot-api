@@ -60,6 +60,8 @@ import {
   resolveRoutingAffinityFromHeaders,
 } from "~/lib/routing-affinity"
 import { state } from "~/lib/state"
+import { withRequestSnapshot } from "~/lib/storage/request-snapshot"
+import { admitWebSocketTurn } from "~/lib/storage/websocket-admission"
 import { isResponsesCompactionRequest } from "~/services/copilot/compaction-payload"
 import {
   createChatCompletions,
@@ -132,6 +134,7 @@ import {
 const WS_PATHS = new Set(["/v1/responses", "/responses"])
 
 export interface ResponsesWebSocketData {
+  authenticationRequest?: Request
   activeTurns: Map<number, ResponsesWebSocketTurn>
   closed: boolean
   nextTurnSequence: number
@@ -221,6 +224,7 @@ export async function tryUpgradeResponsesWebSocket(
   })
 
   const data: ResponsesWebSocketData = {
+    authenticationRequest: new Request(req.url, { headers: req.headers }),
     type: "responses",
     activeTurns: new Map<number, ResponsesWebSocketTurn>(),
     closed: false,
@@ -247,151 +251,192 @@ export const responsesWebSocket = {
 
   // The dispatcher is intentionally linear so every preflight/stream branch
   // shares one turn owner and one terminal guard.
-  // eslint-disable-next-line complexity, max-lines-per-function
+
   async message(
     ws: ResponsesWebSocketState,
     message: string | Buffer | Uint8Array,
   ) {
-    if (ws.data.closed) return
-
-    const parsed = parseResponsesWebSocketFrame(message)
-    if (!parsed.ok) {
-      sendWebSocketError(ws, parsed.error)
+    if (ws.data.authenticationRequest) {
+      const admission = await admitWebSocketTurn(ws.data.authenticationRequest)
+      if (admission.status !== "authorized") {
+        sendWebSocketError(ws, {
+          code:
+            admission.status === "unauthorized" ?
+              "authentication_error"
+            : "storage_unavailable",
+          message:
+            admission.status === "unauthorized" ?
+              "Authentication failed"
+            : "Database storage is temporarily unavailable.",
+          status: admission.status === "unauthorized" ? 401 : 503,
+        })
+        return
+      }
+      await withRequestSnapshot(admission.snapshot, () =>
+        handleResponsesWebSocketMessage(ws, message),
+      )
       return
     }
-    if (typeof message !== "string") return
-
-    const {
-      attribution,
-      initiator,
-      nativeMessagesOptions,
-      payload: parsedPayload,
-      requestHeaders,
-      requestedModel,
-    } = parsed.value
-    parsedPayload.stream = true
-    ws.data.effectiveNativeMessagesOptions =
-      mergeEffectiveNativeMessagesOptions(
-        ws.data.effectiveNativeMessagesOptions,
-        nativeMessagesOptions,
-      )
-    const turnNativeMessagesOptions = {
-      ...ws.data.effectiveNativeMessagesOptions,
-    }
-    const turn = createResponsesWebSocketTurn(ws.data, message)
-    turn.requestedModel = requestedModel
-    turn.model = requestedModel
-    ensureResponsesWebSocketLifecycle(turn, {
-      model: requestedModel ?? "unknown",
-      requestedModel,
-    })
-
-    try {
-      const { affinity, payload } = await prepareResponseCreate(
-        ws.data,
-        parsedPayload,
-      )
-      await runWithWebSocketRequestContext(
-        affinity,
-        attribution,
-        turn,
-        async () => {
-          await runWithModelFallback(
-            {
-              headers: mergeFallbackIdentityHeaders(
-                ws.data.fallbackHeaders,
-                requestHeaders,
-              ),
-              credentialScope: ws.data.fallbackCredentialScope,
-              payload,
-              signal: turn.abortController.signal,
-              canRetry: () =>
-                !turn.outputStarted && turn.terminal.state === "open",
-            },
-            async () => {
-              await handleResponseCreate(ws, {
-                initiator,
-                payload: structuredClone(payload),
-                requestedModel,
-                nativeMessagesOptions: turnNativeMessagesOptions,
-                turn,
-              })
-            },
-          )
-        },
-      )
-      if (turn.terminal.state === "open") {
-        await failWebSocketTurn(ws, turn, { kind: "source_ended" })
-      }
-    } catch (error) {
-      const terminal = await classifyWebSocketTerminal(error, turn)
-      const errorInspection = terminal.errorInspection
-      if (
-        terminal.terminalStatus !== "ABORTED"
-        && turn.outputStarted
-        && turn.terminal.state === "open"
-      ) {
-        await failWebSocketTurn(ws, turn, {
-          kind: "thrown",
-          error,
-          ...(errorInspection ? { inspection: errorInspection } : {}),
-        })
-        if (errorInspection?.kind === "upstream") {
-          reportHttpErrorForTransport(errorInspection, {
-            method: "POST",
-            path: "/responses",
-          })
-        }
-        return
-      }
-      const normalized = normalizeWebSocketError(error, errorInspection)
-      const committed = await turn.terminal.fail({
-        kind: "thrown",
-        error,
-        ...(errorInspection ? { inspection: errorInspection } : {}),
-      })
-      if (terminal.terminalStatus === "ABORTED") {
-        consola.debug(`[responses-ws] ${turn.turnId} aborted`)
-        return
-      }
-      if (!committed) return
-      if (errorInspection?.kind === "upstream") {
-        reportHttpErrorForTransport(errorInspection, {
-          method: "POST",
-          path: "/responses",
-        })
-      }
-      consola.error(`[responses-ws] ${turn.turnId} error`, {
-        code: normalized.code,
-        status: terminal.status,
-      })
-      try {
-        sendWebSocketError(ws, normalized)
-      } catch {
-        // Client already disconnected, nothing to do
-      }
-    }
+    // Explicit test sockets may inject routing without a network upgrade.
+    await handleResponsesWebSocketMessage(ws, message)
   },
 
   close(ws: { data: ResponsesWebSocketData }) {
-    ws.data.closed = true
-    for (const turn of ws.data.activeTurns.values()) {
-      const abortError = new Error("Responses WebSocket closed")
-      abortError.name = "AbortError"
-      turn.abortController.abort(abortError)
-      if (!turn.terminal.abort()) continue
-      ensureResponsesWebSocketLifecycle(turn)
-      finalizeResponsesWebSocketTurn(ws.data, turn, {
-        error: abortError,
-        status: 499,
-        terminalStatus: "ABORTED",
+    closeResponsesWebSocket(ws)
+  },
+}
+
+async function handleResponsesWebSocketMessage(
+  ws: ResponsesWebSocketState,
+  message: string | Buffer | Uint8Array,
+) {
+  if (ws.data.closed) return
+
+  const parsed = parseResponsesWebSocketFrame(message)
+  if (!parsed.ok) {
+    sendWebSocketError(ws, parsed.error)
+    return
+  }
+  if (typeof message !== "string") return
+
+  const {
+    attribution,
+    initiator,
+    nativeMessagesOptions,
+    payload: parsedPayload,
+    requestHeaders,
+    requestedModel,
+  } = parsed.value
+  parsedPayload.stream = true
+  ws.data.effectiveNativeMessagesOptions = mergeEffectiveNativeMessagesOptions(
+    ws.data.effectiveNativeMessagesOptions,
+    nativeMessagesOptions,
+  )
+  const turnNativeMessagesOptions = {
+    ...ws.data.effectiveNativeMessagesOptions,
+  }
+  const turn = createResponsesWebSocketTurn(ws.data, message)
+  turn.requestedModel = requestedModel
+  turn.model = requestedModel
+  ensureResponsesWebSocketLifecycle(turn, {
+    model: requestedModel ?? "unknown",
+    requestedModel,
+  })
+
+  try {
+    const { affinity, payload } = await prepareResponseCreate(
+      ws.data,
+      parsedPayload,
+    )
+    await runWithWebSocketRequestContext(
+      affinity,
+      attribution,
+      turn,
+      async () => {
+        await runWithModelFallback(
+          {
+            headers: mergeFallbackIdentityHeaders(
+              ws.data.fallbackHeaders,
+              requestHeaders,
+            ),
+            credentialScope: ws.data.fallbackCredentialScope,
+            payload,
+            signal: turn.abortController.signal,
+            canRetry: () =>
+              !turn.outputStarted && turn.terminal.state === "open",
+          },
+          async () => {
+            await handleResponseCreate(ws, {
+              initiator,
+              payload: structuredClone(payload),
+              requestedModel,
+              nativeMessagesOptions: turnNativeMessagesOptions,
+              turn,
+            })
+          },
+        )
+      },
+    )
+    if (turn.terminal.state === "open") {
+      await failWebSocketTurn(ws, turn, { kind: "source_ended" })
+    }
+  } catch (error) {
+    await handleResponsesWebSocketError(ws, turn, error)
+  }
+}
+
+async function handleResponsesWebSocketError(
+  ws: ResponsesWebSocketState,
+  turn: ResponsesWebSocketTurn,
+  error: unknown,
+) {
+  const terminal = await classifyWebSocketTerminal(error, turn)
+  const errorInspection = terminal.errorInspection
+  if (
+    terminal.terminalStatus !== "ABORTED"
+    && turn.outputStarted
+    && turn.terminal.state === "open"
+  ) {
+    await failWebSocketTurn(ws, turn, {
+      kind: "thrown",
+      error,
+      ...(errorInspection ? { inspection: errorInspection } : {}),
+    })
+    if (errorInspection?.kind === "upstream") {
+      reportHttpErrorForTransport(errorInspection, {
+        method: "POST",
+        path: "/responses",
       })
     }
-    ws.data.responseSnapshots.clear()
-    ws.data.effectiveNativeMessagesOptions = {}
-    ws.data.fallbackHeaders = undefined
-    consola.debug("[responses-ws] WebSocket closed")
-  },
+    return
+  }
+  const normalized = normalizeWebSocketError(error, errorInspection)
+  const committed = await turn.terminal.fail({
+    kind: "thrown",
+    error,
+    ...(errorInspection ? { inspection: errorInspection } : {}),
+  })
+  if (terminal.terminalStatus === "ABORTED") {
+    consola.debug(`[responses-ws] ${turn.turnId} aborted`)
+    return
+  }
+  if (!committed) return
+  if (errorInspection?.kind === "upstream") {
+    reportHttpErrorForTransport(errorInspection, {
+      method: "POST",
+      path: "/responses",
+    })
+  }
+  consola.error(`[responses-ws] ${turn.turnId} error`, {
+    code: normalized.code,
+    status: terminal.status,
+  })
+  try {
+    sendWebSocketError(ws, normalized)
+  } catch {
+    // Client already disconnected, nothing to do
+  }
+}
+
+function closeResponsesWebSocket(ws: { data: ResponsesWebSocketData }) {
+  ws.data.closed = true
+  for (const turn of ws.data.activeTurns.values()) {
+    const abortError = new Error("Responses WebSocket closed")
+    abortError.name = "AbortError"
+    turn.abortController.abort(abortError)
+    if (!turn.terminal.abort()) continue
+    ensureResponsesWebSocketLifecycle(turn)
+    finalizeResponsesWebSocketTurn(ws.data, turn, {
+      error: abortError,
+      status: 499,
+      terminalStatus: "ABORTED",
+    })
+  }
+  ws.data.responseSnapshots.clear()
+  ws.data.effectiveNativeMessagesOptions = {}
+  ws.data.fallbackHeaders = undefined
+  ws.data.authenticationRequest = undefined
+  consola.debug("[responses-ws] WebSocket closed")
 }
 
 async function prepareResponseCreate(

@@ -21,6 +21,14 @@ import { setSsePreflushDeadlineForTest } from "~/lib/sse-lifecycle"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 let upstreamAborted = false
 let rejectUpstream: ((error: unknown) => void) | undefined
@@ -98,7 +106,9 @@ afterEach(() => {
 
 test("commits synthetic Responses SSE before buffered Messages headers", async () => {
   const responsePromise = Promise.resolve(
-    server.request("/v1/responses", createRequest()),
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", createRequest()),
+    ),
   )
   const outcome = await Promise.race([
     responsePromise.then(() => "response" as const),
@@ -117,7 +127,9 @@ test("commits synthetic Responses SSE before buffered Messages headers", async (
 })
 
 test("cancels buffered Messages and emits no Responses events after detach", async () => {
-  const response = await server.request("/v1/responses", createRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", createRequest()),
+  )
   const reader = requireBody(response).getReader()
   const first = await reader.read()
   expect(new TextDecoder().decode(first.value)).toBe(": keepalive\n\n")
@@ -134,7 +146,9 @@ test("emits an in-band Responses failure for a late upstream rejection", async (
   }
   globalThis.addEventListener("unhandledrejection", onUnhandled)
   try {
-    const response = await server.request("/v1/responses", createRequest())
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", createRequest()),
+    )
     const reader = requireBody(response).getReader()
     const first = await reader.read()
     expect(new TextDecoder().decode(first.value)).toBe(": keepalive\n\n")
@@ -187,7 +201,9 @@ test.each([
       () => "event-id",
     )
     try {
-      const response = await server.request("/v1/responses", createRequest())
+      const response = await seedProtocolDatabase().then(() =>
+        server.request("/v1/responses", createRequest()),
+      )
       const reader = requireBody(response).getReader()
       await reader.read()
       rejectUpstream?.(
@@ -249,7 +265,9 @@ test("does not emit failure or leak rejection when abort races late failure", as
   }
   globalThis.addEventListener("unhandledrejection", onUnhandled)
   try {
-    const response = await server.request("/v1/responses", createRequest())
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", createRequest()),
+    )
     const reader = requireBody(response).getReader()
     await reader.read()
     await reader.cancel()
@@ -264,7 +282,9 @@ test("does not emit failure or leak rejection when abort races late failure", as
 })
 
 test("completes an in-band Responses stream for a late unknown Messages block", async () => {
-  const response = await server.request("/v1/responses", createRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", createRequest()),
+  )
   const reader = requireBody(response).getReader()
   const first = await reader.read()
   expect(new TextDecoder().decode(first.value)).toBe(": keepalive\n\n")
@@ -292,7 +312,10 @@ test("completes an in-band Responses stream for a late unknown Messages block", 
 function createRequest(): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify({
       model: "route-model",
       input: "hello",

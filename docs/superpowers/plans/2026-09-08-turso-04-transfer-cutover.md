@@ -7,7 +7,7 @@
 **Tech Stack:** Bun/TypeScript, Turso repositories, existing fflate, node:crypto streaming AES-256-GCM/scrypt, Hono, Docker/Compose, Bun tests.
 **Spec:** ../specs/2026-09-08-database-persistence-design.md
 **Prerequisite:** Plans 1-3 integrated and reviewed.
-**Status:** Proposed; implementation, remote writes and cutover follow user approval of the complete plan set.
+**Status:** Implemented and reviewed. Final evidence and operational limits: [acceptance record](2026-09-08-database-persistence-acceptance.md).
 
 ## Global Constraints
 

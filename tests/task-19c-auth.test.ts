@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterEach, beforeEach, expect, test } from "bun:test"
 
 import {
@@ -7,13 +9,19 @@ import {
 import { resetIpSecurityForTest } from "../src/lib/ip-blocker"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalGateway = state.apiKeyAuth
 const originalFetch = globalThis.fetch
 
 let capturedHeaders: Headers | undefined
 
-beforeEach(() => {
+beforeEach(async () => {
   state.apiKeyAuth = "gateway-19c-private-marker"
   resetIpSecurityForTest()
   capturedHeaders = undefined
@@ -21,6 +29,7 @@ beforeEach(() => {
     capturedHeaders = new Headers(init?.headers)
     return Promise.resolve(new Response("ok", { status: 202 }))
   }) as typeof fetch
+  await seedProtocolDatabase({ gatewayKeys: ["gateway-19c-private-marker"] })
 })
 
 afterEach(() => {
@@ -37,11 +46,13 @@ function transparentHeaders(extra: Record<string, string> = {}) {
   }
 }
 
-test("dedicated gateway credentials are gateway-only", () => {
-  expect(resolveGatewayCredential("gateway-19c-private-marker")).toMatchObject({
+test("dedicated gateway credentials are gateway-only", async () => {
+  expect(
+    await resolveGatewayCredential("gateway-19c-private-marker"),
+  ).toMatchObject({
     kind: "gateway",
   })
-  expect(resolveGatewayCredential(" wrong ")).toBeNull()
+  expect(await resolveGatewayCredential(" wrong ")).toBeNull()
   expect(
     extractRequestCredential(
       new Request("http://localhost/v1/messages", {

@@ -51,7 +51,6 @@ test("application source contains no local traffic or resource limits", () => {
     "closeOnBackpressureLimit",
     "AbortSignal.timeout",
     "hono/body-limit",
-    "timeoutMs",
     "COPILOT_VOICE_BUDGET_BYTES_PER_HOUR",
     "REPLACEMENT_LIMITS",
     "LLM_DEBUG_LOG_RETENTION_MS",
@@ -60,6 +59,21 @@ test("application source contains no local traffic or resource limits", () => {
   ]) {
     expect(source).not.toContain(forbidden)
   }
+
+  // Database snapshot and shutdown deadlines bound infrastructure lifetime, not inference traffic.
+  const inferenceTimeoutSource = readFiles(
+    path.join(root, "src"),
+    new Set([".ts", ".tsx"]),
+    new Set([
+      path.join("src", "lib", "attachments.ts"),
+      path.join("src", "lib", "shutdown.ts"),
+      path.join("src", "lib", "storage", "local-sqlite.ts"),
+      path.join("src", "lib", "storage", "turso.ts"),
+      path.join("src", "lib", "storage", "types.ts"),
+      path.join("src", "lib", "storage", "transfer-records.ts"),
+    ]),
+  )
+  expect(inferenceTimeoutSource).not.toContain("timeoutMs")
 
   expect(source).not.toMatch(
     /\b(?:RESPONSES_WS|VOICE|REMOTE|DIRECT_CONNECT|CODE_SESSION|SESSION_COMPAT|SESSION_EVENT_HISTORY)_MAX_/,

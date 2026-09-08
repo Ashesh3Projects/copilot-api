@@ -59,13 +59,13 @@ async function requestDashboardJson(
 
 beforeEach(async () => {
   adminSession = await createTestAdminSession()
-  removeFeatureFlag(TEST_CLAUDE_FLAG)
+  await removeFeatureFlag(TEST_CLAUDE_FLAG)
   statsigOverrideStore.replaceForTest(createEmptyOverrides())
 })
 
-afterAll(() => {
-  resetTestAdminSession()
-  removeFeatureFlag(TEST_CLAUDE_FLAG)
+afterAll(async () => {
+  await removeFeatureFlag(TEST_CLAUDE_FLAG)
+  await resetTestAdminSession()
   statsigOverrideStore.replaceForTest(createEmptyOverrides())
   statsigOverrideStore.resetAfterTest()
 })

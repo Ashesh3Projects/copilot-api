@@ -1,9 +1,12 @@
-import consola from "consola"
-import fs from "node:fs/promises"
-
 import type { ReasoningEffort } from "~/lib/model-suffix"
 
-import { PATHS } from "./paths"
+import {
+  getLoadedSetting,
+  readSetting,
+  updateSetting,
+} from "~/lib/storage/domain-settings"
+import { StorageSchemaError } from "~/lib/storage/errors"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export interface ModelSettings {
   model: string
@@ -71,8 +74,7 @@ const DELETE_BOOLEAN_MODEL_SETTING: Record<
   },
 }
 
-let modelSettings: Record<string, ModelSettings> = {}
-let isLoaded = false
+let testSettings: Record<string, ModelSettings> | undefined
 
 export function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return REASONING_EFFORTS.has(value as ReasoningEffort)
@@ -229,46 +231,92 @@ function hasCustomModelSettings(settings: ModelSettings): boolean {
   )
 }
 
-async function saveModelSettings(): Promise<void> {
-  try {
-    await fs.writeFile(
-      PATHS.MODEL_SETTINGS_CONFIG_PATH,
-      `${JSON.stringify(Object.values(modelSettings), null, 2)}\n`,
-      "utf8",
-    )
-    consola.debug(
-      `Saved ${Object.keys(modelSettings).length} model setting entries`,
-    )
-  } catch (error) {
-    consola.error("Failed to save model settings:", error)
-    throw error
+function validSettingArray(
+  value: unknown,
+  predicate: (entry: unknown) => boolean,
+): boolean {
+  return Array.isArray(value) && value.every((entry) => predicate(entry))
+}
+
+function validateStoredModelSettingFields(item: Record<string, unknown>): void {
+  const fields: Record<string, (value: unknown) => boolean> = {
+    sentryModelName: (value) => typeof value === "string",
+    defaultReasoningEffort: isReasoningEffort,
+    supportedReasoningEfforts: (value) =>
+      validSettingArray(value, isReasoningEffort),
+    unsupportedRequestParameters: (value) =>
+      validSettingArray(value, isModelRequestParameter),
+    implicitReasoningDefault: (value) => typeof value === "boolean",
+    exposeVirtualReasoningModels: (value) => typeof value === "boolean",
+    supportsAssistantPrefill: (value) => typeof value === "boolean",
   }
+  for (const [key, validate] of Object.entries(fields)) {
+    if (Object.hasOwn(item, key) && !validate(item[key]))
+      throw new StorageSchemaError("Invalid model setting field")
+  }
+}
+
+export function validateStoredModelSettings(
+  value: unknown,
+): Record<string, ModelSettings> {
+  if (value === undefined) return {}
+  if (!Array.isArray(value) && !isSettingsRecord(value))
+    throw new StorageSchemaError("Invalid model settings")
+  for (const item of getSettingsItems(value)) {
+    if (
+      !isSettingsRecord(item)
+      || typeof item.model !== "string"
+      || !item.model.trim()
+    )
+      throw new StorageSchemaError("Invalid model setting entry")
+    validateStoredModelSettingFields(item)
+  }
+  return normalizeSettings(value)
+}
+
+function currentSettings(): Record<string, ModelSettings> {
+  return structuredClone(
+    testSettings
+      ?? validateStoredModelSettings(getLoadedSetting("model_settings")),
+  )
+}
+
+async function mutateSettings<T>(
+  update: (settings: Record<string, ModelSettings>) => T,
+): Promise<T> {
+  if (testSettings) {
+    const next = structuredClone(testSettings)
+    const result = update(next)
+    testSettings = next
+    return structuredClone(result)
+  }
+  let result: T | undefined
+  await updateSetting("model_settings", (current) => {
+    const next = validateStoredModelSettings(current)
+    result = update(next)
+    return normalizeSettingsJson(Object.values(next))
+  })
+  return structuredClone(result as T)
 }
 
 export async function loadModelSettings(): Promise<void> {
-  try {
-    const data = await fs.readFile(PATHS.MODEL_SETTINGS_CONFIG_PATH)
-    modelSettings = normalizeSettings(JSON.parse(data.toString()) as unknown)
-    isLoaded = true
-    consola.debug(`Loaded ${Object.keys(modelSettings).length} model settings`)
-  } catch {
-    modelSettings = {}
-    isLoaded = true
-  }
+  validateStoredModelSettings(await readSetting("model_settings"))
+  testSettings = undefined
 }
 
 export async function ensureModelSettingsLoaded(): Promise<void> {
-  if (!isLoaded) await loadModelSettings()
+  await Promise.resolve(currentSettings())
 }
 
 export function getModelSettings(model: string): ModelSettings | undefined {
-  return modelSettings[model]
+  return currentSettings()[model]
 }
 
 export async function getAllModelSettings(): Promise<Array<ModelSettings>> {
-  await ensureModelSettingsLoaded()
-  return Object.values(modelSettings).sort((a, b) =>
-    a.model.localeCompare(b.model),
+  return await Promise.resolve(
+    Object.values(currentSettings()).sort((a, b) =>
+      a.model.localeCompare(b.model),
+    ),
   )
 }
 
@@ -276,92 +324,85 @@ export async function setModelSettings(
   model: string,
   updates: ModelSettingsUpdate,
 ): Promise<ModelSettings> {
-  await ensureModelSettingsLoaded()
-
-  const trimmedModel = model.trim()
-  const current: ModelSettings = modelSettings[trimmedModel] ?? {
-    model: trimmedModel,
-  }
-  const next: ModelSettings = { ...current }
-
-  if (updates.sentryModelName !== undefined) {
-    const sentryModelName = updates.sentryModelName?.trim()
-    if (sentryModelName) {
-      next.sentryModelName = sentryModelName
-    } else {
-      delete next.sentryModelName
+  return mutateSettings((modelSettings) => {
+    const trimmedModel = model.trim()
+    const current: ModelSettings = modelSettings[trimmedModel] ?? {
+      model: trimmedModel,
     }
-  }
+    const next: ModelSettings = { ...current }
 
-  if (updates.supportedReasoningEfforts !== undefined) {
-    const supportedReasoningEfforts = normalizeSupportedReasoningEfforts(
-      updates.supportedReasoningEfforts,
-    )
-    if (supportedReasoningEfforts && supportedReasoningEfforts.length > 0) {
-      next.supportedReasoningEfforts = supportedReasoningEfforts
-    } else {
-      delete next.supportedReasoningEfforts
+    if (updates.sentryModelName !== undefined) {
+      const sentryModelName = updates.sentryModelName?.trim()
+      if (sentryModelName) {
+        next.sentryModelName = sentryModelName
+      } else {
+        delete next.sentryModelName
+      }
     }
-  }
 
-  if (updates.defaultReasoningEffort !== undefined) {
-    const defaultReasoningEffort = normalizeReasoningEffort(
-      updates.defaultReasoningEffort,
-    )
-    if (defaultReasoningEffort) {
-      next.defaultReasoningEffort = defaultReasoningEffort
-    } else {
-      delete next.defaultReasoningEffort
+    if (updates.supportedReasoningEfforts !== undefined) {
+      const supportedReasoningEfforts = normalizeSupportedReasoningEfforts(
+        updates.supportedReasoningEfforts,
+      )
+      if (supportedReasoningEfforts && supportedReasoningEfforts.length > 0) {
+        next.supportedReasoningEfforts = supportedReasoningEfforts
+      } else {
+        delete next.supportedReasoningEfforts
+      }
     }
-  }
 
-  applyBooleanModelSettingUpdate(
-    next,
-    "implicitReasoningDefault",
-    updates.implicitReasoningDefault,
-  )
-  applyBooleanModelSettingUpdate(
-    next,
-    "exposeVirtualReasoningModels",
-    updates.exposeVirtualReasoningModels,
-  )
-  applyBooleanModelSettingUpdate(
-    next,
-    "supportsAssistantPrefill",
-    updates.supportsAssistantPrefill,
-  )
+    if (updates.defaultReasoningEffort !== undefined) {
+      const defaultReasoningEffort = normalizeReasoningEffort(
+        updates.defaultReasoningEffort,
+      )
+      if (defaultReasoningEffort) {
+        next.defaultReasoningEffort = defaultReasoningEffort
+      } else {
+        delete next.defaultReasoningEffort
+      }
+    }
 
-  applyUnsupportedRequestParametersUpdate(
-    next,
-    updates.unsupportedRequestParameters,
-  )
-
-  if (!hasCustomModelSettings(next)) {
-    modelSettings = Object.fromEntries(
-      Object.entries(modelSettings).filter(([key]) => key !== trimmedModel),
+    applyBooleanModelSettingUpdate(
+      next,
+      "implicitReasoningDefault",
+      updates.implicitReasoningDefault,
     )
-    await saveModelSettings()
-    return { model: trimmedModel }
-  }
+    applyBooleanModelSettingUpdate(
+      next,
+      "exposeVirtualReasoningModels",
+      updates.exposeVirtualReasoningModels,
+    )
+    applyBooleanModelSettingUpdate(
+      next,
+      "supportsAssistantPrefill",
+      updates.supportsAssistantPrefill,
+    )
 
-  modelSettings[trimmedModel] = next
-  await saveModelSettings()
-  return { ...next }
+    applyUnsupportedRequestParametersUpdate(
+      next,
+      updates.unsupportedRequestParameters,
+    )
+
+    if (!hasCustomModelSettings(next)) {
+      Reflect.deleteProperty(modelSettings, trimmedModel)
+      return { model: trimmedModel }
+    }
+
+    modelSettings[trimmedModel] = next
+    return { ...next }
+  })
 }
 
 export async function removeModelSettings(model: string): Promise<boolean> {
-  await ensureModelSettingsLoaded()
-  if (!Object.hasOwn(modelSettings, model)) return false
-  modelSettings = Object.fromEntries(
-    Object.entries(modelSettings).filter(([key]) => key !== model),
-  )
-  await saveModelSettings()
-  return true
+  return mutateSettings((modelSettings) => {
+    if (!Object.hasOwn(modelSettings, model)) return false
+    Reflect.deleteProperty(modelSettings, model)
+    return true
+  })
 }
 
 export function setModelSettingsForTest(settings: Array<unknown>): void {
-  modelSettings = normalizeSettings(settings)
-  isLoaded = true
+  testSettings = normalizeSettings(settings)
 }
 
 function applyUnsupportedRequestParametersUpdate(

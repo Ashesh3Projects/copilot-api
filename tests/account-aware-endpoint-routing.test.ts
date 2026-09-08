@@ -1,4 +1,3 @@
-/* eslint-disable max-lines -- endpoint authority and token continuity share singleton route fixtures */
 import {
   afterAll,
   afterEach,
@@ -9,6 +8,7 @@ import {
   test,
 } from "bun:test"
 
+/* eslint-disable max-lines -- endpoint authority and token continuity share singleton route fixtures */
 import type { Account } from "~/lib/token-pool"
 import type { Model } from "~/services/copilot/get-models"
 
@@ -27,12 +27,20 @@ import {
 import { setModelRedirectsForTest } from "~/lib/model-redirect"
 import { setModelSettingsForTest } from "~/lib/model-settings"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "~/lib/routing-telemetry"
 import { state } from "~/lib/state"
 import { tokenPool } from "~/lib/token-pool"
 import { server } from "~/server"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -238,13 +246,13 @@ afterAll(() => {
   state.models = originalModels
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   upstreamRequests.length = 0
   upstreamSessionTokens.length = 0
   queuedFetchResults.length = 0
   onAttachmentFetch = undefined
   fetchMock.mockClear()
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetRoutingTelemetryForTest()
   state.accountType = "individual"
   state.copilotToken = "single-token-fallback"
@@ -307,15 +315,18 @@ test.each([
     if (!affinityKey) throw new TypeError("Expected ordinary B affinity")
     const token = sessionToken({ modelId, subject: "issuer-a" })
 
-    const response = await server.request(path, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": token,
-        "x-client-session-id": affinityKey,
-      },
-      body: JSON.stringify(body(modelId)),
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request(path, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": token,
+          "x-client-session-id": affinityKey,
+        },
+        body: JSON.stringify(body(modelId)),
+      }),
+    )
 
     expect(response.status).toBe(200)
     expect(upstreamSessionTokens).toEqual([{ path: upstreamPath, token }])
@@ -325,11 +336,14 @@ test.each([
         path: upstreamPath,
       },
     ])
-    const debugEntry = getLlmDebugLog(
-      listLlmDebugLogs().entries.find((entry) => entry.path === upstreamPath)
-        ?.id ?? "",
+    const debugEntry = await getLlmDebugLog(
+      (await listLlmDebugLogs()).entries.find(
+        (entry) => entry.path === upstreamPath,
+      )?.id ?? "",
     )
-    expect(debugEntry?.request.headers["Copilot-Session-Token"]).toBe(token)
+    expect(debugEntry?.request.headers["Copilot-Session-Token"]).toBe(
+      "[REDACTED]",
+    )
   },
 )
 
@@ -360,10 +374,15 @@ test("omits a session issued by account A when eligibility moves inference to ac
   const issuedToken = sessionToken({ modelId, subject: "issuer-a" })
   queuedFetchResults.push(Response.json({ session_token: issuedToken }))
 
-  const sessionResponse = await server.request("/models/session", {
-    method: "POST",
-    headers: { "x-client-session-id": affinityKey },
-  })
+  const sessionResponse = await seedProtocolDatabase().then(() =>
+    server.request("/models/session", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "x-client-session-id": affinityKey,
+      },
+    }),
+  )
   expect(sessionResponse.status).toBe(200)
   expect(await sessionResponse.json()).toEqual({
     session_token: issuedToken,
@@ -377,15 +396,18 @@ test("omits a session issued by account A when eligibility moves inference to ac
   tokenPool.rebuildModelIndex()
   upstreamSessionTokens.length = 0
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": issuedToken,
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": issuedToken,
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamRequests.at(-1)).toEqual({
@@ -393,8 +415,10 @@ test("omits a session issued by account A when eligibility moves inference to ac
     path: "/responses",
   })
   expect(upstreamSessionTokens).toEqual([{ path: "/responses", token: null }])
-  for (const entry of listLlmDebugLogs().entries) {
-    expect(JSON.stringify(getLlmDebugLog(entry.id))).not.toContain(issuedToken)
+  for (const entry of (await listLlmDebugLogs()).entries) {
+    expect(JSON.stringify(await getLlmDebugLog(entry.id))).not.toContain(
+      issuedToken,
+    )
   }
 })
 
@@ -428,15 +452,18 @@ test("omits the session token when the issuer becomes unhealthy", async () => {
   expect(accountB.healthy).toBe(true)
   state.models = tokenPool.getAllModels()
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": token,
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": token,
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamSessionTokens).toEqual([{ path: "/responses", token: null }])
@@ -481,15 +508,18 @@ test("preserves issuer selection when adding an account changes the affinity win
   state.models = tokenPool.getAllModels()
   const token = sessionToken({ modelId, subject: "issuer-a" })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": token,
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": token,
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamSessionTokens).toEqual([{ path: "/responses", token }])
@@ -524,14 +554,17 @@ test("preserves issuer selection after a no-affinity account-order change", asyn
   state.models = tokenPool.getAllModels()
   expect(tokenPool.getAccountForModelBySession(modelId)?.id).toBe(52_402)
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": token,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": token,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamSessionTokens).toEqual([{ path: "/responses", token }])
@@ -556,17 +589,20 @@ test("pins an unidentified forwarded session token instead of failing over to an
   const token = sessionToken({ modelId, subject: "issuer-a" })
   queuedFetchResults.push(new Response("forbidden", { status: 403 }))
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": token,
-    },
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": token,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(403)
   expect(upstreamSessionTokens).toEqual([{ path: "/chat/completions", token }])
@@ -604,15 +640,18 @@ test("uses the issuer account for endpoint evaluation and transport", async () =
   if (!affinityKey) throw new TypeError("Expected ordinary B affinity")
   const token = sessionToken({ modelId, subject: "issuer-a" })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": token,
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": token,
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamRequests).toEqual([
@@ -665,19 +704,21 @@ test("keeps a populated account pin authoritative over issuer preference", async
   tokenPool.rebuildModelIndex()
   const pin: RoutedAccountPin = { accountId: 52_402 }
 
-  await routedFetch(
-    "/responses",
-    { method: "POST", body: JSON.stringify({ model: modelId }) },
-    {
-      headerOptions: {
-        copilotSessionToken: sessionToken({
-          modelId,
-          subject: "issuer-a",
-        }),
+  await seedProtocolDatabase().then(() =>
+    routedFetch(
+      "/responses",
+      { method: "POST", body: JSON.stringify({ model: modelId }) },
+      {
+        headerOptions: {
+          copilotSessionToken: sessionToken({
+            modelId,
+            subject: "issuer-a",
+          }),
+        },
+        modelId,
+        routedAccountPin: pin,
       },
-      modelId,
-      routedAccountPin: pin,
-    },
+    ),
   )
 
   expect(upstreamRequests).toEqual([
@@ -711,14 +752,16 @@ test("inherits the selected account into an empty retry pin and fails closed if 
   const retryPin: RoutedAccountPin = {}
 
   await runWithRoutedModelSelection(selection, async () => {
-    await routedFetch(
-      "/responses",
-      { method: "POST", body: JSON.stringify({ model: modelId }) },
-      {
-        headerOptions: { copilotSessionToken: token },
-        modelId,
-        routedAccountPin: retryPin,
-      },
+    await seedProtocolDatabase().then(() =>
+      routedFetch(
+        "/responses",
+        { method: "POST", body: JSON.stringify({ model: modelId }) },
+        {
+          headerOptions: { copilotSessionToken: token },
+          modelId,
+          routedAccountPin: retryPin,
+        },
+      ),
     )
   })
 
@@ -729,15 +772,17 @@ test("inherits the selected account into an empty retry pin and fails closed if 
   })
   tokenPool.markUnhealthy(accountA)
   const beforeRetry = upstreamRequests.length
-  const result = await routedFetch(
-    "/responses",
-    { method: "POST", body: JSON.stringify({ model: modelId }) },
-    {
-      headerOptions: { copilotSessionToken: token },
-      modelId,
-      recordSelection: false,
-      routedAccountPin: retryPin,
-    },
+  const result = await seedProtocolDatabase().then(() =>
+    routedFetch(
+      "/responses",
+      { method: "POST", body: JSON.stringify({ model: modelId }) },
+      {
+        headerOptions: { copilotSessionToken: token },
+        modelId,
+        recordSelection: false,
+        routedAccountPin: retryPin,
+      },
+    ),
   )
 
   expect(result.response.status).toBe(403)
@@ -761,17 +806,20 @@ test.each([
     tokenPool.rebuildModelIndex()
     state.models = tokenPool.getAllModels()
 
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": sessionToken({
-          modelId,
-          subject: "issuer-a",
-        }),
-      },
-      body: JSON.stringify({ model: modelId, input: "hello" }),
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": sessionToken({
+            modelId,
+            subject: "issuer-a",
+          }),
+        },
+        body: JSON.stringify({ model: modelId, input: "hello" }),
+      }),
+    )
 
     expect(response.status).toBe(200)
     expect(upstreamSessionTokens).toEqual([{ path: "/responses", token: null }])
@@ -795,17 +843,20 @@ test("Chat routes from the affinity-selected account's raw endpoint catalog", as
     second: ["/responses"],
   })
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamRequests).toEqual([
@@ -824,14 +875,17 @@ test("Responses routes from the affinity-selected account's raw endpoint catalog
     second: ["/chat/completions"],
   })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({ model: modelId, input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({ model: modelId, input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamRequests).toEqual([
@@ -850,18 +904,21 @@ test("Messages routes from the affinity-selected account's raw endpoint catalog"
     second: ["/responses"],
   })
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({
-      model: modelId,
-      max_tokens: 16,
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(upstreamRequests).toEqual([
@@ -903,14 +960,19 @@ test("unidentified auth rejection preserves the selected endpoint-authoritative 
     return new Response("forbidden", { status: 403 })
   })
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(403)
   expect(upstreamRequests).toEqual([
@@ -933,14 +995,19 @@ test("does not reinitialize or resend after a public OAuth 401", async () => {
   state.models = tokenPool.getAllModels()
   queuedFetchResults.push(new Response("unauthorized", { status: 401 }))
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(401)
   expect(upstreamRequests.map((request) => request.path)).toEqual([
@@ -979,14 +1046,16 @@ test.each(["/chat/completions", "/responses", "/v1/messages"] as const)(
     let thrown: unknown
     try {
       await runWithRoutedModelSelection(selection, async () => {
-        await routedFetch(
-          path,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ model: modelId }),
-          },
-          { modelId },
+        await seedProtocolDatabase().then(() =>
+          routedFetch(
+            path,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ model: modelId }),
+            },
+            { modelId },
+          ),
         )
       })
     } catch (error) {
@@ -1023,14 +1092,16 @@ test("rejects dispatch when the selected account model row disappears", async ()
   let thrown: unknown
   try {
     await runWithRoutedModelSelection(selection, async () => {
-      await routedFetch(
-        "/responses",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ model: modelId }),
-        },
-        { modelId },
+      await seedProtocolDatabase().then(() =>
+        routedFetch(
+          "/responses",
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: modelId }),
+          },
+          { modelId },
+        ),
       )
     })
   } catch (error) {
@@ -1072,34 +1143,41 @@ test("revalidates native Messages authority after asynchronous attachment prepar
   let catalogMutated = false
   onAttachmentFetch = () => {
     catalogMutated = true
-    account.modelsData = [createModel(modelId, ["/responses"])]
+    const current = tokenPool
+      .getAllAccounts()
+      .find((candidate) => candidate.id === account.id)
+    if (!current) throw new Error("Expected current routed account")
+    current.modelsData = [createModel(modelId, ["/responses"])]
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": affinityKey,
-    },
-    body: JSON.stringify({
-      model: modelId,
-      max_tokens: 16,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: {
-                type: "url",
-                url: "https://attachment.test/a.png",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": affinityKey,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        max_tokens: 16,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "url",
+                  url: "https://attachment.test/a.png",
+                },
               },
-            },
-          ],
-        },
-      ],
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(catalogMutated).toBe(true)
   expect(response.status).toBe(400)

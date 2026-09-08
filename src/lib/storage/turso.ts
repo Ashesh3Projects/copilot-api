@@ -273,6 +273,37 @@ export class TursoStorage implements Storage {
   read<T>(work: (session: SqlSession) => Promise<T>): Promise<T> {
     return this.operate(work, true)
   }
+
+  async readSnapshot<T>(
+    work: (session: SqlSession) => Promise<T>,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<T> {
+    if (this.closed) throw new StorageUnavailableError()
+    options.signal?.throwIfAborted()
+    const isolated = new TursoStorage(this.config, {
+      queryTimeoutMs: this.queryTimeout,
+      operationTimeoutMs: options.timeoutMs ?? 1_800_000,
+    })
+    try {
+      return await isolated.read(async (session) => {
+        options.signal?.throwIfAborted()
+        let rejectAbort: (() => void) | undefined
+        const abort = new Promise<never>((_resolve, reject) => {
+          rejectAbort = () => reject(new StorageUnavailableError())
+          options.signal?.addEventListener("abort", rejectAbort, { once: true })
+        })
+        try {
+          options.signal?.throwIfAborted()
+          return await Promise.race([work(session), abort])
+        } finally {
+          if (rejectAbort)
+            options.signal?.removeEventListener("abort", rejectAbort)
+        }
+      })
+    } finally {
+      await isolated.close()
+    }
+  }
   transaction<T>(work: (session: SqlSession) => Promise<T>): Promise<T> {
     return this.operate(work, false)
   }

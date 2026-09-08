@@ -1,14 +1,23 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll, afterEach } from "bun:test"
 
 import { apiKeyGuard } from "~/lib/api-key-guard"
 import { setIpAllowlistForTest } from "~/lib/ip-allowlist"
 import { isIpBlocked, resetIpSecurityForTest } from "~/lib/ip-blocker"
-import { state } from "~/lib/state"
 import { server } from "~/server"
 
-import { initializeTestState, request, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  rawRequest as request,
+  registerGatewayCredential,
+  removeGatewayCredential,
+  INTEGRATION_GATEWAY_KEY,
+  TEST_TIMEOUT,
+} from "./setup"
 
-let originalApiKeyAuth: string | undefined
+const MIDDLEWARE_GATEWAY_KEY = "test-secret-key-12345"
 
 interface ProtectedRoute {
   method: "DELETE" | "GET" | "PATCH" | "POST"
@@ -343,14 +352,15 @@ function requestProtectedRoute(
   })
 }
 
+useIntegrationFixture()
+
 beforeAll(async () => {
   await initializeTestState()
-  originalApiKeyAuth = state.apiKeyAuth
+  await registerGatewayCredential(MIDDLEWARE_GATEWAY_KEY)
   setIpAllowlistForTest([])
 }, TEST_TIMEOUT)
 
 afterEach(() => {
-  state.apiKeyAuth = originalApiKeyAuth
   resetIpSecurityForTest()
   setIpAllowlistForTest([])
 })
@@ -382,7 +392,6 @@ describe("Middleware", () => {
     test(
       "request with correct API key succeeds",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
         const res = await request("/v1/models", {
           headers: { "x-api-key": "test-secret-key-12345" },
         })
@@ -394,7 +403,6 @@ describe("Middleware", () => {
     test(
       "request with correct API key via Bearer auth succeeds",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
         const res = await request("/v1/models", {
           headers: { Authorization: "Bearer test-secret-key-12345" },
         })
@@ -406,7 +414,6 @@ describe("Middleware", () => {
     test(
       "request with a wrong API key receives a uniform denial",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
         const res = await request("/v1/models", {
           headers: { Authorization: "Bearer definitely-wrong" },
         })
@@ -425,8 +432,6 @@ describe("Middleware", () => {
     test(
       "records missing and invalid credentials on every protected route",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
-
         for (const [routeIndex, route] of protectedRoutes.entries()) {
           for (const [credentialIndex, credential] of [
             undefined,
@@ -461,7 +466,6 @@ describe("Middleware", () => {
     test(
       "public health requests do not count as authentication failures",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
         const clientIp = "198.51.100.81"
         const headers = { "x-copilot-peer-ip": clientIp }
 
@@ -478,7 +482,6 @@ describe("Middleware", () => {
     test(
       "successful authentication clears prior failures and prevents a later re-ban",
       async () => {
-        state.apiKeyAuth = "test-secret-key-12345"
         const clientIp = "198.51.100.82"
         const peer = { "x-copilot-peer-ip": clientIp }
 
@@ -529,13 +532,19 @@ describe("Middleware", () => {
     )
   })
 
-  describe("Config-based auth", () => {
+  describe("Database credential authority", () => {
     test(
-      "request without any auth when no keys configured succeeds",
+      "request without any auth stays denied when no keys are configured",
       async () => {
-        state.apiKeyAuth = undefined
-        const res = await request("/v1/models")
-        expect(res.status).toBe(200)
+        await removeGatewayCredential(MIDDLEWARE_GATEWAY_KEY)
+        await removeGatewayCredential(INTEGRATION_GATEWAY_KEY)
+        try {
+          const res = await request("/v1/models")
+          expect(res.status).toBe(401)
+        } finally {
+          await registerGatewayCredential(MIDDLEWARE_GATEWAY_KEY)
+          await registerGatewayCredential(INTEGRATION_GATEWAY_KEY)
+        }
       },
       TEST_TIMEOUT,
     )

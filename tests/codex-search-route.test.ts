@@ -1,9 +1,17 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 
 import { state } from "../src/lib/state"
 import { tokenPool } from "../src/lib/token-pool"
 import { server } from "../src/server"
 import { resetWebSearchSessionsForTest } from "../src/services/copilot/mcp-web-search"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalState = {
@@ -55,7 +63,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   mcpRequests.length = 0
   resetWebSearchSessionsForTest()
@@ -63,12 +71,16 @@ beforeEach(() => {
   state.apiKeyAuth = undefined
   state.githubToken = "github-token"
   state.isMultiToken = false
+  await seedProtocolDatabase()
 })
 
 test("serves Codex Desktop standalone web search through Copilot MCP", async () => {
   const response = await server.request("/v1/alpha/search", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       id: "codex-thread-1",
       model: "gpt-5.6-sol",
@@ -125,7 +137,10 @@ test("serves Codex Desktop standalone web search through Copilot MCP", async () 
 test("rejects malformed Codex search requests before calling MCP", async () => {
   const response = await server.request("/v1/alpha/search", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({ model: "gpt-5.6-sol", commands: {} }),
   })
 
@@ -149,10 +164,14 @@ test("selects the Codex model account for standalone multi-token search", async 
   tokenPool.rebuildModelIndex()
   state.githubToken = undefined
   state.isMultiToken = true
+  await seedProtocolDatabase()
 
   const response = await server.request("/v1/alpha/search", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       id: "sticky-codex-session",
       model,

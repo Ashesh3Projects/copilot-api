@@ -7,7 +7,7 @@
 **Tech Stack:** Bun/TypeScript, pinned Turso storage adapter, existing logging/diagnostics, Hono/React dashboard.
 **Spec:** ../specs/2026-09-08-database-persistence-design.md
 **Prerequisite:** Plan 1 schema/storage contracts; Plan 2 authorization for dashboard integration.
-**Status:** Proposed; execute after complete plan approval.
+**Status:** Implemented and reviewed. Final evidence and operational limits: [acceptance record](2026-09-08-database-persistence-acceptance.md).
 
 ## Global Constraints
 

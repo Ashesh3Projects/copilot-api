@@ -18,6 +18,13 @@ import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { setModelSettingsForTest } from "../src/lib/model-settings"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let streamMode:
@@ -260,9 +267,8 @@ test.each([false, true])(
   "closes direct/buffered Responses text before one received failure (buffered=%s)",
   async (buffered) => {
     streamMode = buffered ? "received-buffered" : "received-direct"
-    const response = await server.request(
-      "/v1/messages",
-      createRequest(buffered),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createRequest(buffered)),
     )
     const body = await response.text()
     expect(eventTypes(body)).toEqual([
@@ -280,7 +286,9 @@ test.each([false, true])(
 
 test("mounts unsigned Responses reasoning as one balanced thinking block", async () => {
   streamMode = "unsigned-reasoning"
-  const response = await server.request("/v1/messages", createRequest(false))
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createRequest(false)),
+  )
   const body = await response.text()
 
   expect(eventTypes(body)).toEqual([
@@ -298,7 +306,9 @@ test("mounts unsigned Responses reasoning as one balanced thinking block", async
 
 test("mounts a terminal-first Responses stream with one complete lifecycle", async () => {
   streamMode = "terminal-first"
-  const response = await server.request("/v1/messages", createRequest(false))
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createRequest(false)),
+  )
   const body = await response.text()
 
   expect(eventTypes(body)).toEqual([
@@ -312,7 +322,9 @@ test("mounts a terminal-first Responses stream with one complete lifecycle", asy
 test("skips a malformed Responses delta before one Messages terminal", async () => {
   streamMode = "malformed-recover"
   const body = await (
-    await server.request("/v1/messages", createRequest(false))
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createRequest(false)),
+    )
   ).text()
 
   expect(eventTypes(body).at(-2)).toBe("message_delta")
@@ -324,7 +336,9 @@ test("skips a malformed Responses delta before one Messages terminal", async () 
 test("fails once for malformed Responses terminal JSON", async () => {
   streamMode = "malformed-terminal"
   const body = await (
-    await server.request("/v1/messages", createRequest(false))
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createRequest(false)),
+    )
   ).text()
 
   expect(eventTypes(body).filter((type) => type === "error")).toHaveLength(1)
@@ -353,9 +367,8 @@ test.each([
       () => "event-id",
     )
     try {
-      const response = await server.request(
-        "/v1/messages",
-        createRequest(false),
+      const response = await seedProtocolDatabase().then(() =>
+        server.request("/v1/messages", createRequest(false)),
       )
       const body = await response.text()
       const payload = JSON.parse(
@@ -394,7 +407,10 @@ test.each([
 function createRequest(buffered: boolean): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify({
       model: "responses-model",
       messages: [{ role: "user", content: "hello" }],

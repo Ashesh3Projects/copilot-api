@@ -6,6 +6,13 @@ import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { setModelSettingsForTest } from "../src/lib/model-settings"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let streamMode: "received-error" | "throw" | "usage-error" = "throw"
@@ -94,7 +101,10 @@ const fetchMock = mock((_url: string | URL | Request, init?: RequestInit) => {
 function createMessagesRequest(buffered: boolean): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify({
       model: "gpt-4o",
       messages: [{ role: "user", content: "Search if needed." }],
@@ -132,7 +142,26 @@ beforeEach(() => {
   state.githubToken = "github-token"
   state.isMultiToken = false
   state.manualApprove = false
-  state.models = undefined
+  state.models = {
+    object: "list",
+    data: [
+      {
+        id: "gpt-4o",
+        name: "gpt-4o",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+    ],
+  }
   setModelRedirectsForTest([])
   setModelSettingsForTest([])
 })
@@ -146,9 +175,8 @@ test.each([
   "buffered=%s keeps the first finish reason after %s",
   async (buffered, mode) => {
     streamMode = mode
-    const response = await server.request(
-      "/v1/messages",
-      createMessagesRequest(buffered),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createMessagesRequest(buffered)),
     )
     const body = await response.text()
     expect(
@@ -170,9 +198,8 @@ test.each([false, true])(
   "buffered=%s captures trailing usage after finish",
   async (buffered) => {
     streamMode = "usage-error"
-    const response = await server.request(
-      "/v1/messages",
-      createMessagesRequest(buffered),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createMessagesRequest(buffered)),
     )
     const body = await response.text()
     const payloads = Array.from(

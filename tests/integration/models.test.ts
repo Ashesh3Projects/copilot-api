@@ -1,6 +1,13 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
-import { initializeTestState, request, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  request,
+  TEST_TIMEOUT,
+} from "./setup"
 
 interface ModelEntry {
   id: string
@@ -11,6 +18,8 @@ interface ModelsResponse {
   object: string
   data: Array<ModelEntry>
 }
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

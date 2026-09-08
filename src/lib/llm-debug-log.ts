@@ -1,5 +1,20 @@
 import { randomUUID } from "node:crypto"
 
+import type { JsonValue } from "~/lib/storage/types"
+import type { HistoryRuntime } from "~/lib/telemetry-writer"
+
+import {
+  debugCredentialLiterals,
+  sanitizeDebugCapture,
+  sanitizeDebugHeaders,
+  sanitizeDebugText,
+  sanitizeDebugUrl,
+  reserveDebugCaptureMemory,
+  releaseDebugCaptureMemory,
+  type CapturedBody,
+} from "~/lib/debug-capture"
+import { getHistoryRuntime, peekHistoryRuntime } from "~/lib/telemetry-writer"
+
 import {
   readDescriptorSnapshotValue,
   readNativeDomExceptionField,
@@ -24,18 +39,14 @@ export interface LlmDebugLogError {
   stack?: string
 }
 
-export interface LlmDebugLogRequest {
-  body: string | null
-  bodyBytes: number
+export interface LlmDebugLogRequest extends CapturedBody {
   headers: HeaderRecord
   method: string
   path: string
   url: string
 }
 
-export interface LlmDebugLogResponse {
-  body: string | null
-  bodyBytes: number
+export interface LlmDebugLogResponse extends CapturedBody {
   bodyReadError?: LlmDebugLogError
   headers: HeaderRecord
   status: number
@@ -56,7 +67,9 @@ export interface LlmDebugLogEntry {
   response?: LlmDebugLogResponse
   startedAt: string
   startedAtMs: number
-  status: "pending" | "complete" | "error" | "aborted"
+  replayable: boolean
+  updatedAt: number
+  status: "pending" | "complete" | "error" | "aborted" | "interrupted"
   stream?: boolean
 }
 
@@ -77,6 +90,7 @@ export interface LlmDebugLogSummary {
   responseStatus?: number
   responseStatusText?: string
   startedAt: string
+  replayable: boolean
   status: LlmDebugLogEntry["status"]
   stream?: boolean
 }
@@ -85,6 +99,7 @@ export interface LlmDebugLogListResponse {
   count: number
   entries: Array<LlmDebugLogSummary>
   generatedAt: string
+  cursor: string | null
 }
 
 interface AbortLlmDebugLogOptions {
@@ -98,25 +113,60 @@ interface StartLlmDebugLogInput {
   method: string
   path: string
   requestBody: string | null
+  requestCapture?: CapturedBody
   requestHeaders: HeaderRecord
   requestId?: string
   startedAtMs?: number
   url: string
 }
 
-interface LlmDebugExpiration {
-  deadlineMs: number
-  id: string
+interface LiveCapture {
+  entry: LlmDebugLogEntry
+  controller: AbortController
+  credentials: Array<string>
+  runtime: HistoryRuntime
+  generation: number
+  bytes: number
+}
+const liveCaptures = new Map<string, LiveCapture>()
+const MAX_LIVE_REQUESTS = 2000
+
+function releaseCapture(id: string): void {
+  const capture = liveCaptures.get(id)
+  if (!capture) return
+  releaseDebugCaptureMemory(capture.bytes)
+  capture.controller.abort()
+  capture.credentials.length = 0
+  liveCaptures.delete(id)
 }
 
-let logIndex = new Map<string, LlmDebugLogEntry>()
-let expirationHeap: Array<LlmDebugExpiration> = []
-let pruneTimer: ReturnType<typeof setTimeout> | undefined
-let pruneTimerDeadlineMs: number | undefined
+function pruneLive(now = Date.now()): void {
+  const runtime = peekHistoryRuntime()
+  for (const [id, capture] of liveCaptures) {
+    if (
+      capture.runtime !== runtime
+      || capture.generation !== runtime.generations.debug
+      || capture.entry.startedAtMs + LLM_DEBUG_FAILURE_HISTORY_WINDOW_MS <= now
+    )
+      releaseCapture(id)
+  }
+}
+const livePruneTimer = setInterval(pruneLive, 60_000)
+livePruneTimer.unref()
 
-function byteLength(value: string | null): number {
-  if (value === null) return 0
-  return new TextEncoder().encode(value).byteLength
+/** Capture readers stop on clear, TTL expiry, capacity eviction, or completion. */
+export function getLlmDebugCaptureSignal(id: string): AbortSignal {
+  return liveCaptures.get(id)?.controller.signal ?? AbortSignal.abort()
+}
+
+function queueCapture(capture: LiveCapture): void {
+  capture.runtime.writer.enqueue({
+    id: capture.entry.id,
+    kind: "debug",
+    recordedAt: capture.entry.startedAtMs,
+    generation: capture.generation,
+    payload: capture.entry as unknown as JsonValue,
+  })
 }
 
 function compactWhitespace(value: string): string {
@@ -228,144 +278,6 @@ function buildRequestPreview(body: string | null): string {
 function buildResponsePreview(body: string | null): string | undefined {
   if (!body) return undefined
   return compactWhitespace(body)
-}
-
-function clearPruneTimer(): void {
-  if (pruneTimer !== undefined) clearTimeout(pruneTimer)
-  pruneTimer = undefined
-  pruneTimerDeadlineMs = undefined
-}
-
-function swapExpirations(left: number, right: number): void {
-  const value = expirationHeap[left]
-  expirationHeap[left] = expirationHeap[right]
-  expirationHeap[right] = value
-}
-
-function pushExpiration(expiration: LlmDebugExpiration): void {
-  expirationHeap.push(expiration)
-  let index = expirationHeap.length - 1
-  while (index > 0) {
-    const parentIndex = Math.floor((index - 1) / 2)
-    const parent = expirationHeap[parentIndex]
-    if (parent.deadlineMs <= expiration.deadlineMs) break
-    expirationHeap[index] = parent
-    index = parentIndex
-  }
-  expirationHeap[index] = expiration
-}
-
-function popExpiration(): LlmDebugExpiration | undefined {
-  if (expirationHeap.length === 0) return undefined
-  const first = expirationHeap[0]
-  const last = expirationHeap.pop()
-  if (expirationHeap.length === 0) return first
-
-  expirationHeap[0] = last as LlmDebugExpiration
-  let index = 0
-  while (true) {
-    const leftIndex = index * 2 + 1
-    if (leftIndex >= expirationHeap.length) break
-    const rightIndex = leftIndex + 1
-    let childIndex = leftIndex
-    if (
-      rightIndex < expirationHeap.length
-      && expirationHeap[rightIndex].deadlineMs
-        < expirationHeap[leftIndex].deadlineMs
-    ) {
-      childIndex = rightIndex
-    }
-    if (
-      expirationHeap[index].deadlineMs <= expirationHeap[childIndex].deadlineMs
-    ) {
-      break
-    }
-    swapExpirations(index, childIndex)
-    index = childIndex
-  }
-  return first
-}
-
-function discardStaleExpirations(): void {
-  while (expirationHeap.length > 0) {
-    const expiration = expirationHeap[0]
-    const entry = logIndex.get(expiration.id)
-    if (entry && getExpirationDeadlineMs(entry) === expiration.deadlineMs) {
-      return
-    }
-    popExpiration()
-  }
-}
-
-function schedulePrune(): void {
-  discardStaleExpirations()
-  if (expirationHeap.length === 0) {
-    clearPruneTimer()
-    return
-  }
-  const deadlineMs = expirationHeap[0].deadlineMs
-
-  if (pruneTimerDeadlineMs === deadlineMs) return
-
-  clearPruneTimer()
-  pruneTimerDeadlineMs = deadlineMs
-  const delayMs = Math.max(0, deadlineMs - Date.now())
-  pruneTimer = setTimeout(() => {
-    pruneTimer = undefined
-    pruneTimerDeadlineMs = undefined
-    prune()
-  }, delayMs)
-  pruneTimer.unref()
-}
-
-function getExpirationDeadlineMs(entry: LlmDebugLogEntry): number {
-  const retentionMs =
-    entry.status === "complete" ?
-      LLM_DEBUG_HISTORY_WINDOW_MS
-    : LLM_DEBUG_FAILURE_HISTORY_WINDOW_MS
-  return entry.startedAtMs + retentionMs
-}
-
-function indexExpiration(entry: LlmDebugLogEntry): void {
-  pushExpiration({
-    deadlineMs: getExpirationDeadlineMs(entry),
-    id: entry.id,
-  })
-  schedulePrune()
-}
-
-function prune(nowMs = Date.now()): void {
-  if (pruneTimerDeadlineMs !== undefined && pruneTimerDeadlineMs > nowMs) {
-    return
-  }
-
-  if (pruneTimerDeadlineMs !== undefined) clearPruneTimer()
-  discardStaleExpirations()
-  while (expirationHeap[0]?.deadlineMs <= nowMs) {
-    const expiration = popExpiration()
-    if (!expiration) break
-    const entry = logIndex.get(expiration.id)
-    if (entry && getExpirationDeadlineMs(entry) === expiration.deadlineMs) {
-      logIndex.delete(expiration.id)
-    }
-    discardStaleExpirations()
-  }
-  schedulePrune()
-}
-
-function insertLog(entry: LlmDebugLogEntry): void {
-  logIndex.set(entry.id, entry)
-  indexExpiration(entry)
-}
-
-function getActiveLogs(): Array<LlmDebugLogEntry> {
-  return [...logIndex.values()].sort(
-    (left, right) => left.startedAtMs - right.startedAtMs,
-  )
-}
-
-function cloneEntry(entry: LlmDebugLogEntry): LlmDebugLogEntry {
-  return structuredClone(entry)
 }
 
 const DEBUG_ERROR_DESCRIPTOR_KEYS = new Set([
@@ -506,6 +418,7 @@ function toSummary(entry: LlmDebugLogEntry): LlmDebugLogSummary {
     responseStatus: entry.response?.status,
     responseStatusText: entry.response?.statusText,
     startedAt: entry.startedAt,
+    replayable: entry.replayable,
     status: entry.status,
     stream: entry.stream,
   }
@@ -523,62 +436,151 @@ function findHeader(
   return match?.[1]
 }
 
-function getEntry(id: string): LlmDebugLogEntry | undefined {
-  return logIndex.get(id)
-}
-
 export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
-  const startedAtMs = input.startedAtMs ?? Date.now()
-  prune(startedAtMs)
-
-  const requestBody = input.requestBody
-
   const id = randomUUID()
+  const runtime = peekHistoryRuntime()
+  if (!runtime) return id
+  const startedAtMs = input.startedAtMs ?? Date.now()
+  pruneLive(startedAtMs)
+  const customProvider = input.upstream?.kind === "custom"
+  const credentials = debugCredentialLiterals(
+    input.requestHeaders,
+    input.url,
+    customProvider,
+  )
+  const body = sanitizeDebugCapture({
+    ...input.requestCapture,
+    body: input.requestBody,
+    contentType: findHeader(input.requestHeaders, "content-type"),
+    knownCredentials: credentials,
+  })
   const entry: LlmDebugLogEntry = {
     id,
     ...(input.upstream ? { upstream: { ...input.upstream } } : {}),
-    model: inferModel(requestBody),
+    model: inferModel(body.body),
     request: {
-      body: requestBody,
-      bodyBytes: byteLength(requestBody),
-      headers: { ...input.requestHeaders },
-      method: input.method,
-      path: input.path,
-      url: input.url,
+      ...body,
+      headers: sanitizeDebugHeaders(
+        input.requestHeaders,
+        credentials,
+        customProvider,
+      ),
+      method: sanitizeDebugText(input.method, credentials),
+      path: sanitizeDebugUrl(sanitizeDebugText(input.path, credentials)),
+      url: sanitizeDebugUrl(sanitizeDebugText(input.url, credentials)),
     },
-    requestId: input.requestId,
+    requestId:
+      input.requestId ?
+        sanitizeDebugText(input.requestId, credentials)
+      : undefined,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
+    updatedAt: startedAtMs,
     status: "pending",
-    stream: inferStream(requestBody),
+    replayable: body.body !== null && !body.redacted && !body.omittedReason,
+    stream: inferStream(body.body),
   }
-  insertLog(entry)
-
+  const capture: LiveCapture = {
+    entry,
+    controller: new AbortController(),
+    credentials,
+    runtime,
+    generation: runtime.generations.debug,
+    bytes:
+      Buffer.byteLength(JSON.stringify(entry))
+      + credentials.reduce(
+        (total, value) => total + Buffer.byteLength(value),
+        0,
+      ),
+  }
+  while (liveCaptures.size >= MAX_LIVE_REQUESTS) {
+    const oldest = liveCaptures.keys().next().value
+    if (!oldest) break
+    releaseCapture(oldest)
+  }
+  let reserved = reserveDebugCaptureMemory(capture.bytes)
+  while (!reserved && liveCaptures.size > 0) {
+    const oldest = liveCaptures.keys().next().value
+    if (!oldest) break
+    releaseCapture(oldest)
+    reserved = reserveDebugCaptureMemory(capture.bytes)
+  }
+  if (reserved) {
+    liveCaptures.set(id, capture)
+    queueCapture(capture)
+  } else {
+    capture.credentials.length = 0
+    capture.controller.abort()
+  }
   return id
+}
+
+function sanitizedError(
+  error: unknown,
+  credentials: ReadonlyArray<string>,
+): LlmDebugLogError {
+  const normalized = normalizeError(error)
+  return Object.fromEntries(
+    Object.entries(normalized).map(([key, value]) => [
+      key,
+      typeof value === "string" ? sanitizeDebugText(value, credentials) : value,
+    ]),
+  ) as unknown as LlmDebugLogError
+}
+
+function terminalCapture(
+  id: string,
+  endedAtMs: number,
+): LiveCapture | undefined {
+  pruneLive(endedAtMs)
+  const capture = liveCaptures.get(id)
+  if (!capture) return undefined
+  capture.entry.endedAt = new Date(endedAtMs).toISOString()
+  capture.entry.durationMs = endedAtMs - capture.entry.startedAtMs
+  capture.entry.updatedAt = endedAtMs
+  return capture
+}
+
+function sanitizeResponse(
+  response: Omit<LlmDebugLogResponse, "bodyBytes"> & { bodyBytes?: number },
+  capture: LiveCapture,
+): LlmDebugLogResponse {
+  const credentials = [
+    ...capture.credentials,
+    ...debugCredentialLiterals(response.headers),
+  ]
+  const body = sanitizeDebugCapture({
+    ...response,
+    contentType: findHeader(response.headers, "content-type"),
+    knownCredentials: credentials,
+  })
+  if (body.redacted || body.omittedReason || response.bodyReadError)
+    capture.entry.replayable = false
+  return {
+    ...body,
+    ...(response.bodyReadError ?
+      { bodyReadError: sanitizedError(response.bodyReadError, credentials) }
+    : {}),
+    headers: sanitizeDebugHeaders(response.headers, credentials),
+    status: response.status,
+    statusText: sanitizeDebugText(response.statusText, credentials),
+  }
 }
 
 export function finishLlmDebugLog(
   id: string,
-  response: Omit<LlmDebugLogResponse, "bodyBytes">,
+  response: Omit<LlmDebugLogResponse, "bodyBytes"> & { bodyBytes?: number },
   endedAtMs = Date.now(),
 ): void {
-  prune(endedAtMs)
-  const entry = getEntry(id)
-  if (!entry || entry.status !== "pending") return
-
-  entry.endedAt = new Date(endedAtMs).toISOString()
-  entry.durationMs = endedAtMs - entry.startedAtMs
-  entry.response = {
-    ...response,
-    body: response.body,
-    headers: { ...response.headers },
-    bodyBytes: byteLength(response.body),
-  }
-  entry.status =
+  const capture = terminalCapture(id, endedAtMs)
+  if (!capture) return
+  capture.entry.response = sanitizeResponse(response, capture)
+  capture.entry.status =
     response.bodyReadError || response.status < 200 || response.status >= 300 ?
       "error"
     : "complete"
-  if (entry.status === "complete") indexExpiration(entry)
+  queueCapture(capture)
+  releaseCapture(id)
 }
 
 export function failLlmDebugLog(
@@ -586,57 +588,60 @@ export function failLlmDebugLog(
   error: unknown,
   endedAtMs = Date.now(),
 ): void {
-  prune(endedAtMs)
-  const entry = getEntry(id)
-  if (!entry || entry.status !== "pending") return
-
-  entry.endedAt = new Date(endedAtMs).toISOString()
-  entry.durationMs = endedAtMs - entry.startedAtMs
-  entry.error = normalizeError(error)
-  entry.status = "error"
+  const capture = terminalCapture(id, endedAtMs)
+  if (!capture) return
+  capture.entry.error = sanitizedError(error, capture.credentials)
+  capture.entry.status = "error"
+  queueCapture(capture)
+  releaseCapture(id)
 }
 
 export function abortLlmDebugLog(
   id: string,
   options: AbortLlmDebugLogOptions,
 ): void {
-  const endedAtMs = options.endedAtMs ?? Date.now()
-  prune(endedAtMs)
-  const entry = getEntry(id)
-  if (!entry || entry.status !== "pending") return
-
-  entry.endedAt = new Date(endedAtMs).toISOString()
-  entry.durationMs = endedAtMs - entry.startedAtMs
-  entry.error = normalizeError(options.error)
-  if (options.response) {
-    entry.response = {
-      ...options.response,
-      body: options.response.body,
-      headers: { ...options.response.headers },
-      bodyBytes: byteLength(options.response.body),
-    }
-  }
-  entry.status = "aborted"
+  const capture = terminalCapture(id, options.endedAtMs ?? Date.now())
+  if (!capture) return
+  capture.entry.error = sanitizedError(options.error, capture.credentials)
+  if (options.response)
+    capture.entry.response = sanitizeResponse(options.response, capture)
+  capture.entry.status = "aborted"
+  queueCapture(capture)
+  releaseCapture(id)
 }
 
-export function listLlmDebugLogs(): LlmDebugLogListResponse {
-  prune()
-  const activeLogs = getActiveLogs()
+export async function listLlmDebugLogs(
+  options: { limit?: number; cursor?: string } = {},
+): Promise<LlmDebugLogListResponse> {
+  pruneLive()
+  const runtime = getHistoryRuntime()
+  const page = await runtime.writer.read((pending) =>
+    runtime.repository.list("debug", options, pending),
+  )
+  const entries = page.records.map((record) =>
+    toSummary(record.payload as unknown as LlmDebugLogEntry),
+  )
   return {
-    count: activeLogs.length,
-    entries: activeLogs.map((entry) => toSummary(entry)).reverse(),
+    count: entries.length,
+    entries,
     generatedAt: new Date().toISOString(),
+    cursor: page.cursor,
   }
 }
 
-export function getLlmDebugLog(id: string): LlmDebugLogEntry | undefined {
-  prune()
-  const entry = getEntry(id)
-  return entry ? cloneEntry(entry) : undefined
+export async function getLlmDebugLog(
+  id: string,
+): Promise<LlmDebugLogEntry | undefined> {
+  pruneLive()
+  const runtime = getHistoryRuntime()
+  const record = await runtime.writer.read((pending) =>
+    runtime.repository.get("debug", id, pending),
+  )
+  return record ? (record.payload as unknown as LlmDebugLogEntry) : undefined
 }
 
-export function clearLlmDebugLogs(): void {
-  logIndex = new Map()
-  expirationHeap = []
-  clearPruneTimer()
+export async function clearLlmDebugLogs(): Promise<void> {
+  const runtime = getHistoryRuntime()
+  await runtime.clear("debug")
+  pruneLive()
 }

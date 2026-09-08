@@ -26,6 +26,14 @@ import {
 import { server } from "~/server"
 import { resetWebSearchSessionsForTest } from "~/services/copilot/mcp-web-search"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const upstreamBodies: Array<Record<string, unknown>> = []
 const upstreamHeaders: Array<Headers> = []
@@ -241,7 +249,6 @@ beforeAll(() => {
 })
 
 afterAll(() => {
-  removeTestAccounts()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
@@ -951,7 +958,7 @@ test.each([
   "uses canonical beta membership for $name model routing",
   async ({ beta, expectedHeader, expectedModel }) => {
     state.isMultiToken = true
-    registerAccount(92_001, "beta-account-token")
+    const account = registerAccount(92_001, "beta-account-token")
     tokenPool.rebuildModelIndex()
     state.models = {
       object: "list",
@@ -964,6 +971,8 @@ test.each([
         },
       ],
     } satisfies ModelsResponse
+    account.modelsData = state.models.data
+    account.models = new Set(state.models.data.map((model) => model.id))
 
     const response = await postMessages({}, { "anthropic-beta": beta })
 
@@ -975,7 +984,7 @@ test.each([
 
 test("retains valid beta identifiers before model-variant routing", async () => {
   state.isMultiToken = true
-  registerAccount(92_001, "beta-account-token")
+  const account = registerAccount(92_001, "beta-account-token")
   tokenPool.rebuildModelIndex()
   state.models = {
     object: "list",
@@ -988,6 +997,8 @@ test("retains valid beta identifiers before model-variant routing", async () => 
       },
     ],
   } satisfies ModelsResponse
+  account.modelsData = state.models.data
+  account.models = new Set(state.models.data.map((model) => model.id))
 
   const response = await postMessages(
     {},
@@ -2791,16 +2802,22 @@ function postMessages(
   headers: Record<string, string> = {},
 ): Promise<Response> {
   return Promise.resolve(
-    server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify({
-        model: "route-model",
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hello" }],
-        ...extra,
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify({
+          model: "route-model",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          ...extra,
+        }),
       }),
-    }),
+    ),
   )
 }
 
@@ -2888,12 +2905,13 @@ function installModel(options: { supported_endpoints?: Array<string> }): void {
   } satisfies ModelsResponse
 }
 
-function registerAccount(id: number, copilotToken: string): void {
+function registerAccount(id: number, copilotToken: string) {
   const account = tokenPool.addAccount(`github-${id}`, "individual", id)
   account.copilotToken = copilotToken
   account.models = new Set(["route-model"])
   account.modelsData = [createModel({ supported_endpoints: ["/v1/messages"] })]
   account.healthy = true
+  return account
 }
 
 function removeTestAccounts(): void {

@@ -2,11 +2,11 @@ import consola from "consola"
 import { events } from "fetch-event-stream"
 
 import type {
-  AppConfig,
   CustomProviderConfig,
   CustomProviderModelConfig,
 } from "~/lib/config"
 import type { ReasoningEffort } from "~/lib/model-suffix"
+import type { MutationContext } from "~/lib/storage/types"
 import type {
   ChatCompletionResponse,
   ChatCompletionsPayload,
@@ -16,12 +16,14 @@ import type {
   EmbeddingResponse,
 } from "~/services/copilot/create-embeddings"
 
-import { getConfig, updateConfig } from "~/lib/config"
+import { getConfigForTest } from "~/lib/config"
+import { captureDebugResponseBody } from "~/lib/debug-capture"
 import { CustomProviderHTTPError, LocalHTTPError } from "~/lib/error"
 import {
   abortLlmDebugLog,
   failLlmDebugLog,
   finishLlmDebugLog,
+  getLlmDebugCaptureSignal,
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
@@ -34,6 +36,19 @@ import {
   recordUpstreamCall,
   type UpstreamOutcome,
 } from "~/lib/routing-telemetry"
+import { getSettingsActorId } from "~/lib/storage/domain-settings"
+import { StorageConflictError } from "~/lib/storage/errors"
+import {
+  createProviderMutationContext,
+  createProvidersRepository,
+  type ProviderInput,
+  type ProviderSummary,
+} from "~/lib/storage/providers-repository"
+import {
+  getCurrentSnapshot,
+  getRequestSnapshot,
+} from "~/lib/storage/request-snapshot"
+import { getStorageRuntime } from "~/lib/storage/runtime"
 import { isAbortLikeError } from "~/services/copilot/transport-retry"
 
 export type CustomProviderModelKind = "chat" | "embedding"
@@ -183,7 +198,6 @@ function getRequiredProviderFields(
 
   const normalizedApiKey = normalizeOptionalString(apiKey)
   const normalizedApiKeyEnv = normalizeOptionalString(apiKeyEnv)
-  if (!normalizedApiKey && !normalizedApiKeyEnv) return undefined
 
   const normalized = {
     id: id.trim(),
@@ -242,7 +256,17 @@ export function normalizeCustomProviders(
 }
 
 export function getCustomProviders(): Array<CustomProviderConfig> {
-  return normalizeCustomProviders(getConfig().customProviders)
+  const test = getConfigForTest()
+  if (test) return normalizeCustomProviders(test.customProviders)
+  return (
+    getCurrentSnapshot(getStorageRuntime().snapshot).providers?.providers ?? []
+  )
+}
+
+export function getGroqApiKey(): string | undefined {
+  const test = getConfigForTest()
+  if (test) return test.groqApiKey
+  return getCurrentSnapshot(getStorageRuntime().snapshot).providers?.groqApiKey
 }
 
 export function getCustomProviderModels(): Array<CustomProviderModelListing> {
@@ -360,12 +384,11 @@ function shouldPassReasoningEffort(
 }
 
 function getProviderApiKey(provider: CustomProviderConfig): string {
-  const apiKey = provider.apiKey?.trim() ?? getProviderApiKeyFromEnv(provider)
+  const apiKey = provider.apiKey?.trim()
   if (!apiKey) {
-    const fallback = provider.apiKeyEnv ? ` or set ${provider.apiKeyEnv}` : ""
     const clientBody = {
       error: {
-        message: `Missing API key for custom provider ${provider.name}. Configure apiKey${fallback}.`,
+        message: `Missing API key for custom provider ${provider.name}. Configure its stored API key.`,
         type: "configuration_error",
         provider: provider.id,
       },
@@ -377,12 +400,6 @@ function getProviderApiKey(provider: CustomProviderConfig): string {
     )
   }
   return apiKey
-}
-
-function getProviderApiKeyFromEnv(provider: CustomProviderConfig): string {
-  return provider.apiKeyEnv ?
-      (process.env[provider.apiKeyEnv]?.trim() ?? "")
-    : ""
 }
 
 function buildHeaders(provider: CustomProviderConfig): Record<string, string> {
@@ -458,7 +475,7 @@ async function fetchCustomProvider(
       signal: options?.signal,
     })
     if (path === "/chat/completions") recordModelFallbackResponse(response)
-    void captureCustomProviderDebugResponse(logId, response)
+    void captureCustomProviderDebugResponse(logId, response, options?.signal)
     recordCustomProviderCall({
       outcome: customProviderOutcome(response),
       path,
@@ -483,12 +500,17 @@ async function fetchCustomProvider(
 async function captureCustomProviderDebugResponse(
   logId: string,
   response: Response,
+  signal?: AbortSignal,
 ): Promise<void> {
   const headers = Object.fromEntries(response.headers.entries())
   try {
-    const body = await response.clone().text()
+    const captureSignal = getLlmDebugCaptureSignal(logId)
+    const body = await captureDebugResponseBody(
+      response,
+      signal ? AbortSignal.any([signal, captureSignal]) : captureSignal,
+    )
     finishLlmDebugLog(logId, {
-      body,
+      ...body,
       headers,
       status: response.status,
       statusText: response.statusText,
@@ -496,6 +518,7 @@ async function captureCustomProviderDebugResponse(
   } catch (error) {
     const debugResponse = {
       body: null,
+      omittedReason: "read-error" as const,
       bodyReadError: toLlmDebugLogError(error),
       headers,
       status: response.status,
@@ -714,52 +737,60 @@ function redactProviderRequestPayload(
   return redacted
 }
 
-export interface DashboardCustomProvider
-  extends Omit<CustomProviderConfig, "apiKey" | "headers"> {
-  apiKeyConfigured: boolean
-  headerNames: Array<string>
+export type DashboardCustomProvider = ProviderSummary
+
+export async function listCustomProvidersForDashboard(): Promise<
+  Array<DashboardCustomProvider>
+> {
+  return createProvidersRepository(getStorageRuntime().storage).list()
 }
 
-export function listCustomProvidersForDashboard(): Array<DashboardCustomProvider> {
-  return getCustomProviders().map(({ apiKey, headers, ...provider }) => ({
-    ...provider,
-    apiKeyConfigured: Boolean(apiKey),
-    headerNames: Object.keys(headers ?? {}),
-  }))
+export function listCustomProviderPageForDashboard() {
+  return createProvidersRepository(getStorageRuntime().storage).listPage()
+}
+export async function upsertCustomProvider(
+  provider: ProviderInput,
+  context?: MutationContext,
+): Promise<Array<CustomProviderConfig>> {
+  const runtime = getStorageRuntime()
+  const detached = structuredClone(provider)
+  const mutation =
+    context ?? (await providerMutation("provider.upsert", detached))
+  await createProvidersRepository(runtime.storage).upsert(detached, mutation)
+  await runtime.snapshot.refreshIfChanged()
+  return runtime.snapshot.get().providers?.providers ?? []
 }
 
-export function upsertCustomProvider(
-  provider: CustomProviderConfig,
-): Array<CustomProviderConfig> {
-  const normalized = normalizeProvider(provider)
-  if (!normalized) {
-    throw new Error("Invalid custom provider config")
-  }
-
-  let nextProviders: Array<CustomProviderConfig> = []
-  updateConfig((config: AppConfig) => {
-    const providers = normalizeCustomProviders(config.customProviders)
-    const index = providers.findIndex((item) => item.id === normalized.id)
-    nextProviders =
-      index === -1 ?
-        [...providers, normalized]
-      : providers.map((item) => (item.id === normalized.id ? normalized : item))
-    return { ...config, customProviders: nextProviders }
-  })
-  return nextProviders
+export async function removeCustomProvider(
+  providerId: string,
+  context?: MutationContext,
+): Promise<boolean> {
+  const runtime = getStorageRuntime()
+  const mutation =
+    context ?? (await providerMutation("provider.remove", { id: providerId }))
+  const result = await createProvidersRepository(runtime.storage).remove(
+    providerId,
+    mutation,
+  )
+  await runtime.snapshot.refreshIfChanged()
+  return result.value.removed
 }
 
-export function removeCustomProvider(providerId: string): boolean {
-  let removed = false
-  updateConfig((config: AppConfig) => {
-    const providers = normalizeCustomProviders(config.customProviders)
-    const nextProviders = providers.filter(
-      (provider) => provider.id !== providerId,
-    )
-    removed = nextProviders.length !== providers.length
-    return { ...config, customProviders: nextProviders }
-  })
-  return removed
+async function providerMutation(
+  kind: string,
+  input: unknown,
+): Promise<MutationContext> {
+  const actor =
+    getSettingsActorId()
+    ?? (getRequestSnapshot() ? undefined : "system:startup-cli")
+  if (!actor)
+    throw new StorageConflictError("A verified settings actor is required")
+  return createProviderMutationContext(
+    getStorageRuntime().storage,
+    kind,
+    input,
+    actor,
+  )
 }
 
 export function createNebiusQwen3EmbeddingProvider(
@@ -770,7 +801,7 @@ export function createNebiusQwen3EmbeddingProvider(
     name: "Nebius",
     type: OPENAI_COMPATIBLE_TYPE,
     baseUrl: "https://api.studio.nebius.com/v1",
-    ...(apiKey ? { apiKey } : { apiKeyEnv: "NEBIUS_API_KEY" }),
+    ...(apiKey ? { apiKey } : {}),
     headers: {},
     models: [
       {

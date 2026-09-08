@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 
 import type {
@@ -26,6 +28,9 @@ import {
   executeWebSearch,
   resetWebSearchSessionsForTest,
 } from "../src/services/copilot/mcp-web-search"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 

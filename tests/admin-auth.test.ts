@@ -1,1015 +1,410 @@
-/* eslint-disable max-lines -- admin auth integration coverage intentionally shares process state */
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
-import { createHash } from "node:crypto"
-import fs from "node:fs/promises"
+/* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-confusing-void-expression -- Bun rejects assertions require awaiting despite their typings. */
+import { afterEach, beforeEach, expect, test } from "bun:test"
+import { Hono } from "hono"
 
 import {
   ADMIN_CSRF_COOKIE,
   ADMIN_SESSION_COOKIE,
-  setAdminAuthTestMode,
-  setAdminAuthClockForTest,
+  ADMIN_SESSION_TTL_MS,
+  authenticateAdminRequest,
+  issueAdminSetupCode,
   initializeAdminAuth,
+  loginAdmin,
+  resetAdminPassword,
+  setAdminAuthClockForTest,
   validateAdminPasswordHash,
 } from "../src/lib/admin-auth"
-import { setIpAllowlistForTest } from "../src/lib/ip-allowlist"
-import {
-  isIpBlocked,
-  leaseIp,
-  recordFailedAttempt,
-  resetIpSecurityForTest,
-} from "../src/lib/ip-blocker"
-import { state } from "../src/lib/state"
-import { trustedJwtDigestStore } from "../src/lib/trusted-jwt-digests"
-import { server } from "../src/server"
+import { resolveCredential } from "../src/lib/credential-resolver"
+import { forwardError } from "../src/lib/error"
+import { isIpBlocked, resetIpSecurityForTest } from "../src/lib/ip-blocker"
+import { OAuthStore, createPkceChallenge } from "../src/lib/oauth-store"
+import { credentialDigest } from "../src/lib/storage/credentials-repository"
+import { dashboardAuthRoutes } from "../src/routes/dashboard/auth-route"
+import { createAuthStorageFixture } from "./helpers/auth-storage"
 
 const GATEWAY_KEY = "test-gateway-key-that-is-long-and-random"
-const ADMIN_PASSWORD = "correct horse battery staple"
-const ROTATED_ADMIN_PASSWORD = "rotated administrator password"
+const PASSWORD = "correct horse battery staple"
 const ORIGIN = "https://gateway.example.com"
-const MONTH_MS = 30 * 24 * 60 * 60 * 1000
+let fixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
+let originalHash: string | undefined
+const app = new Hono()
+  .onError((error, c) => forwardError(c, error))
+  .route("/dashboard/auth", dashboardAuthRoutes)
+app.get("/protected", async (c) =>
+  (await authenticateAdminRequest(c.req.raw)) ?
+    c.json({ ok: true })
+  : c.json({ error: "Unauthorized" }, 401),
+)
 
-let originalAdminPasswordHash: string | undefined
-
-interface AdminCookies {
-  cookie: string
-  csrf: string
-}
-
-function readSetCookies(response: Response): Array<string> {
-  return response.headers.getSetCookie()
-}
-
-function cookiesFrom(response: Response): AdminCookies {
-  const values = readSetCookies(response)
-  const session = values
-    .find((value) => value.startsWith(`${ADMIN_SESSION_COOKIE}=`))
-    ?.split(";", 1)[0]
-  const csrfCookie = values
-    .find((value) => value.startsWith(`${ADMIN_CSRF_COOKIE}=`))
-    ?.split(";", 1)[0]
-  expect(session).toBeTruthy()
-  expect(csrfCookie).toBeTruthy()
-  const csrf = csrfCookie?.slice(`${ADMIN_CSRF_COOKIE}=`.length) ?? ""
-  return { cookie: `${session}; ${csrfCookie}`, csrf }
-}
-
-function adminSessionToken(cookies: AdminCookies): string {
-  const prefix = `${ADMIN_SESSION_COOKIE}=`
-  const segment = cookies.cookie
-    .split("; ")
-    .find((value) => value.startsWith(prefix))
-  expect(segment).toBeTruthy()
-  return segment?.slice(prefix.length) ?? ""
-}
-
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex")
-}
-
-async function requestOverview(cookie: string): Promise<Response> {
-  return await server.request("/dashboard/api/overview", {
-    headers: { cookie },
-  })
-}
-
-async function setup(): Promise<AdminCookies> {
-  const response = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(response.status).toBe(201)
-  return cookiesFrom(response)
-}
-
-beforeEach(() => {
-  setIpAllowlistForTest([])
-  originalAdminPasswordHash = process.env.COPILOT_ADMIN_PASSWORD_HASH
-  delete process.env.COPILOT_ADMIN_PASSWORD_HASH
-  setAdminAuthTestMode(true)
-  resetIpSecurityForTest()
-  trustedJwtDigestStore.replaceForTest([])
-  state.apiKeyAuth = GATEWAY_KEY
+beforeEach(async () => {
+  originalHash = process.env.COPILOT_ADMIN_PASSWORD_HASH
   process.env.COPILOT_ADMIN_ORIGIN = ORIGIN
+  resetIpSecurityForTest()
+  fixture = await createAuthStorageFixture()
 })
-
-afterEach(() => {
-  setIpAllowlistForTest([])
-  setAdminAuthTestMode(false)
-  state.apiKeyAuth = undefined
-  delete process.env.COPILOT_ADMIN_ORIGIN
-  if (originalAdminPasswordHash === undefined) {
-    delete process.env.COPILOT_ADMIN_PASSWORD_HASH
-  } else {
-    process.env.COPILOT_ADMIN_PASSWORD_HASH = originalAdminPasswordHash
-  }
+afterEach(async () => {
+  await fixture.close()
   setAdminAuthClockForTest()
   resetIpSecurityForTest()
-  trustedJwtDigestStore.resetAfterTest()
-})
-
-test("first admin setup requires the gateway key and a four-character password", async () => {
-  const wrongKey = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: "wrong", password: ADMIN_PASSWORD }),
-  })
-  expect(wrongKey.status).toBe(401)
-
-  const shortPassword = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "123" }),
-  })
-  expect(shortPassword.status).toBe(401)
-
-  const numericPassword = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "1234" }),
-  })
-  expect(numericPassword.status).toBe(201)
-
-  setAdminAuthTestMode(true)
-  state.apiKeyAuth = GATEWAY_KEY
-
-  const cookies = await setup()
-  const setCookies = readSetCookies(
-    await server.request("/dashboard/auth/login", {
-      method: "POST",
-      headers: { "content-type": "application/json", origin: ORIGIN },
-      body: JSON.stringify({
-        gatewayKey: GATEWAY_KEY,
-        password: ADMIN_PASSWORD,
-      }),
-    }),
-  )
-  expect(
-    setCookies.some((cookie) =>
-      /^__Host-copilot_admin=.*; Max-Age=2592000; Path=\/; HttpOnly; Secure; SameSite=Strict$/.test(
-        cookie,
-      ),
-    ),
-  ).toBe(true)
-  expect(
-    setCookies.some((cookie) =>
-      /^__Host-copilot_admin_csrf=.*; Max-Age=2592000; Path=\/; Secure; SameSite=Strict$/.test(
-        cookie,
-      ),
-    ),
-  ).toBe(true)
-  expect(cookies.cookie).toContain(ADMIN_SESSION_COOKIE)
-})
-
-test("administrator auth mutations require the configured browser Origin", async () => {
-  const missingOrigin = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(missingOrigin.status).toBe(401)
-
-  const wrongOrigin = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      origin: "https://evil.invalid",
-    },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(wrongOrigin.status).toBe(401)
-  expect((await server.request("/dashboard/auth/status")).status).toBe(200)
-})
-
-test("external dashboard origins require explicit configuration", async () => {
   delete process.env.COPILOT_ADMIN_ORIGIN
-
-  const external = await server.request("/dashboard/auth/setup", {
+  if (originalHash === undefined) delete process.env.COPILOT_ADMIN_PASSWORD_HASH
+  else process.env.COPILOT_ADMIN_PASSWORD_HASH = originalHash
+})
+function cookiesFrom(response: Response) {
+  const values = response.headers.getSetCookie()
+  const cookie = values.map((value) => value.split(";", 1)[0]).join("; ")
+  const csrf =
+    values
+      .find((value) => value.startsWith(`${ADMIN_CSRF_COOKIE}=`))
+      ?.split(";", 1)[0]
+      ?.slice(ADMIN_CSRF_COOKIE.length + 1) ?? ""
+  return { cookie, csrf }
+}
+function post(
+  action: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+) {
+  return app.request(`/dashboard/auth/${action}`, {
     method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
+    headers: { origin: ORIGIN, "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
   })
-  expect(external.status).toBe(401)
-
-  const local = await server.request("/dashboard/auth/setup", {
-    method: "POST",
+}
+async function setup(password = PASSWORD) {
+  const { code } = await issueAdminSetupCode()
+  const response = await post("setup", {
+    setupCode: code,
+    gatewayKey: GATEWAY_KEY,
+    password,
+  })
+  expect(response.status).toBe(201)
+  return { ...cookiesFrom(response), response }
+}
+function passwordChange(
+  session: ReturnType<typeof cookiesFrom>,
+  currentPassword = PASSWORD,
+  newPassword = "new password",
+) {
+  return app.request("/dashboard/auth/password", {
+    method: "PUT",
     headers: {
+      cookie: session.cookie,
+      origin: ORIGIN,
+      "x-copilot-csrf": session.csrf,
       "content-type": "application/json",
-      origin: "http://127.0.0.1:4141",
     },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
+    body: JSON.stringify({ currentPassword, newPassword }),
   })
-  expect(local.status).toBe(201)
-})
+}
 
-test("concurrent first-time setup creates only one administrator", async () => {
-  const requests = await Promise.all(
-    [ADMIN_PASSWORD, "another secure administrator password"].map((password) =>
-      Promise.resolve(
-        server.request("/dashboard/auth/setup", {
-          method: "POST",
-          headers: { "content-type": "application/json", origin: ORIGIN },
-          body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password }),
-        }),
-      ),
-    ),
-  )
-  expect(requests.map((response) => response.status).sort()).toEqual([201, 409])
-})
-
-test("gateway key alone cannot access administrator APIs", async () => {
-  await setup()
-  const response = await server.request("/dashboard/api/overview", {
-    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
-  })
-  expect(response.status).toBe(401)
-})
-
-test("remote and code launcher pages require the administrator cookie", async () => {
-  const cookies = await setup()
-
-  for (const path of ["/remote", "/code", "/code/session_example"]) {
-    const unauthenticated = await server.request(path)
-    expect(unauthenticated.status).toBe(302)
-    expect(unauthenticated.headers.get("location")).toBe("/dashboard")
-  }
-
-  const code = await server.request("/code", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(code.status).toBe(302)
-  expect(code.headers.get("location")).toBe("/dashboard#environments")
-
-  const sessionLink = await server.request("/code/session_abc123", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(sessionLink.status).toBe(302)
-  expect(sessionLink.headers.get("location")).toBe("/remote?session=cse_abc123")
-})
-
-test("setup and login credential failures share the IP tracker", async () => {
-  const headers = {
-    "content-type": "application/json",
-    origin: ORIGIN,
-    "x-copilot-peer-ip": "198.51.100.77",
-  }
-
-  const wrongSetup = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ gatewayKey: "wrong", password: ADMIN_PASSWORD }),
-  })
-  expect(wrongSetup.status).toBe(401)
-
-  const configured = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(configured.status).toBe(201)
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const wrongLogin = await server.request("/dashboard/auth/login", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "wrong" }),
-    })
-    expect(wrongLogin.status).toBe(401)
-  }
-
-  expect(isIpBlocked("198.51.100.77")).toBe(true)
-  const correctButBanned = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(correctButBanned.status).toBe(401)
-})
-
-test("missing setup credential fields count as failed attempts", async () => {
-  for (const [clientIp, body] of [
-    ["198.51.100.79", { password: ADMIN_PASSWORD }],
-    ["198.51.100.80", { gatewayKey: GATEWAY_KEY }],
-  ] as const) {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await server.request("/dashboard/auth/setup", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          origin: ORIGIN,
-          "x-copilot-peer-ip": clientIp,
-        },
-        body: JSON.stringify(body),
-      })
-      expect(response.status).toBe(400)
-    }
-    expect(isIpBlocked(clientIp)).toBe(true)
-  }
-})
-
-test("missing login password counts as a failed attempt", async () => {
-  await setup()
-  const clientIp = "198.51.100.81"
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await server.request("/dashboard/auth/login", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: ORIGIN,
-        "x-copilot-peer-ip": clientIp,
-      },
-      body: JSON.stringify({ gatewayKey: GATEWAY_KEY }),
-    })
-    expect(response.status).toBe(401)
-  }
-  expect(isIpBlocked(clientIp)).toBe(true)
-})
-
-test("malformed setup JSON does not count as a credential attempt", async () => {
-  const clientIp = "198.51.100.83"
-  const headers = {
-    "content-type": "application/json",
-    origin: ORIGIN,
-    "x-copilot-peer-ip": clientIp,
-  }
-
-  for (const body of ["null", "[]", '"text"']) {
-    expect(
-      (
-        await server.request("/dashboard/auth/setup", {
-          method: "POST",
-          headers,
-          body,
-        })
-      ).status,
-    ).toBe(400)
-  }
-  expect(isIpBlocked(clientIp)).toBe(false)
-
-  const valid = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(valid.status).toBe(201)
-})
-
-test("malformed dashboard auth JSON does not count as a credential attempt", async () => {
-  await setup()
-  const clientIp = "198.51.100.82"
-  const headers = {
-    "content-type": "application/json",
-    origin: ORIGIN,
-    "x-copilot-peer-ip": clientIp,
-  }
-
-  for (const body of ["null", "[]", '"text"']) {
-    expect(
-      (
-        await server.request("/dashboard/auth/login", {
-          method: "POST",
-          headers,
-          body,
-        })
-      ).status,
-    ).toBe(401)
-  }
-  expect(isIpBlocked(clientIp)).toBe(false)
-
-  const valid = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(valid.status).toBe(200)
-})
-
-test("session and CSRF failures do not count as password attempts", async () => {
-  const cookies = await setup()
-  const clientIp = "198.51.100.78"
-  const peer = { "x-copilot-peer-ip": clientIp }
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    expect(
-      (
-        await server.request("/dashboard/auth/session", {
-          headers: {
-            ...peer,
-            cookie: `${ADMIN_SESSION_COOKIE}=expired`,
-          },
-        })
-      ).status,
-    ).toBe(401)
-  }
+test("first setup requires a one-use code, initial key and four-character password", async () => {
+  const { code } = await issueAdminSetupCode()
+  expect(
+    (await post("setup", { gatewayKey: GATEWAY_KEY, password: PASSWORD }))
+      .status,
+  ).toBe(400)
   expect(
     (
-      await server.request("/dashboard/auth/logout", {
-        method: "POST",
-        headers: {
-          ...peer,
-          cookie: cookies.cookie,
-          origin: ORIGIN,
-        },
+      await post("setup", {
+        setupCode: "wrong",
+        gatewayKey: GATEWAY_KEY,
+        password: PASSWORD,
       })
     ).status,
   ).toBe(401)
-  expect(isIpBlocked(clientIp)).toBe(false)
-
-  const login = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: {
-      ...peer,
-      "content-type": "application/json",
-      origin: ORIGIN,
-    },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(login.status).toBe(200)
-})
-
-test("banned IPs cannot use valid admin sessions on browser surfaces", async () => {
-  const cookies = await setup()
-  const clientIp = "198.51.100.84"
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    recordFailedAttempt(clientIp)
-  }
-
-  const headers = {
-    cookie: cookies.cookie,
-    "x-copilot-peer-ip": "127.0.0.1",
-    "x-forwarded-for": clientIp,
-  }
   expect(
-    (await server.request("/dashboard/auth/session", { headers })).status,
+    (
+      await post("setup", {
+        setupCode: code,
+        gatewayKey: "",
+        password: PASSWORD,
+      })
+    ).status,
   ).toBe(401)
   expect(
-    (await server.request("/dashboard/api/overview", { headers })).status,
+    (
+      await post("setup", {
+        setupCode: code,
+        gatewayKey: GATEWAY_KEY,
+        password: "123",
+      })
+    ).status,
   ).toBe(401)
-
-  const remote = await server.request("/remote", { headers })
-  expect(remote.status).toBe(302)
-  expect(remote.headers.get("location")).toBe("/dashboard")
+  const response = await post("setup", {
+    setupCode: code,
+    gatewayKey: GATEWAY_KEY,
+    password: "1234",
+  })
+  expect(response.status).toBe(201)
+  expect(response.headers.getSetCookie().join(";")).toContain(
+    "HttpOnly; Secure; SameSite=Strict",
+  )
+  expect(response.headers.getSetCookie().join(";")).toContain("Max-Age=2592000")
+  expect(
+    (await post("login", { gatewayKey: GATEWAY_KEY, password: "1234" })).status,
+  ).toBe(200)
 })
 
-test("an explicit lease lets a banned IP use its valid admin session", async () => {
-  const cookies = await setup()
-  const clientIp = "198.51.100.85"
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    recordFailedAttempt(clientIp)
+test("setup requires exact allowed Origin without requiring preexisting CSRF", async () => {
+  const { code } = await issueAdminSetupCode()
+  const body = { setupCode: code, gatewayKey: GATEWAY_KEY, password: PASSWORD }
+  for (const origin of [
+    "",
+    "https://evil.invalid",
+    `${ORIGIN}/`,
+    "https://gateway.example.com.evil.invalid",
+  ]) {
+    expect((await post("setup", body, { origin })).status).toBe(401)
   }
-  expect(leaseIp(clientIp, 60_000)).toBe(true)
+  expect((await post("setup", body)).status).toBe(201)
+})
 
-  const headers = {
-    cookie: cookies.cookie,
-    "x-copilot-peer-ip": "127.0.0.1",
-    "x-forwarded-for": clientIp,
-  }
+test("login retains gateway-key-plus-password and ignores environment password authority", async () => {
+  const session = await setup()
+  process.env.COPILOT_ADMIN_PASSWORD_HASH = "invalid legacy hash"
+  await initializeAdminAuth()
   expect(
-    (await server.request("/dashboard/auth/session", { headers })).status,
+    (await post("login", { gatewayKey: GATEWAY_KEY, password: PASSWORD }))
+      .status,
   ).toBe(200)
   expect(
-    (await server.request("/dashboard/api/overview", { headers })).status,
+    (await post("login", { gatewayKey: "wrong", password: PASSWORD })).status,
+  ).toBe(401)
+  expect(
+    (await post("login", { gatewayKey: GATEWAY_KEY, password: "wrong" }))
+      .status,
+  ).toBe(401)
+  expect(
+    (
+      await app.request("/protected", {
+        headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+      })
+    ).status,
+  ).toBe(401)
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
   ).toBe(200)
-  expect((await server.request("/remote", { headers })).status).toBe(200)
-})
-
-test("admin session accesses reads and mutations require CSRF and Origin", async () => {
-  const cookies = await setup()
-  const overview = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
+  expect(await (await app.request("/dashboard/auth/status")).json()).toEqual({
+    configured: true,
+    gatewayConfigured: true,
+    passwordManagedExternally: false,
   })
-  expect(overview.status).toBe(200)
-
-  const missingCsrf = await server.request(
-    "/dashboard/api/settings/codex-cleanup-model",
-    {
-      method: "POST",
-      headers: { cookie: cookies.cookie, "content-type": "application/json" },
-      body: JSON.stringify({ model: null }),
-    },
-  )
-  expect(missingCsrf.status).toBe(401)
-
-  const mutation = await server.request(
-    "/dashboard/api/settings/codex-cleanup-model",
-    {
-      method: "POST",
-      headers: {
-        cookie: cookies.cookie,
-        "content-type": "application/json",
-        origin: ORIGIN,
-        "x-copilot-csrf": cookies.csrf,
-      },
-      body: JSON.stringify({ model: null }),
-    },
-  )
-  expect(mutation.status).toBe(200)
 })
 
-test("managed JWT rows reserve issued administrator sessions until deleted", async () => {
-  const cookies = await setup()
-  const token = adminSessionToken(cookies)
-  const digest = sha256Hex(token)
-
-  expect((await requestOverview(cookies.cookie)).status).toBe(200)
-
-  const entry = trustedJwtDigestStore.add({
-    label: "Administrator collision",
-    digest,
-  })
-  expect((await requestOverview(cookies.cookie)).status).toBe(401)
-
-  trustedJwtDigestStore.setEnabled(entry.id, false)
-  expect((await requestOverview(cookies.cookie)).status).toBe(401)
-
-  const digestCookie = cookies.cookie.replace(
-    `${ADMIN_SESSION_COOKIE}=${token}`,
-    `${ADMIN_SESSION_COOKIE}=${digest}`,
+test("password change requires CSRF and current password, then revokes every older session atomically", async () => {
+  const session = await setup()
+  const other = cookiesFrom(
+    await post("login", { gatewayKey: GATEWAY_KEY, password: PASSWORD }),
   )
-  expect((await requestOverview(digestCookie)).status).toBe(401)
-
-  trustedJwtDigestStore.remove(entry.id)
-  expect((await requestOverview(cookies.cookie)).status).toBe(200)
-})
-
-test("admin sessions can access sensitive dashboard routes without reauthentication", async () => {
-  const cookies = await setup()
-  const readFile = spyOn(fs, "readFile").mockRejectedValue(
-    Object.assign(new Error("missing test fixture"), { code: "ENOENT" }),
-  )
-  try {
-    const response = await server.request("/dashboard/api/settings/export", {
-      headers: { cookie: cookies.cookie },
-    })
-    expect(response.status).toBe(200)
-  } finally {
-    readFile.mockRestore()
-  }
-})
-
-test("admin password change revokes prior sessions", async () => {
-  const cookies = await setup()
-  const changed = await server.request("/dashboard/auth/password", {
-    method: "PUT",
-    headers: {
-      cookie: cookies.cookie,
-      "content-type": "application/json",
-      origin: ORIGIN,
-      "x-copilot-csrf": cookies.csrf,
-    },
-    body: JSON.stringify({
-      currentPassword: ADMIN_PASSWORD,
-      newPassword: "a new administrator password with length",
-    }),
-  })
+  expect((await passwordChange({ ...session, csrf: "wrong" })).status).toBe(401)
+  expect((await passwordChange(session, "wrong")).status).toBe(401)
+  expect((await passwordChange(session, PASSWORD, "123")).status).toBe(400)
+  const changed = await passwordChange(session)
   expect(changed.status).toBe(200)
-
-  const oldSession = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(oldSession.status).toBe(401)
+  for (const cookie of [session.cookie, other.cookie])
+    expect(
+      (await app.request("/protected", { headers: { cookie } })).status,
+    ).toBe(401)
+  expect(
+    (
+      await app.request("/protected", {
+        headers: { cookie: cookiesFrom(changed).cookie },
+      })
+    ).status,
+  ).toBe(200)
+  expect(await loginAdmin(GATEWAY_KEY, PASSWORD)).toBeNull()
+  expect(await loginAdmin(GATEWAY_KEY, "new password")).not.toBeNull()
 })
 
-test("environment Argon2id hash is the authoritative admin password", async () => {
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
+test("password transaction failure preserves the old password and sessions", async () => {
+  const session = await setup()
+  fixture.failWrites()
+  expect((await passwordChange(session)).status).toBe(503)
+  fixture.failWrites(false)
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(200)
+  expect(await loginAdmin(GATEWAY_KEY, PASSWORD)).not.toBeNull()
+  expect(await loginAdmin(GATEWAY_KEY, "new password")).toBeNull()
+})
+
+test("sessions survive restart with no raw session, csrf, password or gateway in storage", async () => {
+  const session = await setup()
+  const stored = await fixture.storage.read((sql) =>
+    sql.query({
+      sql: "SELECT password_hash FROM capi_admin UNION ALL SELECT token_hash FROM capi_admin_sessions UNION ALL SELECT csrf_hash FROM capi_admin_sessions UNION ALL SELECT digest FROM capi_gateway_credentials",
+      args: [],
+    }),
   )
+  const serialized = JSON.stringify(stored)
+  expect(serialized).not.toContain(GATEWAY_KEY)
+  expect(serialized).not.toContain(PASSWORD)
+  expect(serialized).not.toContain(session.csrf)
+  await fixture.restart()
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(200)
+})
 
-  expect(await (await server.request("/dashboard/auth/status")).json()).toEqual(
-    {
-      configured: true,
-      gatewayConfigured: true,
-      passwordManagedExternally: true,
-    },
+test("admin sessions use a 30-day sliding expiry persisted at five-minute cadence", async () => {
+  let current = Date.now()
+  setAdminAuthClockForTest({ now: () => current })
+  const session = await setup()
+  const started = current
+  const read = () =>
+    fixture.storage.read((sql) =>
+      sql.query({
+        sql: "SELECT last_seen_at,expires_at FROM capi_admin_sessions",
+        args: [],
+      }),
+    )
+  current += 60_000
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(200)
+  expect((await read())[0]?.last_seen_at).toBe(started)
+  current += 5 * 60_000
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(200)
+  expect((await read())[0]?.expires_at).toBe(current + ADMIN_SESSION_TTL_MS)
+  await fixture.restart()
+  current += ADMIN_SESSION_TTL_MS + 1
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(401)
+})
+
+test("logout requires CSRF, revokes only its session and clears cookies", async () => {
+  const session = await setup()
+  expect((await post("logout", {}, { cookie: session.cookie })).status).toBe(
+    401,
   )
+  const response = await post(
+    "logout",
+    {},
+    { cookie: session.cookie, "x-copilot-csrf": session.csrf },
+  )
+  expect(response.status).toBe(200)
+  expect(response.headers.getSetCookie().join(";")).toContain("Max-Age=0")
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(401)
+})
 
-  const setupAttempt = await server.request("/dashboard/auth/setup", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
+test("owner reset preserves administrator and independent gateway credentials", async () => {
+  const session = await setup()
+  await resetAdminPassword("owner reset password")
+  await fixture.restart()
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(401)
+  expect(await loginAdmin(GATEWAY_KEY, "owner reset password")).not.toBeNull()
+  expect(await resolveCredential(GATEWAY_KEY)).toMatchObject({
+    kind: "gateway",
   })
-  expect(setupAttempt.status).toBe(409)
+  await expect(issueAdminSetupCode()).rejects.toThrow("already configured")
+})
 
-  const wrongLogin = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "wrong" }),
+test("inference digests cannot reserve admin cookie values as privileged credentials", async () => {
+  const session = await setup()
+  const token = session.cookie
+    .split("; ")
+    .find((part) => part.startsWith(`${ADMIN_SESSION_COOKIE}=`))
+    ?.slice(ADMIN_SESSION_COOKIE.length + 1)
+  if (!token) throw new Error("Missing fixture session token")
+  await fixture.storage.transaction(async (sql) => {
+    await sql.execute({
+      sql: "INSERT INTO capi_inference_credentials (digest,id,kind,principal_id,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+      args: [
+        credentialDigest(token),
+        "reserved-session",
+        "managed",
+        "inference-managed:reserved-session",
+        Date.now(),
+        Date.now(),
+      ],
+    })
   })
-  expect(wrongLogin.status).toBe(401)
+  expect(
+    (await app.request("/protected", { headers: { cookie: session.cookie } }))
+      .status,
+  ).toBe(401)
+})
 
-  const login = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(login.status).toBe(200)
-  const cookies = cookiesFrom(login)
-  expect(cookies.cookie).toContain(ADMIN_SESSION_COOKIE)
-
-  const settings = await server.request("/dashboard/api/settings", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(settings.status).toBe(200)
-  const settingsBody = (await settings.json()) as {
-    passwordManagedExternally?: boolean
+test("database failures return no-store 503 without adding failed-password strikes", async () => {
+  await setup()
+  fixture.failReads()
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await post(
+      "login",
+      { gatewayKey: GATEWAY_KEY, password: PASSWORD },
+      { "x-copilot-peer-ip": "198.51.100.9" },
+    )
+    expect(response.status).toBe(503)
+    expect(response.headers.get("cache-control")).toBe("no-store")
   }
-  expect(settingsBody.passwordManagedExternally).toBe(true)
+  expect(isIpBlocked("198.51.100.9")).toBe(false)
+  expect((await app.request("/dashboard/auth/status")).status).toBe(503)
 })
 
-test("environment-backed login enforces the four-character minimum", async () => {
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash("123", {
+test("Argon2id verifier validation retains parameter and encoding bounds", async () => {
+  const valid = await Bun.password.hash(PASSWORD, {
     algorithm: "argon2id",
     memoryCost: 65_536,
     timeCost: 3,
   })
-  const short = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "123" }),
-  })
-  expect(short.status).toBe(401)
-
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash("1234", {
-    algorithm: "argon2id",
-    memoryCost: 65_536,
-    timeCost: 3,
-  })
-  const numeric = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "1234" }),
-  })
-  expect(numeric.status).toBe(200)
-})
-
-test("environment password hash overrides an existing local verifier", async () => {
-  await setup()
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ROTATED_ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-
-  const localPassword = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(localPassword.status).toBe(401)
-
-  const environmentPassword = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ROTATED_ADMIN_PASSWORD,
-    }),
-  })
-  expect(environmentPassword.status).toBe(200)
-})
-
-test("environment migration prevents a stale local password from returning", async () => {
-  await setup()
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ROTATED_ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-  await initializeAdminAuth()
-  delete process.env.COPILOT_ADMIN_PASSWORD_HASH
-
-  expect(initializeAdminAuth()).rejects.toThrow(
-    "COPILOT_ADMIN_PASSWORD_HASH is required",
-  )
-  const login = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ADMIN_PASSWORD,
-    }),
-  })
-  expect(login.status).toBe(500)
-})
-
-test("successful environment login persists the fail-closed migration marker", async () => {
-  await setup()
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ROTATED_ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-
-  const environmentLogin = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ROTATED_ADMIN_PASSWORD,
-    }),
-  })
-  expect(environmentLogin.status).toBe(200)
-  delete process.env.COPILOT_ADMIN_PASSWORD_HASH
-
-  expect(initializeAdminAuth()).rejects.toThrow(
-    "COPILOT_ADMIN_PASSWORD_HASH is required",
-  )
-})
-
-test("environment password rotation revokes existing admin sessions", async () => {
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-  const login = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  const cookies = cookiesFrom(login)
-
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ROTATED_ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-  await initializeAdminAuth()
-
-  const oldSession = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(oldSession.status).toBe(401)
-  const oldPassword = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  expect(oldPassword.status).toBe(401)
-  const rotatedPassword = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({
-      gatewayKey: GATEWAY_KEY,
-      password: ROTATED_ADMIN_PASSWORD,
-    }),
-  })
-  expect(rotatedPassword.status).toBe(200)
-})
-
-test("environment-managed password cannot be changed through the dashboard", async () => {
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = await Bun.password.hash(
-    ADMIN_PASSWORD,
-    {
-      algorithm: "argon2id",
-      memoryCost: 65_536,
-      timeCost: 3,
-    },
-  )
-  const login = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: ADMIN_PASSWORD }),
-  })
-  const cookies = cookiesFrom(login)
-  const changed = await server.request("/dashboard/auth/password", {
-    method: "PUT",
-    headers: {
-      cookie: cookies.cookie,
-      "content-type": "application/json",
-      origin: ORIGIN,
-      "x-copilot-csrf": cookies.csrf,
-    },
-    body: JSON.stringify({
-      currentPassword: ADMIN_PASSWORD,
-      newPassword: ROTATED_ADMIN_PASSWORD,
-    }),
-  })
-  expect(changed.status).toBe(409)
-  expect(await changed.json()).toEqual({
-    error: "Administrator password is managed by COPILOT_ADMIN_PASSWORD_HASH",
-  })
-})
-
-test("invalid environment admin password hashes fail closed", async () => {
-  process.env.COPILOT_ADMIN_PASSWORD_HASH = "$argon2id$invalid"
-  const response = await server.request("/dashboard/auth/status")
-  expect(response.status).toBe(500)
-  expect(await response.json()).toEqual({
-    error: {
-      code: "internal_error",
-      message: "Internal server error",
-      type: "server_error",
-    },
-  })
-})
-
-test("environment admin hashes reject unsafe Argon2id parameters", () => {
+  expect(validateAdminPasswordHash(valid)).toBe(valid)
   expect(() =>
-    validateAdminPasswordHash(
-      "$argon2id$v=19$m=1024,t=1,p=1$MTIzNDU2Nzg5MDEyMzQ1Ng$MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI",
-    ),
-  ).toThrow("unsupported Argon2id parameters")
-})
-
-test("environment admin hashes reject invalid Base64 encodings", () => {
+    validateAdminPasswordHash(valid.replace("m=65536", "m=1024")),
+  ).toThrow("unsupported")
+  expect(() => validateAdminPasswordHash(valid.replace("t=3", "t=1"))).toThrow(
+    "unsupported",
+  )
+  expect(() => validateAdminPasswordHash("invalid")).toThrow("Argon2id")
   expect(() =>
     validateAdminPasswordHash(
       `$argon2id$v=19$m=65536,t=3,p=1$${"A".repeat(25)}$${"A".repeat(45)}`,
     ),
-  ).toThrow("invalid Base64 encoding")
+  ).toThrow("Base64")
 })
 
-test("environment admin hashes reject padded PHC segments", async () => {
-  const valid = await Bun.password.hash(ADMIN_PASSWORD, {
-    algorithm: "argon2id",
-    memoryCost: 65_536,
-    timeCost: 3,
-  })
-  const segments = valid.split("$")
-  segments[4] += "="
-  expect(() => validateAdminPasswordHash(segments.join("$"))).toThrow(
-    "valid Argon2id PHC string",
-  )
-})
-
-test("wrong current admin passwords count toward the shared IP ban", async () => {
-  const cookies = await setup()
-  const clientIp = "198.51.100.86"
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await server.request("/dashboard/auth/password", {
-      method: "PUT",
-      headers: {
-        cookie: cookies.cookie,
-        "content-type": "application/json",
-        origin: ORIGIN,
-        "x-copilot-csrf": cookies.csrf,
-        "x-copilot-peer-ip": clientIp,
-      },
-      body: JSON.stringify({
-        currentPassword: "incorrect administrator password",
-        newPassword: "a valid replacement administrator password",
-      }),
-    })
-    expect(response.status).toBe(401)
+test("owner password recovery preserves usable OAuth access and reusable refresh credentials", async () => {
+  await setup()
+  const oauth = new OAuthStore({ storage: fixture.storage })
+  const binding = {
+    clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    redirectUri: "http://localhost:54545/callback",
+    state: "state-with-enough-entropy-123456789",
+    codeVerifier: "v".repeat(64),
   }
-
-  expect(isIpBlocked(clientIp)).toBe(true)
-})
-
-test("admin password changes accept numeric values and reject fewer than four characters", async () => {
-  const cookies = await setup()
-  const clientIp = "198.51.100.87"
-
-  const headers = {
-    cookie: cookies.cookie,
-    "content-type": "application/json",
-    origin: ORIGIN,
-    "x-copilot-csrf": cookies.csrf,
-    "x-copilot-peer-ip": clientIp,
-  }
-  const short = await server.request("/dashboard/auth/password", {
-    method: "PUT",
-    headers,
-    body: JSON.stringify({
-      currentPassword: ADMIN_PASSWORD,
-      newPassword: "123",
-    }),
+  const code = await oauth.issueAuthorizationCode({
+    ...binding,
+    codeChallenge: createPkceChallenge(binding.codeVerifier),
+    scopes: ["user:inference", "user:profile"],
   })
-  expect(short.status).toBe(400)
-
-  expect(isIpBlocked(clientIp)).toBe(false)
-
-  const numeric = await server.request("/dashboard/auth/password", {
-    method: "PUT",
-    headers,
-    body: JSON.stringify({
-      currentPassword: ADMIN_PASSWORD,
-      newPassword: "1234",
-    }),
-  })
-  expect(numeric.status).toBe(200)
-
-  const numericLogin = await server.request("/dashboard/auth/login", {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: ORIGIN },
-    body: JSON.stringify({ gatewayKey: GATEWAY_KEY, password: "1234" }),
-  })
-  expect(numericLogin.status).toBe(200)
-})
-
-test("logout revokes the current server-side session and expires cookies", async () => {
-  const cookies = await setup()
-  const logout = await server.request("/dashboard/auth/logout", {
-    method: "POST",
-    headers: {
-      cookie: cookies.cookie,
-      origin: ORIGIN,
-      "x-copilot-csrf": cookies.csrf,
-    },
-  })
-  expect(logout.status).toBe(200)
-  expect(logout.headers.getSetCookie().join(";")).toContain("Max-Age=0")
-
-  const afterLogout = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(afterLogout.status).toBe(401)
-})
-
-test("administrator sessions renew a one-month ttl while the dashboard is active", async () => {
-  const testClock = { nowMs: Date.UTC(2026, 6, 12) }
-  const startedAt = testClock.nowMs
-  setAdminAuthClockForTest({ now: () => testClock.nowMs })
-  const cookies = await setup()
-
-  // eslint-disable-next-line require-atomic-updates
-  testClock.nowMs = startedAt + 24 * 60 * 60 * 1000
-  const activeNextDay = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
-  })
-  expect(activeNextDay.status).toBe(200)
+  const issued = await oauth.exchangeAuthorizationCode({ ...binding, code })
+  if (issued.status !== "ok") throw new Error("OAuth fixture failed")
+  await resetAdminPassword("recovered password")
+  await fixture.restart()
+  const reopened = new OAuthStore({ storage: fixture.storage })
   expect(
-    readSetCookies(activeNextDay).some((cookie) =>
-      /^__Host-copilot_admin=.*; Max-Age=2592000; Path=\/; HttpOnly; Secure; SameSite=Strict$/.test(
-        cookie,
-      ),
-    ),
-  ).toBe(true)
-  expect(
-    readSetCookies(activeNextDay).some((cookie) =>
-      /^__Host-copilot_admin_csrf=.*; Max-Age=2592000; Path=\/; Secure; SameSite=Strict$/.test(
-        cookie,
-      ),
-    ),
-  ).toBe(true)
-
-  // eslint-disable-next-line require-atomic-updates
-  testClock.nowMs = startedAt + MONTH_MS + 1
-  const activePastOriginalExpiry = await server.request(
-    "/dashboard/api/overview",
-    { headers: { cookie: cookies.cookie } },
-  )
-  expect(activePastOriginalExpiry.status).toBe(200)
-})
-
-test("administrator sessions expire after one month without activity", async () => {
-  let currentTime = Date.UTC(2026, 6, 12)
-  setAdminAuthClockForTest({ now: () => currentTime })
-  const cookies = await setup()
-
-  currentTime += MONTH_MS + 1
-  const expired = await server.request("/dashboard/api/overview", {
-    headers: { cookie: cookies.cookie },
+    await reopened.resolveAccessToken(issued.tokens.accessToken),
+  ).not.toBeNull()
+  const refreshed = await reopened.refreshAccessToken({
+    refreshToken: issued.tokens.refreshToken,
+    clientId: binding.clientId,
   })
-  expect(expired.status).toBe(401)
-})
-
-test("dashboard responses carry hardening headers and no wildcard CORS", async () => {
-  const response = await server.request("/dashboard")
-  const csp = response.headers.get("content-security-policy")
-  expect(csp).toContain("nonce-")
-  expect(csp).toContain("form-action 'self';")
-  expect(csp).not.toContain("http://localhost")
-  expect(csp).not.toContain("https://platform.claude.com")
-  expect(response.headers.get("x-frame-options")).toBe("DENY")
-  expect(response.headers.get("x-content-type-options")).toBe("nosniff")
-  expect(response.headers.get("access-control-allow-origin")).toBeNull()
+  expect(refreshed.status).toBe("ok")
+  if (refreshed.status === "ok")
+    expect(refreshed.tokens.refreshToken).toBe(issued.tokens.refreshToken)
 })

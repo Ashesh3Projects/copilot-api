@@ -1,7 +1,5 @@
 import type { Context } from "hono"
 
-import consola from "consola"
-
 import { getAdminAuthStatus } from "~/lib/admin-auth"
 import {
   addReplacement,
@@ -18,8 +16,9 @@ import {
 } from "~/lib/config"
 import {
   createNebiusQwen3EmbeddingProvider,
-  getCustomProviders,
+  getGroqApiKey,
   listCustomProvidersForDashboard,
+  listCustomProviderPageForDashboard,
   removeCustomProvider,
   upsertCustomProvider,
 } from "~/lib/custom-providers"
@@ -56,12 +55,16 @@ import {
   removeModelSettings,
   setModelSettings,
 } from "~/lib/model-settings"
-import { PATHS } from "~/lib/paths"
+import { hasActiveGatewayCredentials } from "~/lib/request-auth"
 import {
   getRoutingTelemetrySnapshot,
   isRoutingWindow,
 } from "~/lib/routing-telemetry"
 import { state } from "~/lib/state"
+import { getSettingsActorId } from "~/lib/storage/domain-settings"
+import { createProviderMutationContext } from "~/lib/storage/providers-repository"
+import { getStorageRuntime } from "~/lib/storage/runtime"
+import { peekHistoryRuntime } from "~/lib/telemetry-writer"
 import { tokenPool } from "~/lib/token-pool"
 import {
   trustedJwtDigestStore,
@@ -131,6 +134,9 @@ interface CustomProviderRequestBody {
   baseUrl?: string
   apiKey?: string
   apiKeyEnv?: string
+  clearApiKey?: boolean
+  clearHeaders?: boolean
+  enabled?: boolean
   headers?: Record<string, string>
   passReasoningEffort?: boolean | null
   models?: Array<{
@@ -153,6 +159,9 @@ interface ValidCustomProviderBody {
   baseUrl: string
   apiKey?: string
   apiKeyEnv?: string
+  clearApiKey?: boolean
+  clearHeaders?: boolean
+  enabled?: boolean
   headers?: Record<string, string>
   passReasoningEffort?: boolean
   models: Array<{
@@ -315,7 +324,7 @@ export async function handleSetFlag(c: Context) {
   if (!body.name || typeof body.name !== "string") {
     return c.json({ error: "name is required" }, 400)
   }
-  setFeatureFlag(
+  await setFeatureFlag(
     body.name,
     body.value as boolean | string | number | Record<string, unknown>,
   )
@@ -327,7 +336,7 @@ export async function handleDeleteFlag(c: Context) {
   if (!body.name || typeof body.name !== "string") {
     return c.json({ error: "name is required" }, 400)
   }
-  const removed = removeFeatureFlag(body.name)
+  const removed = await removeFeatureFlag(body.name)
   if (!removed) {
     return c.json({ error: "Flag not found" }, 404)
   }
@@ -353,7 +362,7 @@ export async function handleSetStatsigOverride(c: Context) {
   }
 
   try {
-    statsigOverrideStore.set(body.kind, body.name, body.value)
+    await statsigOverrideStore.set(body.kind, body.name, body.value)
     return c.json({ success: true })
   } catch (error) {
     if (error instanceof StatsigOverrideValidationError) {
@@ -377,7 +386,7 @@ export async function handleDeleteStatsigOverride(c: Context) {
   }
 
   try {
-    const removed = statsigOverrideStore.remove(body.kind, body.name)
+    const removed = await statsigOverrideStore.remove(body.kind, body.name)
     if (!removed) {
       return c.json({ error: "Override not found" }, 404)
     }
@@ -638,6 +647,8 @@ export function handleListModelRouting(c: Context) {
     accountType: account.accountType,
     githubUsername: account.githubUsername,
     healthy: account.healthy,
+    enabled: account.enabled !== false,
+    deleting: account.deleting === true,
     modelsCount: account.models.size,
   }))
 
@@ -656,8 +667,10 @@ export function handleListModelRouting(c: Context) {
   })
 }
 
-export function handleListCustomProviders(c: Context) {
-  return c.json(listCustomProvidersForDashboard())
+export async function handleListCustomProviders(c: Context) {
+  if (c.req.query("withRevision") === "1")
+    return c.json(await listCustomProviderPageForDashboard())
+  return c.json(await listCustomProvidersForDashboard())
 }
 
 export async function handleUpsertCustomProvider(c: Context) {
@@ -667,33 +680,31 @@ export async function handleUpsertCustomProvider(c: Context) {
   if (!parsed.ok) return c.json({ error: parsed.error }, 400)
 
   const { body } = parsed
-  const existing = getCustomProviders().find(
-    (provider) => provider.id === body.id,
+  await upsertCustomProvider(
+    {
+      id: body.id,
+      name: body.name,
+      type: "openai-compatible",
+      baseUrl: body.baseUrl,
+      ...(body.apiKey ? { apiKey: body.apiKey } : {}),
+      ...(body.headers ? { headers: body.headers } : {}),
+      ...(body.clearApiKey !== undefined ?
+        { clearApiKey: body.clearApiKey }
+      : {}),
+      ...(body.clearHeaders !== undefined ?
+        { clearHeaders: body.clearHeaders }
+      : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+      models: body.models,
+      ...(body.passReasoningEffort !== undefined ?
+        { passReasoningEffort: body.passReasoningEffort }
+      : {}),
+    },
+    await providerMutation(c, "provider.upsert", body),
   )
-  const resolvedApiKey = body.apiKey ?? existing?.apiKey
-  const resolvedApiKeyEnv = body.apiKeyEnv ?? existing?.apiKeyEnv
-  const resolvedHeaders = body.headers ?? existing?.headers
-
-  if (!resolvedApiKey && !resolvedApiKeyEnv) {
-    return c.json({ error: "apiKey or apiKeyEnv is required" }, 400)
-  }
-
-  upsertCustomProvider({
-    id: body.id,
-    name: body.name,
-    type: "openai-compatible",
-    baseUrl: body.baseUrl,
-    ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
-    ...(resolvedApiKeyEnv ? { apiKeyEnv: resolvedApiKeyEnv } : {}),
-    ...(resolvedHeaders ? { headers: resolvedHeaders } : {}),
-    models: body.models,
-    ...(body.passReasoningEffort !== undefined ?
-      { passReasoningEffort: body.passReasoningEffort }
-    : {}),
-  })
 
   return c.json(
-    listCustomProvidersForDashboard().find(
+    (await listCustomProvidersForDashboard()).find(
       (provider) => provider.id === body.id,
     ),
   )
@@ -728,7 +739,15 @@ function parseCustomProviderBase(
   const baseUrl = getRequiredString(body.baseUrl, "baseUrl")
   if (!baseUrl.ok) return baseUrl
   const apiKey = getOptionalString(body.apiKey)
-  const apiKeyEnv = getOptionalString(body.apiKeyEnv)
+  if (body.apiKeyEnv !== undefined)
+    return {
+      ok: false,
+      error:
+        "apiKeyEnv is no longer supported; store a provider key in the dashboard",
+    }
+  for (const value of [body.enabled, body.clearApiKey, body.clearHeaders])
+    if (value !== undefined && typeof value !== "boolean")
+      return { ok: false, error: "Provider flags must be boolean" }
 
   if (body.headers !== undefined && !isStringRecord(body.headers)) {
     return { ok: false, error: "headers must be an object of strings" }
@@ -741,7 +760,13 @@ function parseCustomProviderBase(
       name: name.value,
       baseUrl: baseUrl.value,
       ...(apiKey ? { apiKey } : {}),
-      ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+      ...(body.clearApiKey !== undefined ?
+        { clearApiKey: body.clearApiKey }
+      : {}),
+      ...(body.clearHeaders !== undefined ?
+        { clearHeaders: body.clearHeaders }
+      : {}),
       ...(body.headers ? { headers: body.headers } : {}),
       ...(typeof body.passReasoningEffort === "boolean" ?
         { passReasoningEffort: body.passReasoningEffort }
@@ -855,20 +880,48 @@ export async function handleAddNebiusCustomProvider(c: Context) {
   if (!apiKey.ok) return c.json({ error: apiKey.error }, 400)
 
   const provider = createNebiusQwen3EmbeddingProvider(apiKey.value)
-  upsertCustomProvider(provider)
+  await upsertCustomProvider(
+    provider,
+    await providerMutation(c, "provider.upsert", provider),
+  )
   return c.json(
-    listCustomProvidersForDashboard().find(
+    (await listCustomProvidersForDashboard()).find(
       (candidate) => candidate.id === provider.id,
     ),
   )
 }
 
-export function handleDeleteCustomProvider(c: Context) {
+export async function handleDeleteCustomProvider(c: Context) {
   const id = c.req.param("id") ?? ""
-  if (!removeCustomProvider(id)) {
+  if (
+    !(await removeCustomProvider(
+      id,
+      await providerMutation(c, "provider.remove", { id }),
+    ))
+  ) {
     return c.json({ error: "Custom provider not found" }, 404)
   }
   return c.json({ success: true })
+}
+
+async function providerMutation(c: Context, kind: string, input: unknown) {
+  const actor = getSettingsActorId()
+  if (!actor) throw new Error("Administrator authority is required")
+  const mutation = await createProviderMutationContext(
+    getStorageRuntime().storage,
+    kind,
+    input,
+    actor,
+  )
+  const revision = c.req.header("If-Match")
+  if (revision !== undefined) {
+    const value = revision.replaceAll('"', "")
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))
+      throw new Error("Invalid configuration revision")
+    mutation.expectedRevision = Number(value)
+  }
+  mutation.operationId = c.req.header("Idempotency-Key") ?? mutation.operationId
+  return mutation
 }
 
 export async function handleSetModelRouting(c: Context) {
@@ -908,11 +961,11 @@ export async function handleSetModelRouting(c: Context) {
   return c.json(override)
 }
 
-export function handleGetUsage(c: Context) {
-  return c.json(getUsageResponse())
+export async function handleGetUsage(c: Context) {
+  return c.json(await getUsageResponse())
 }
 
-export function handleGetUsageRouting(c: Context) {
+export async function handleGetUsageRouting(c: Context) {
   const windowValues = new URL(c.req.url).searchParams.getAll("window")
   const window = windowValues.length === 0 ? "1h" : windowValues[0]
   if (windowValues.length > 1 || !isRoutingWindow(window)) {
@@ -920,7 +973,7 @@ export function handleGetUsageRouting(c: Context) {
   }
 
   return c.json(
-    getRoutingTelemetrySnapshot({
+    await getRoutingTelemetrySnapshot({
       accounts: tokenPool.getAllAccounts().map((account) => ({
         id: account.id,
         accountType: account.accountType,
@@ -969,30 +1022,18 @@ export async function handleSetIpAllowlistEntry(c: Context) {
 
 export async function handleDeleteIpAllowlistEntry(c: Context) {
   const ip = c.req.param("ip") ?? ""
-  const removed = await removeIpSecurityPolicy(ip).catch((error: unknown) => {
-    consola.error("Failed to remove IP allowlist entry:", error)
-    return null
-  })
-  if (removed === null) {
-    return c.json({ error: "Failed to save IP allowlist" }, 500)
-  }
+  const removed = await removeIpSecurityPolicy(ip)
   if (!removed) return c.json({ error: "IP address not found" }, 404)
   return c.json({ success: true })
 }
 
 export async function handleClearIpAllowlist(c: Context) {
-  const cleared = await clearIpSecurityPolicy().catch((error: unknown) => {
-    consola.error("Failed to clear IP allowlist:", error)
-    return null
-  })
-  if (cleared === null) {
-    return c.json({ error: "Failed to save IP allowlist" }, 500)
-  }
+  const cleared = await clearIpSecurityPolicy()
   return c.json({ success: true, cleared })
 }
 
-export function handleListTrustedJwtDigests(c: Context) {
-  return c.json(trustedJwtDigestStore.list())
+export async function handleListTrustedJwtDigests(c: Context) {
+  return c.json(await trustedJwtDigestStore.list())
 }
 
 export async function handleAddTrustedJwtDigest(c: Context) {
@@ -1003,7 +1044,7 @@ export async function handleAddTrustedJwtDigest(c: Context) {
 
   try {
     return c.json(
-      trustedJwtDigestStore.add({
+      await trustedJwtDigestStore.add({
         label: body.label as string,
         digest: body.digest as string,
       }),
@@ -1026,7 +1067,7 @@ export async function handleSetTrustedJwtDigestEnabled(c: Context) {
   }
 
   try {
-    const entry = trustedJwtDigestStore.setEnabled(
+    const entry = await trustedJwtDigestStore.setEnabled(
       c.req.param("id") ?? "",
       body.enabled,
     )
@@ -1040,25 +1081,25 @@ export async function handleSetTrustedJwtDigestEnabled(c: Context) {
   }
 }
 
-export function handleDeleteTrustedJwtDigest(c: Context) {
-  const removed = trustedJwtDigestStore.remove(c.req.param("id") ?? "")
+export async function handleDeleteTrustedJwtDigest(c: Context) {
+  const removed = await trustedJwtDigestStore.remove(c.req.param("id") ?? "")
   if (!removed) return c.json({ error: "Trusted JWT digest not found" }, 404)
   return c.json({ success: true })
 }
 
-export function handleListLlmDebugLogs(c: Context) {
-  return c.json(listLlmDebugLogs())
+export async function handleListLlmDebugLogs(c: Context) {
+  return c.json(await listLlmDebugLogs())
 }
 
-export function handleGetLlmDebugLog(c: Context) {
+export async function handleGetLlmDebugLog(c: Context) {
   const id = c.req.param("id") ?? ""
-  const entry = getLlmDebugLog(id)
+  const entry = await getLlmDebugLog(id)
   if (!entry) return c.json({ error: "Debug log not found" }, 404)
   return c.json(entry)
 }
 
-export function handleClearLlmDebugLogs(c: Context) {
-  clearLlmDebugLogs()
+export async function handleClearLlmDebugLogs(c: Context) {
+  await clearLlmDebugLogs()
   return c.json({ success: true })
 }
 
@@ -1075,11 +1116,19 @@ export async function handleGetSettings(c: Context) {
     version: packageJson.version,
     port: process.env.PORT ?? "4141",
     host: process.env.HOST ?? "localhost",
-    authEnabled: Boolean(state.apiKeyAuth),
-    multiToken: state.isMultiToken,
+    authEnabled: await hasActiveGatewayCredentials(),
+    multiToken: tokenPool.getAllAccounts().length > 1,
     sentryEnabled: Boolean(process.env.SENTRY_DSN),
-    groqEnabled: Boolean(process.env.GROQ_API_KEY),
-    dataDir: PATHS.APP_DIR,
+    groqEnabled: Boolean(getGroqApiKey()),
+    dataDir:
+      getStorageRuntime().config.kind === "sqlite" ?
+        "Local SQLite"
+      : "Remote Turso",
+    storage: {
+      kind: getStorageRuntime().config.kind,
+      revision: getStorageRuntime().snapshot.get().revision,
+      telemetry: peekHistoryRuntime()?.writer.status(),
+    },
     debug: state.debug,
     verbose: state.verbose,
     passwordManagedExternally: adminAuthStatus.passwordManagedExternally,
@@ -1110,7 +1159,7 @@ export async function handleSetCodexCleanupModel(c: Context) {
     }
   }
 
-  setCodexCleanupModel(trimmed)
+  await setCodexCleanupModel(trimmed)
   return c.json({
     codexCleanupModel: getCodexCleanupModel(),
     codexCleanupModelDefault: getSmallModel(),

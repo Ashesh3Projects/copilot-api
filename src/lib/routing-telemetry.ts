@@ -1,4 +1,13 @@
+/* eslint-disable max-lines -- Keeps the existing routing DTO calculations and durable mapping together. */
+import { randomUUID } from "node:crypto"
+
 import type { RoutingAffinitySource } from "~/lib/routing-affinity"
+import type { CollectionStatus } from "~/lib/storage/history-repository"
+import type { JsonValue } from "~/lib/storage/types"
+import type { TelemetryStatus } from "~/lib/telemetry-writer"
+
+import { historyObject } from "~/lib/storage/history-repository"
+import { getHistoryRuntime, getTelemetryWriter } from "~/lib/telemetry-writer"
 
 const MINUTE_MS = 60_000
 const RETENTION_MINUTES = 24 * 60
@@ -140,6 +149,7 @@ export interface RoutingAffinitySources {
 }
 
 export interface RoutingTelemetrySnapshot {
+  collection?: TelemetryStatus & CollectionStatus
   window: RoutingWindow
   windowMinutes: number
   retentionMinutes: number
@@ -229,6 +239,7 @@ const RETRY_REASONS = new Set<UpstreamSendReason>([
   "token_refresh",
 ])
 
+let testMode = false
 let buckets = new Map<number, MinuteBucket>()
 let lifetime = emptyTotals()
 let telemetryStartedAt = Date.now()
@@ -348,6 +359,7 @@ function createBucket(timestamp: number): MinuteBucket {
 
 function getBucket(timestamp: number): MinuteBucket {
   const minute = minuteFor(timestamp)
+  if (!testMode) return createBucket(minute)
   let bucket = buckets.get(minute)
   if (!bucket) {
     bucket = createBucket(minute)
@@ -455,9 +467,10 @@ export function recordRoutingRequest(event: RoutingRequestEvent): void {
     }
     const bucket = getBucket(timestamp)
     bucket.totals.requests++
-    lifetime.requests++
+    if (testMode) lifetime.requests++
     getModelCounters(bucket, event.model, event.provider).requests++
     getRouteCounters(bucket, event.route).requests++
+    enqueueBucket(bucket, timestamp)
   } catch {
     // Telemetry must never affect request handling.
   }
@@ -478,18 +491,18 @@ export function recordUpstreamCall(event: UpstreamCallEvent): void {
     const route = getRouteCounters(bucket, event.route)
 
     bucket.totals.upstreamCalls++
-    lifetime.upstreamCalls++
+    if (testMode) lifetime.upstreamCalls++
     model.upstreamCalls++
     route.upstreamCalls++
     incrementOutcome(model.outcomes, event.outcome)
 
     if (RETRY_REASONS.has(event.reason)) {
       bucket.totals.retries++
-      lifetime.retries++
+      if (testMode) lifetime.retries++
       model.retries++
     } else if (event.reason === "failover") {
       bucket.totals.failovers++
-      lifetime.failovers++
+      if (testMode) lifetime.failovers++
       model.failovers++
     }
 
@@ -502,6 +515,7 @@ export function recordUpstreamCall(event: UpstreamCallEvent): void {
     } else if (normalizeDimension(event.provider) === "GitHub Copilot") {
       bucket.defaultUpstreamCalls++
     }
+    enqueueBucket(bucket, timestamp)
   } catch {
     // Telemetry must never affect provider calls.
   }
@@ -514,7 +528,9 @@ export function recordRoutingSelection(event: RoutingSelectionEvent): void {
       return
     }
     if (event.mode === "single") {
-      getBucket(timestamp).selectionModes.single++
+      const bucket = getBucket(timestamp)
+      bucket.selectionModes.single++
+      enqueueBucket(bucket, timestamp)
       return
     }
     if (!validAccountId(event.accountId)) return
@@ -544,6 +560,7 @@ export function recordRoutingSelection(event: RoutingSelectionEvent): void {
         event.affinitySource
       : "unidentified"
     bucket.affinitySources[affinitySource]++
+    enqueueBucket(bucket, timestamp)
   } catch {
     // Telemetry must never affect account selection.
   }
@@ -797,30 +814,28 @@ function snapshotTimeSeries(
   return points
 }
 
-export function getRoutingTelemetrySnapshot(
+// eslint-disable-next-line max-params -- Retains existing DTO calculation inputs independently.
+function formatRoutingSnapshot(
   options: RoutingSnapshotOptions,
+  selected: Array<MinuteBucket>,
+  totalLifetime: RoutingTotals,
+  startedAt: number,
 ): RoutingTelemetrySnapshot {
   const now = validTimestamp(options.now) ? options.now : Date.now()
-  pruneBuckets(now)
   const config = WINDOW_CONFIG[options.window]
-  const cutoff = minuteFor(now - config.minutes * MINUTE_MS)
-  const end = minuteFor(now)
-  const selected = [...buckets.values()].filter(
-    (bucket) => bucket.timestamp >= cutoff && bucket.timestamp <= end,
-  )
   const aggregate = aggregateBuckets(selected)
 
   return {
     accounts: snapshotAccounts(aggregate, options.accounts, options.multiToken),
     generatedAt: now,
-    lifetime: { ...lifetime },
+    lifetime: { ...totalLifetime },
     models: snapshotModels(aggregate),
     multiToken: options.multiToken,
     retentionMinutes: RETENTION_MINUTES,
     routes: snapshotRoutes(aggregate),
     selectionModes: { ...aggregate.selectionModes },
     affinitySources: { ...aggregate.affinitySources },
-    telemetryStartedAt,
+    telemetryStartedAt: startedAt,
     timeSeries: snapshotTimeSeries(selected, now, options.window),
     totals: { ...aggregate.totals },
     window: options.window,
@@ -828,11 +843,129 @@ export function getRoutingTelemetrySnapshot(
   }
 }
 
+export async function getRoutingTelemetrySnapshot(
+  options: RoutingSnapshotOptions,
+): Promise<RoutingTelemetrySnapshot> {
+  if (testMode) return getRoutingTelemetrySnapshotForTest(options)
+  const runtime = getHistoryRuntime()
+  const now = validTimestamp(options.now) ? options.now : Date.now()
+  const cutoff = minuteFor(
+    now - WINDOW_CONFIG[options.window].minutes * MINUTE_MS,
+  )
+  const data = await runtime.writer.read((pending) =>
+    runtime.repository.readRouting(cutoff, pending),
+  )
+  const selected = data.buckets
+    .map((value) => deserializeBucket(value))
+    .filter((bucket) => bucket.timestamp <= minuteFor(now))
+  const totals = {
+    ...emptyTotals(),
+    ...historyObject(data.lifetime),
+  } as RoutingTotals
+  return {
+    ...formatRoutingSnapshot(options, selected, totals, data.startedAt ?? now),
+    collection: {
+      ...runtime.writer.status(),
+      ...(await runtime.repository.collectionStatus()),
+    },
+  }
+}
+
+/** Synchronous snapshots only for fixtures that explicitly reset test mode. */
+export function getRoutingTelemetrySnapshotForTest(
+  options: RoutingSnapshotOptions,
+): RoutingTelemetrySnapshot {
+  if (!testMode) throw new Error("Routing test mode was not initialized")
+  const now = validTimestamp(options.now) ? options.now : Date.now()
+  pruneBuckets(now)
+  const cutoff = minuteFor(
+    now - WINDOW_CONFIG[options.window].minutes * MINUTE_MS,
+  )
+  const selected = [...buckets.values()].filter(
+    (bucket) =>
+      bucket.timestamp >= cutoff && bucket.timestamp <= minuteFor(now),
+  )
+  return formatRoutingSnapshot(options, selected, lifetime, telemetryStartedAt)
+}
+
+function enqueueBucket(bucket: MinuteBucket, timestamp: number): void {
+  if (testMode) return
+  const payload = {
+    timestamp: bucket.timestamp,
+    totals: { ...bucket.totals },
+    models: Object.fromEntries(
+      [...bucket.models].map(([key, model]) => [
+        key,
+        { ...model, accountCalls: Object.fromEntries(model.accountCalls) },
+      ]),
+    ),
+    routes: Object.fromEntries(bucket.routes),
+    accounts: Object.fromEntries(bucket.accounts),
+    defaultUpstreamCalls: bucket.defaultUpstreamCalls,
+    selectionModes: { ...bucket.selectionModes },
+    affinitySources: { ...bucket.affinitySources },
+  } as unknown as JsonValue
+  getTelemetryWriter()?.enqueue({
+    id: randomUUID(),
+    kind: "routing",
+    recordedAt: timestamp,
+    generation: 0,
+    payload,
+  })
+}
+
+function deserializeBucket(value: JsonValue): MinuteBucket {
+  const p = historyObject(value),
+    bucket = createBucket(Number(p.timestamp))
+  bucket.totals = {
+    ...emptyTotals(),
+    ...historyObject(p.totals),
+  } as RoutingTotals
+  bucket.defaultUpstreamCalls = Number(p.defaultUpstreamCalls ?? 0)
+  bucket.selectionModes = {
+    ...emptySelectionModes(),
+    ...historyObject(p.selectionModes),
+  } as RoutingSelectionModes
+  bucket.affinitySources = {
+    ...emptyAffinitySources(),
+    ...historyObject(p.affinitySources),
+  } as RoutingAffinitySources
+  for (const [key, value] of Object.entries(historyObject(p.models))) {
+    const model = historyObject(value)
+    bucket.models.set(key, {
+      ...model,
+      accountCalls: new Map(
+        Object.entries(historyObject(model.accountCalls)).map(([id, calls]) => [
+          Number(id),
+          Number(calls),
+        ]),
+      ),
+    } as unknown as ModelCounters)
+  }
+  bucket.routes = new Map(
+    Object.entries(historyObject(p.routes)),
+  ) as unknown as Map<string, RouteCounters>
+  bucket.accounts = new Map(
+    Object.entries(historyObject(p.accounts)).map(([id, counts]) => [
+      Number(id),
+      counts,
+    ]),
+  ) as unknown as Map<number, AccountCounters>
+  return bucket
+}
+
+export function enableDatabaseRoutingTelemetryForTest(): void {
+  testMode = false
+  modelDimensions.clear()
+  routeDimensions.clear()
+}
+
 export function isRoutingWindow(value: string): value is RoutingWindow {
   return Object.hasOwn(WINDOW_CONFIG, value)
 }
 
 export function resetRoutingTelemetryForTest(startedAt = Date.now()): void {
+  testMode = true
   buckets = new Map()
   lifetime = emptyTotals()
   telemetryStartedAt = startedAt

@@ -6,6 +6,13 @@ import { setConfigForTest } from "../src/lib/config"
 import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalModels = state.models
 const originalFetch = globalThis.fetch
@@ -46,43 +53,69 @@ afterEach(() => {
 })
 test("Google model resource names round-trip through detail and countTokens", async () => {
   state.models = { object: "list", data: [currentModel] }
-  const response = await server.request("/v1beta/models/gpt-current")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1beta/models/gpt-current", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   expect(response.status).toBe(200)
   const model = (await response.json()) as { name: string }
   expect(model.name).toBe("models/gpt-current")
-  const count = await server.request(`/v1beta/${model.name}:countTokens`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: "hello" }] }],
+  const count = await seedProtocolDatabase().then(() =>
+    server.request(`/v1beta/${model.name}:countTokens`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      }),
     }),
-  })
+  )
   expect(count.status).toBe(200)
   expect(await count.json()).toHaveProperty("totalTokens")
-  const generic = await server.request("/v1/models/gpt-current")
+  const generic = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models/gpt-current", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   expect(await generic.json()).toHaveProperty("name", "GPT Current")
 })
 
 test("Google collection names round-trip namespaced model identifiers", async () => {
   const rawId = "vendor/model-name"
   state.models = { object: "list", data: [{ ...currentModel, id: rawId }] }
-  const collection = await server.request("/v1beta/models")
+  const collection = await seedProtocolDatabase().then(() =>
+    server.request("/v1beta/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const listing = (await collection.json()) as {
     models: Array<{ name: string }>
     data: Array<{ id: string }>
   }
   expect(listing.data[0].id).toBe(rawId)
   const name = listing.models[0].name
-  const detail = await server.request(`/v1beta/${name}`)
+  const detail = await seedProtocolDatabase().then(() =>
+    server.request(`/v1beta/${name}`, {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   expect(detail.status).toBe(200)
   expect(await detail.json()).toHaveProperty("id", rawId)
-  const count = await server.request(`/v1beta/${name}:countTokens`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: "hello" }] }],
+  const count = await seedProtocolDatabase().then(() =>
+    server.request(`/v1beta/${name}:countTokens`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      }),
     }),
-  })
+  )
   expect(count.status).toBe(200)
 })
 
@@ -125,19 +158,25 @@ test("Google SDK namespaced custom model names reach the configured generation p
       }),
     )
   }) as typeof fetch
-  const collection = await server.request("/v1beta/models")
+  const collection = await seedProtocolDatabase().then(() =>
+    server.request("/v1beta/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const listing = (await collection.json()) as {
     models: Array<{ name: string }>
   }
-  const result = await server.request(
-    `/v1beta/${listing.models[0].name}:generateContent`,
-    {
+  const result = await seedProtocolDatabase().then(() =>
+    server.request(`/v1beta/${listing.models[0].name}:generateContent`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: "hello" }] }],
       }),
-    },
+    }),
   )
   expect(result.status).toBe(200)
   expect(sentModel).toBe("vendor/model-name")
@@ -157,7 +196,11 @@ test.each(["embedding", "embeddings"])(
         },
       ],
     }
-    const response = await server.request("/v1beta/models")
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1beta/models", {
+        headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+      }),
+    )
     expect(await response.json()).toMatchObject({
       models: [{ name: "models/gpt-current", supportedGenerationMethods: [] }],
     })
@@ -178,7 +221,11 @@ test("Google discovery exposes available limits without promising unadvertised i
       },
     ],
   }
-  const response = await server.request("/v1beta/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1beta/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   expect(await response.json()).toMatchObject({
     models: [
       {
@@ -193,20 +240,35 @@ test("Google discovery exposes available limits without promising unadvertised i
 test.each(["Copilot-Integration-Id", "Copilot-Harness-Id"])(
   "Copilot catalog preserves hidden utility models using %s",
   async (header) => {
-    const headers = { [header]: "copilot-developer-cli" }
-    const response = await server.request("/models", { headers })
+    const headers = {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      [header]: "copilot-developer-cli",
+    }
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/models", { headers }),
+    )
     const body = (await response.json()) as {
       data: Array<{ id: string; model_picker_enabled?: boolean }>
     }
     expect(body.data.find((model) => model.id === "gpt-5-mini")).toMatchObject({
       model_picker_enabled: false,
     })
-    const detail = await server.request("/models/gpt-5-mini", { headers })
+    const detail = await seedProtocolDatabase().then(() =>
+      server.request("/models/gpt-5-mini", { headers }),
+    )
     expect(detail.status).toBe(200)
     expect(await detail.json()).toMatchObject({
       id: "gpt-5-mini",
       model_picker_enabled: false,
     })
-    expect((await server.request("/models/gpt-5-mini")).status).toBe(404)
+    expect(
+      (
+        await seedProtocolDatabase().then(() =>
+          server.request("/models/gpt-5-mini", {
+            headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+          }),
+        )
+      ).status,
+    ).toBe(404)
   },
 )

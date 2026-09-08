@@ -44,10 +44,12 @@ function unauthorized(c: Context): Response {
   )
 }
 
-function authorize(c: Context): Response | null {
+async function authorize(c: Context): Promise<Response | null> {
   const credential = extractRequestCredential(c.req.raw)
   if (credential === null) return unauthorized(c)
-  return trustedJwtDigestStore.findEnabledCredential(credential) === null ?
+  return (
+      (await trustedJwtDigestStore.findEnabledCredential(credential)) === null
+    ) ?
       unauthorized(c)
     : null
 }
@@ -177,7 +179,7 @@ export function createCodexPluginServiceRoutes(
   const fetchImpl = dependencies.fetchImpl ?? globalThis.fetch
 
   routes.get("/plugins/home", async (c) => {
-    const authResponse = authorize(c)
+    const authResponse = await authorize(c)
     if (authResponse !== null) return authResponse
     const document = await loadPublicPluginDocument(
       c,
@@ -192,7 +194,7 @@ export function createCodexPluginServiceRoutes(
   })
 
   routes.get("/plugin-categories/:categorySlug/plugins", async (c) => {
-    const authResponse = authorize(c)
+    const authResponse = await authorize(c)
     if (authResponse !== null) return authResponse
     const categorySlug = c.req.param("categorySlug")
     if (!CATEGORY_SLUG_PATTERN.test(categorySlug)) return c.notFound()
@@ -220,23 +222,23 @@ export function createCodexPluginServiceRoutes(
     "/plugins/workspace/created",
     "/plugins/workspace/shared",
   ]) {
-    routes.get(path, (c) => {
-      const authResponse = authorize(c)
+    routes.get(path, async (c) => {
+      const authResponse = await authorize(c)
       if (authResponse !== null) return authResponse
       c.header("Cache-Control", "no-store")
       return c.json(EMPTY_PLUGIN_PAGE)
     })
   }
 
-  routes.get("/plugins/suggested/codex", (c) => {
-    const authResponse = authorize(c)
+  routes.get("/plugins/suggested/codex", async (c) => {
+    const authResponse = await authorize(c)
     if (authResponse !== null) return authResponse
     c.header("Cache-Control", "no-store")
     return c.json(EMPTY_RECOMMENDATIONS)
   })
 
   routes.get("/plugins/:pluginId", async (c) => {
-    const authResponse = authorize(c)
+    const authResponse = await authorize(c)
     if (authResponse !== null) return authResponse
     const pluginId = c.req.param("pluginId")
     if (!PLUGIN_ID_PATTERN.test(pluginId)) return c.notFound()

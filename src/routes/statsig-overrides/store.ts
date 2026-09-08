@@ -1,8 +1,5 @@
-import { randomUUID } from "node:crypto"
-import fs from "node:fs"
-import path from "node:path"
-
-import { PATHS } from "~/lib/paths"
+import { getLoadedSetting, updateSetting } from "~/lib/storage/domain-settings"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export type StatsigOverrideKind = "featureGate" | "dynamicConfig"
 export type StatsigJsonValue =
@@ -23,10 +20,13 @@ export interface StatsigOverrides {
 }
 
 export interface StatsigOverrideStore {
-  readonly filePath: string
   get(): StatsigOverrides
-  set(kind: StatsigOverrideKind, name: string, value: unknown): StatsigOverrides
-  remove(kind: StatsigOverrideKind, name: string): boolean
+  set(
+    kind: StatsigOverrideKind,
+    name: string,
+    value: unknown,
+  ): Promise<StatsigOverrides>
+  remove(kind: StatsigOverrideKind, name: string): Promise<boolean>
   count(): number
   replaceForTest(overrides: StatsigOverrides): void
   resetAfterTest(): void
@@ -215,7 +215,7 @@ function validateDynamicConfigs(
   return dynamicConfigs
 }
 
-function validateOverrides(value: unknown): StatsigOverrides {
+export function validateStatsigOverrides(value: unknown): StatsigOverrides {
   if (!isRecord(value)) {
     throw new StatsigOverrideValidationError(
       "statsig overrides must be an object",
@@ -228,148 +228,82 @@ function validateOverrides(value: unknown): StatsigOverrides {
   }
 }
 
-function isMissingFileError(error: unknown): boolean {
-  return (
-    typeof error === "object"
-    && error !== null
-    && "code" in error
-    && error.code === "ENOENT"
-  )
+function overridesFromValue(value: unknown): StatsigOverrides {
+  return value === undefined ?
+      createEmptyOverrides()
+    : validateStatsigOverrides(value)
 }
 
-function createTemporaryFilePath(filePath: string): string {
-  return path.join(
-    path.dirname(filePath),
-    `${path.basename(filePath)}.${randomUUID()}.tmp`,
-  )
-}
-
-function persistOverridesToDisk(
-  filePath: string,
-  overrides: StatsigOverrides,
-): void {
-  const nextFileContents = `${JSON.stringify(cloneOverrides(overrides), null, 2)}\n`
-  const temporaryFilePath = createTemporaryFilePath(filePath)
-
-  fs.mkdirSync(path.dirname(filePath), { recursive: true })
-
-  try {
-    fs.writeFileSync(temporaryFilePath, nextFileContents, "utf8")
-    fs.renameSync(temporaryFilePath, filePath)
-  } catch (error) {
-    try {
-      fs.rmSync(temporaryFilePath, { force: true })
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "failed to persist statsig overrides",
-      )
+export function createStatsigOverrideStore(): StatsigOverrideStore {
+  let testOverrides: StatsigOverrides | undefined
+  function getCurrent(): StatsigOverrides {
+    return cloneOverrides(
+      testOverrides
+        ?? overridesFromValue(getLoadedSetting("statsig_overrides")),
+    )
+  }
+  async function mutate(
+    update: (overrides: StatsigOverrides) => StatsigOverrides,
+  ): Promise<StatsigOverrides> {
+    if (testOverrides) {
+      testOverrides = update(cloneOverrides(testOverrides))
+      return cloneOverrides(testOverrides)
     }
-    throw error
+    return validateStatsigOverrides(
+      await updateSetting("statsig_overrides", (current) =>
+        normalizeSettingsJson(update(overridesFromValue(current))),
+      ),
+    )
   }
-}
-
-export function createStatsigOverrideStore(
-  filePath = PATHS.STATSIG_OVERRIDES_PATH,
-): StatsigOverrideStore {
-  let cachedOverrides: StatsigOverrides | null = null
-  let persistenceEnabled = true
-
-  function readFromDisk(): StatsigOverrides {
-    try {
-      const raw = fs.readFileSync(filePath)
-      return validateOverrides(JSON.parse(raw.toString("utf8")) as unknown)
-    } catch (error) {
-      if (isMissingFileError(error)) {
-        return createEmptyOverrides()
-      }
-      throw error
-    }
-  }
-
-  function getCachedOverrides(): StatsigOverrides {
-    cachedOverrides ??= readFromDisk()
-    return cachedOverrides
-  }
-
-  function persist(overrides: StatsigOverrides): void {
-    if (!persistenceEnabled) return
-
-    persistOverridesToDisk(filePath, overrides)
-  }
-
   return {
-    filePath,
-    get(): StatsigOverrides {
-      return cloneOverrides(getCachedOverrides())
-    },
-    set(
-      kind: StatsigOverrideKind,
-      name: string,
-      value: unknown,
-    ): StatsigOverrides {
-      const overrides = getCachedOverrides()
-      const nextOverrides = cloneOverrides(overrides)
+    get: getCurrent,
+    async set(kind, name, value) {
       const normalizedName = normalizeName(name)
-
-      if (kind === "featureGate") {
-        nextOverrides.featureGates[normalizedName] =
-          validateFeatureGateValue(value)
-      } else {
-        nextOverrides.dynamicConfigs[normalizedName] =
-          validateDynamicConfigValue(value)
-      }
-
-      persist(nextOverrides)
-      cachedOverrides = nextOverrides
-      return cloneOverrides(nextOverrides)
-    },
-    remove(kind: StatsigOverrideKind, name: string): boolean {
-      const overrides = getCachedOverrides()
-      const nextOverrides = cloneOverrides(overrides)
-      const normalizedName = normalizeName(name)
-      const bucket =
+      const normalizedValue =
         kind === "featureGate" ?
-          nextOverrides.featureGates
-        : nextOverrides.dynamicConfigs
-
-      if (!Object.hasOwn(bucket, normalizedName)) {
-        return false
-      }
-
-      if (kind === "featureGate") {
-        const { [normalizedName]: _removedFeatureGate, ...restFeatureGates } =
-          nextOverrides.featureGates
-        nextOverrides.featureGates = restFeatureGates
-      } else {
-        const {
-          [normalizedName]: _removedDynamicConfig,
-          ...restDynamicConfigs
-        } = nextOverrides.dynamicConfigs
-        nextOverrides.dynamicConfigs = restDynamicConfigs
-      }
-
-      persist(nextOverrides)
-      cachedOverrides = nextOverrides
-      return true
-    },
-    count(): number {
-      const overrides = getCachedOverrides()
-      return (
-        Object.keys(overrides.featureGates).length
-        + Object.keys(overrides.dynamicConfigs).length
+          validateFeatureGateValue(value)
+        : validateDynamicConfigValue(value)
+      return cloneOverrides(
+        await mutate((next) => {
+          if (typeof normalizedValue === "boolean")
+            next.featureGates[normalizedName] = normalizedValue
+          else next.dynamicConfigs[normalizedName] = normalizedValue
+          return next
+        }),
       )
     },
-    replaceForTest(overrides: StatsigOverrides): void {
-      cachedOverrides = validateOverrides(overrides)
-      persistenceEnabled = false
+    async remove(kind, name) {
+      const normalizedName = normalizeName(name)
+      let removed = false
+      await mutate((next) => {
+        const bucket =
+          kind === "featureGate" ? next.featureGates : next.dynamicConfigs
+        removed = Object.hasOwn(bucket, normalizedName)
+        if (kind === "featureGate") {
+          const { [normalizedName]: _removed, ...rest } = next.featureGates
+          next.featureGates = rest
+        } else {
+          const { [normalizedName]: _removed, ...rest } = next.dynamicConfigs
+          next.dynamicConfigs = rest
+        }
+        return next
+      })
+      return removed
     },
-    resetAfterTest(): void {
-      cachedOverrides = null
-      persistenceEnabled = true
+    count() {
+      const value = getCurrent()
+      return (
+        Object.keys(value.featureGates).length
+        + Object.keys(value.dynamicConfigs).length
+      )
+    },
+    replaceForTest(overrides) {
+      testOverrides = validateStatsigOverrides(overrides)
+    },
+    resetAfterTest() {
+      testOverrides = undefined
     },
   }
 }
 
-export const statsigOverrideStore: StatsigOverrideStore =
-  createStatsigOverrideStore()
+export const statsigOverrideStore = createStatsigOverrideStore()

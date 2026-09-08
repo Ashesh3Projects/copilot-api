@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- discovery fixture and route contracts stay together */
 import { afterAll, beforeEach, expect, mock, test } from "bun:test"
 
 import type { Model, ModelsResponse } from "../src/services/copilot/get-models"
@@ -10,6 +11,13 @@ import {
   modelRoutes,
 } from "../src/routes/models/route"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalModels = state.models
 const originalFetch = globalThis.fetch
@@ -18,7 +26,11 @@ test("serves model discovery at the Google v1beta collection route", async () =>
   state.models = { object: "list", data: [currentModel] }
   state.copilotToken = "copilot-token"
 
-  const response = await server.request("/v1beta/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1beta/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(await response.json()).toMatchObject({
@@ -133,7 +145,11 @@ interface ModelsRouteEntry {
 }
 
 async function getModelsRouteEntries(): Promise<Array<ModelsRouteEntry>> {
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const body = (await response.json()) as {
     data: Array<ModelsRouteEntry>
   }
@@ -366,7 +382,11 @@ afterAll(() => {
 })
 
 test("shows models unless picker metadata explicitly disables them without enabled policy", async () => {
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
 
   expect(response.status).toBe(200)
 
@@ -405,7 +425,11 @@ test("handles visible Copilot models without limits metadata", async () => {
     },
   })
 
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const body = (await response.json()) as {
     data: Array<{ id: string; supports_1m_context?: boolean }>
   }
@@ -426,7 +450,11 @@ test("uses model settings to hide virtual variants for implicit reasoning defaul
     },
   ])
 
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const body = (await response.json()) as {
     data: Array<{ id: string }>
   }
@@ -437,7 +465,11 @@ test("uses model settings to hide virtual variants for implicit reasoning defaul
 })
 
 test("advertises ws:/responses only for native Responses models", async () => {
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const body = (await response.json()) as {
     data: Array<{ id: string; supported_endpoints?: Array<string> }>
   }
@@ -511,7 +543,11 @@ test("isolates virtual model nested metadata from upstream model state", async (
 })
 
 test("preserves cumulative upstream model metadata", async () => {
-  const response = await server.request("/v1/models")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const body = (await response.json()) as {
     data: Array<Record<string, unknown>>
   }
@@ -535,11 +571,19 @@ test("preserves cumulative upstream model metadata", async () => {
 })
 
 test("serves the same normalized row from single-model discovery", async () => {
-  const list = await server.request("/v1/models")
+  const list = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const listBody = (await list.json()) as {
     data: Array<Record<string, unknown>>
   }
-  const single = await server.request("/v1/models/gpt-current")
+  const single = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models/gpt-current", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
 
   expect(single.status).toBe(200)
   expect(await single.json()).toEqual(
@@ -548,7 +592,11 @@ test("serves the same normalized row from single-model discovery", async () => {
 })
 
 test("keeps list and detail visibility consistent for omitted and explicit picker metadata", async () => {
-  const listResponse = await server.request("/v1/models")
+  const listResponse = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
   const listBody = (await listResponse.json()) as {
     data: Array<Record<string, unknown>>
   }
@@ -557,21 +605,49 @@ test("keeps list and detail visibility consistent for omitted and explicit picke
   )
   expect(implicit).toBeDefined()
 
-  const implicitDetail = await server.request(
-    "/v1/models/gpt-picker-implicit-visible",
+  const implicitDetail = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models/gpt-picker-implicit-visible", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
   )
   expect(implicitDetail.status).toBe(200)
   expect(await implicitDetail.json()).toEqual(implicit)
 
-  expect((await server.request("/v1/models/gpt-5.2")).status).toBe(200)
   expect(
-    (await server.request("/v1/models/claude-opus-4.7-1m-internal")).status,
+    (
+      await seedProtocolDatabase().then(() =>
+        server.request("/v1/models/gpt-5.2", {
+          headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+        }),
+      )
+    ).status,
+  ).toBe(200)
+  expect(
+    (
+      await seedProtocolDatabase().then(() =>
+        server.request("/v1/models/claude-opus-4.7-1m-internal", {
+          headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+        }),
+      )
+    ).status,
   ).toBe(404)
-  expect((await server.request("/v1/models/gpt-5-mini")).status).toBe(404)
+  expect(
+    (
+      await seedProtocolDatabase().then(() =>
+        server.request("/v1/models/gpt-5-mini", {
+          headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+        }),
+      )
+    ).status,
+  ).toBe(404)
 })
 
 test("returns a safe not-found error for an unknown single model", async () => {
-  const response = await server.request("/models/not-real")
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/models/not-real", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
+  )
 
   expect(response.status).toBe(404)
   expect(await response.json()).toEqual({

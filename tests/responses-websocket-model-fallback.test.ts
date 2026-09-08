@@ -16,6 +16,13 @@ import {
   tryUpgradeResponsesWebSocket,
 } from "~/routes/responses/websocket"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = {
   apiKeyAuth: state.apiKeyAuth,
@@ -450,20 +457,22 @@ test.each([400, 403])(
 
 async function createSocket(headers: Record<string, string> = {}) {
   let data: ResponsesWebSocketData | undefined
-  await tryUpgradeResponsesWebSocket(
-    new Request("http://localhost/responses", {
-      headers: {
-        authorization: "Bearer ws-client-secret",
-        "session-id": crypto.randomUUID(),
-        ...headers,
+  await seedProtocolDatabase().then(() =>
+    tryUpgradeResponsesWebSocket(
+      new Request("http://localhost/responses", {
+        headers: {
+          authorization: "Bearer ws-client-secret",
+          "session-id": crypto.randomUUID(),
+          ...headers,
+        },
+      }),
+      {
+        upgrade(_request, options) {
+          data = (options as { data: ResponsesWebSocketData }).data
+          return true
+        },
       },
-    }),
-    {
-      upgrade(_request, options) {
-        data = (options as { data: ResponsesWebSocketData }).data
-        return true
-      },
-    },
+    ),
   )
   if (!data) throw new Error("Expected authenticated WebSocket upgrade")
   const sent: Array<Record<string, unknown>> = []

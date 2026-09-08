@@ -43,9 +43,9 @@ beforeAll(() => {
   getAllAccountsSpy.mockReturnValue([account])
 })
 
-afterAll(() => {
+afterAll(async () => {
   getAllAccountsSpy.mockRestore()
-  resetTestAdminSession()
+  await resetTestAdminSession()
 })
 
 beforeEach(async () => {

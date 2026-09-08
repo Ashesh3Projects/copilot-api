@@ -14,6 +14,9 @@ import {
   translateResponsesResultToAnthropic,
 } from "../src/routes/messages/responses-translation"
 import { normalizeResponsesReasoning } from "../src/routes/responses/handler"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 test("keeps Anthropics max_tokens when translating to Responses payload", () => {
   const payload: AnthropicMessagesPayload = {

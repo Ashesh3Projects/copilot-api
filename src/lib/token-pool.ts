@@ -2,6 +2,7 @@ import consola from "consola"
 import { createHash } from "node:crypto"
 
 import type { Model, ModelsResponse } from "~/services/copilot/get-models"
+import type { ResolvedCopilotOAuth } from "~/services/github/resolve-copilot-oauth"
 
 import {
   DEFAULT_GITHUB_DOMAIN,
@@ -9,6 +10,7 @@ import {
   resolveCopilotApiBaseUrl,
 } from "~/lib/github-instance"
 import {
+  getLiveModelRoutingPolicy,
   hasModelRoutingOverride,
   isModelEnabledForAccount,
 } from "~/lib/model-routing"
@@ -30,6 +32,16 @@ export interface Account {
   modelsData: Array<Model>
   accountType: string
   healthy: boolean
+  enabled?: boolean
+  deleting?: boolean
+  credentialRevision?: number
+}
+
+export interface AccountLease {
+  account: Account
+  accountId: number
+  credentialRevision: number
+  release(): void
 }
 
 interface AddAccountOptions {
@@ -50,7 +62,10 @@ export function maskTokenForLog(token: string): string {
 // --- TokenPool ---
 
 export class TokenPool {
-  private accountReinitializations: Map<number, Promise<void>> = new Map()
+  private leases = new Map<number, number>()
+  private drains = new Map<number, Array<() => void>>()
+  private accountReinitializations: Map<string, Promise<ResolvedCopilotOAuth>> =
+    new Map()
   private accounts: Map<number, Account> = new Map()
   private modelIndex: Map<string, Array<Account>> = new Map()
   private readonly onModelsChanged: ModelsSnapshotListener | undefined
@@ -90,6 +105,64 @@ export class TokenPool {
     return account
   }
 
+  /** Publish only committed registry state; callers keep detached old snapshots. */
+  publishAccount(account: Account): void {
+    this.accounts.set(account.id, account)
+    this.rebuildModelIndex()
+    this.onModelsChanged?.(this.getAllModels())
+  }
+
+  deleteAccount(accountId: number): void {
+    this.accounts.delete(accountId)
+    this.rebuildModelIndex()
+    this.onModelsChanged?.(this.getAllModels())
+  }
+
+  acquireLease(account: Account): AccountLease | undefined {
+    const current = this.accounts.get(account.id)
+    if (
+      !current
+      || current.enabled === false
+      || current.deleting
+      || !current.healthy
+      || current.credentialRevision !== account.credentialRevision
+    )
+      return undefined
+    const snapshot = {
+      ...current,
+      models: new Set(current.models),
+      modelsData: structuredClone(current.modelsData),
+    }
+    this.leases.set(account.id, (this.leases.get(account.id) ?? 0) + 1)
+    let released = false
+    return {
+      account: snapshot,
+      accountId: account.id,
+      credentialRevision: current.credentialRevision ?? 0,
+      release: () => {
+        if (released) return
+        released = true
+        const count = (this.leases.get(account.id) ?? 1) - 1
+        if (count > 0) this.leases.set(account.id, count)
+        else {
+          this.leases.delete(account.id)
+          const callbacks = this.drains.get(account.id) ?? []
+          this.drains.delete(account.id)
+          for (const callback of callbacks) callback()
+        }
+      },
+    }
+  }
+
+  waitForDrain(accountId: number): Promise<void> {
+    if (!this.leases.has(accountId)) return Promise.resolve()
+    return new Promise((resolve) => {
+      const callbacks = this.drains.get(accountId) ?? []
+      callbacks.push(resolve)
+      this.drains.set(accountId, callbacks)
+    })
+  }
+
   /** Resolve a GitHub OAuth credential and fetch its available models. */
   async initializeAccount(account: Account, showToken = false): Promise<void> {
     await this.initializeOAuthAccount(account, false, showToken)
@@ -103,19 +176,35 @@ export class TokenPool {
     account: Account,
     showToken = false,
   ): Promise<void> {
-    const existing = this.accountReinitializations.get(account.id)
+    const credentialRevision = account.credentialRevision
+    const githubToken = account.githubToken
+    const instanceDomain = account.githubInstanceDomain
+    const stillMatches = () =>
+      account.credentialRevision === credentialRevision
+      && account.githubToken === githubToken
+      && account.githubInstanceDomain === instanceDomain
+    const key = `${account.id}:${account.credentialRevision ?? 0}:${createHash("sha256").update(account.githubToken).digest("hex")}`
+    const existing = this.accountReinitializations.get(key)
     if (existing) {
-      await existing
+      const resolved = await existing
+      if (stillMatches())
+        this.applyOAuthAccount(account, resolved, false, showToken)
       return
     }
 
-    const current = this.performAccountReinitialization(account, showToken)
-    this.accountReinitializations.set(account.id, current)
+    const current = resolveCopilotOAuth({
+      accountType: account.accountType,
+      githubToken: account.githubToken,
+      instanceDomain: account.githubInstanceDomain,
+    })
+    this.accountReinitializations.set(key, current)
     try {
-      await current
+      const resolved = await current
+      if (stillMatches())
+        this.applyOAuthAccount(account, resolved, true, showToken)
     } finally {
-      if (this.accountReinitializations.get(account.id) === current) {
-        this.accountReinitializations.delete(account.id)
+      if (this.accountReinitializations.get(key) === current) {
+        this.accountReinitializations.delete(key)
       }
     }
   }
@@ -125,12 +214,14 @@ export class TokenPool {
    */
   rebuildModelIndex(): void {
     this.modelIndex.clear()
+    let enabled: ReturnType<typeof getLiveModelRoutingPolicy> | undefined
 
     for (const account of this.accounts.values()) {
-      if (!account.healthy) continue
+      if (!this.isSelectable(account)) continue
 
       for (const modelId of account.models) {
-        if (!isModelEnabledForAccount(modelId, account.id)) continue
+        enabled ??= getLiveModelRoutingPolicy()
+        if (!enabled(modelId, account.id)) continue
 
         let list = this.modelIndex.get(modelId)
         if (!list) {
@@ -212,7 +303,9 @@ export class TokenPool {
    * session-to-account mapping.
    */
   getHealthyAccountBySession(clientSessionId?: string): Account | undefined {
-    const healthy = this.getAllAccounts().filter((account) => account.healthy)
+    const healthy = this.getAllAccounts().filter((account) =>
+      this.isSelectable(account),
+    )
     return this.selectAccountBySession(healthy, clientSessionId)
   }
 
@@ -227,7 +320,7 @@ export class TokenPool {
     clientSessionId?: string,
   ): Account | undefined {
     const advertising = this.getAllAccounts().filter(
-      (account) => account.healthy && account.models.has(modelId),
+      (account) => this.isSelectable(account) && account.models.has(modelId),
     )
     return this.selectAccountBySession(advertising, clientSessionId)
   }
@@ -237,6 +330,13 @@ export class TokenPool {
    */
   markUnhealthy(account: Account): void {
     account.healthy = false
+    const current = this.accounts.get(account.id)
+    if (
+      current
+      && current.githubToken === account.githubToken
+      && current.credentialRevision === account.credentialRevision
+    )
+      current.healthy = false
     consola.warn(`Account #${account.id} marked unhealthy`)
     this.rebuildModelIndex()
   }
@@ -250,7 +350,7 @@ export class TokenPool {
     const mergedData: Array<Model> = []
 
     for (const account of this.accounts.values()) {
-      if (!account.healthy) continue
+      if (!this.isSelectable(account)) continue
 
       for (const model of account.modelsData) {
         if (!seen.has(model.id)) {
@@ -275,6 +375,18 @@ export class TokenPool {
       account.copilotApiBaseUrl,
       account.accountType,
     )
+  }
+
+  publishRecoveredBaseUrl(snapshot: Account, baseUrl: string): void {
+    snapshot.copilotApiBaseUrl = baseUrl
+    const current = this.accounts.get(snapshot.id)
+    if (
+      current
+      && current.githubToken === snapshot.githubToken
+      && current.credentialRevision === snapshot.credentialRevision
+    ) {
+      current.copilotApiBaseUrl = baseUrl
+    }
   }
 
   /** Clear pending account reinitializations. */
@@ -339,13 +451,13 @@ export class TokenPool {
 
   getHealthyAccountIds(): Array<number> {
     return this.getAllAccounts()
-      .filter((account) => account.healthy)
+      .filter((account) => this.isSelectable(account))
       .map((account) => account.id)
       .sort((left, right) => left - right)
   }
 
   getFirstHealthyAccount(): Account | undefined {
-    return this.getAllAccounts().find((account) => account.healthy)
+    return this.getAllAccounts().find((account) => this.isSelectable(account))
   }
 
   hasKnownModel(modelId: string): boolean {
@@ -393,7 +505,10 @@ export class TokenPool {
           models.set(model.id, entry)
         }
 
-        const enabled = isModelEnabledForAccount(model.id, account.id)
+        const enabled =
+          account.enabled !== false
+          && !account.deleting
+          && isModelEnabledForAccount(model.id, account.id)
         entry.accounts.push({
           accountId: account.id,
           accountType: account.accountType,
@@ -411,6 +526,10 @@ export class TokenPool {
 
   // --- Private helpers ---
 
+  private isSelectable(account: Account): boolean {
+    return account.healthy && account.enabled !== false && !account.deleting
+  }
+
   private rendezvousScore(affinityKey: string, accountId: number): string {
     return createHash("sha256")
       .update(`${affinityKey}\0${accountId}`)
@@ -425,13 +544,6 @@ export class TokenPool {
     return count
   }
 
-  private async performAccountReinitialization(
-    account: Account,
-    showToken: boolean,
-  ): Promise<void> {
-    await this.initializeOAuthAccount(account, true, showToken)
-  }
-
   private async initializeOAuthAccount(
     account: Account,
     publishModels = false,
@@ -442,7 +554,17 @@ export class TokenPool {
       githubToken: account.githubToken,
       instanceDomain: account.githubInstanceDomain,
     })
-    const modelsData = resolved.models.data
+    this.applyOAuthAccount(account, resolved, publishModels, showToken)
+  }
+
+  // eslint-disable-next-line max-params -- Every waiting snapshot applies shared discovery with caller publication/logging policy.
+  private applyOAuthAccount(
+    account: Account,
+    resolved: ResolvedCopilotOAuth,
+    publishModels: boolean,
+    showToken: boolean,
+  ): void {
+    const modelsData = structuredClone(resolved.models.data)
 
     // Commit only after both control-plane requests succeed.
 
@@ -456,6 +578,22 @@ export class TokenPool {
       models: new Set(modelsData.map((model) => model.id)),
       modelsData,
     })
+
+    // Request snapshots may refresh after disable/remove/reconnect. Only update
+    // the still-current credential and preserve registry eligibility controls.
+    const current = this.accounts.get(account.id)
+    if (
+      current
+      && current !== account
+      && current.githubToken === account.githubToken
+      && current.credentialRevision === account.credentialRevision
+    ) {
+      Object.assign(current, {
+        ...account,
+        enabled: current.enabled,
+        deleting: current.deleting,
+      })
+    }
 
     this.rebuildModelIndex()
     if (publishModels) this.onModelsChanged?.(this.getAllModels())

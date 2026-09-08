@@ -1,5 +1,5 @@
-/* eslint-disable max-lines -- Google route variants share one upstream transport harness */
 import * as Sentry from "@sentry/bun"
+/* eslint-disable max-lines -- Google route variants share one upstream transport harness */
 import {
   afterAll,
   beforeAll,
@@ -24,12 +24,20 @@ import {
   listLlmDebugLogs,
 } from "../src/lib/llm-debug-log"
 import { setModelRedirectsForTest } from "../src/lib/model-redirect"
-import { getRoutingTelemetrySnapshot } from "../src/lib/routing-telemetry"
+import {
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
+  resetRoutingTelemetryForTest,
+} from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
 import { tokenPool } from "../src/lib/token-pool"
 import { getUsageResponse, resetUsageForTest } from "../src/lib/usage-tracker"
 import { selectGoogleUpstreamEndpoint } from "../src/routes/google-ai/handler"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
 
 const originalFetch = globalThis.fetch
 const originalGatewayKey = state.apiKeyAuth
@@ -329,6 +337,8 @@ const fetchMock = mock((url: string, init?: RequestInit) => {
   })
 })
 
+useProtocolDatabase()
+
 beforeAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch =
     fetchMock as unknown as typeof fetch
@@ -341,6 +351,7 @@ afterAll(() => {
 })
 
 beforeEach(() => {
+  resetRoutingTelemetryForTest()
   setIpAllowlistForTest([])
   fetchMock.mockClear()
   lastResponsesPayload = undefined
@@ -370,7 +381,7 @@ test.each(["/v1beta/models", "/v1/models", "/models"] as const)(
   "authenticates Google generation with a query credential on %s",
   async (prefix) => {
     state.apiKeyAuth = "google-gateway-key"
-    const response = await server.request(
+    const response = await protocolRequest(
       `${prefix}/gpt-4o-mini:generateContent?key=google-gateway-key`,
       {
         method: "POST",
@@ -402,7 +413,7 @@ test("applies redirect verbosity to Google generation routed through Responses",
     },
   ])
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -424,7 +435,7 @@ test("accepts equal Google credentials and rejects ambiguous credentials before 
   const body = JSON.stringify({
     contents: [{ role: "user", parts: [{ text: "Hello" }] }],
   })
-  const equal = await server.request(path, {
+  const equal = await protocolRequest(path, {
     method: "POST",
     headers: {
       authorization: "Bearer google-gateway-key",
@@ -439,7 +450,7 @@ test("accepts equal Google credentials and rejects ambiguous credentials before 
   expect(fetchMock).toHaveBeenCalledTimes(1)
 
   fetchMock.mockClear()
-  const ambiguous = await server.request(path, {
+  const ambiguous = await protocolRequest(path, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -466,7 +477,7 @@ test("treats invalid Google query credentials as supplied attempts without leaki
   const consoleWarn = spyOn(consola, "warn")
   try {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await server.request(
+      const response = await protocolRequest(
         `/v1/models/gpt-4o-mini:generateContent?key=${privateKey}`,
         {
           method: "POST",
@@ -495,7 +506,7 @@ test("does not use query credentials outside exact Google actions", async () => 
     "/v1/responses?key=google-gateway-key",
     "/v1/models/gpt-4o-mini:futureAction?key=google-gateway-key",
   ]) {
-    const response = await server.request(pathname, {
+    const response = await protocolRequest(pathname, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -510,7 +521,7 @@ test("does not use query credentials outside exact Google actions", async () => 
 
 test("authenticates countTokens with a query credential without inference dispatch", async () => {
   state.apiKeyAuth = "google-gateway-key"
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/gpt-4o-mini:countTokens?key=google-gateway-key",
     {
       method: "POST",
@@ -551,7 +562,7 @@ test.each(["/v1beta/models", "/v1/models", "/models"] as const)(
     )
 
     try {
-      const response = await server.request(
+      const response = await protocolRequest(
         `${prefix}/${privateModel}:${privateAction}?key=mounted-query-secret&alt=json`,
         {
           method: "POST",
@@ -605,9 +616,9 @@ test("keeps a multi-account Google model internal while ordinary routing diagnos
   account.modelsData = [model]
   account.healthy = true
   tokenPool.rebuildModelIndex()
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetUsageForTest()
-  const usageBefore = getUsageResponse().lifetime as {
+  const usageBefore = (await getUsageResponse()).lifetime as {
     total_input_tokens: number
     total_output_tokens: number
     total_requests: number
@@ -632,7 +643,7 @@ test("keeps a multi-account Google model internal while ordinary routing diagnos
   consola.addReporter(sentryReporter)
 
   try {
-    const response = await server.request(
+    const response = await protocolRequest(
       `/v1/models/${privateModel}:${privateAction}`,
       {
         method: "POST",
@@ -655,8 +666,10 @@ test("keeps a multi-account Google model internal while ordinary routing diagnos
     expect(lastHeaders?.Authorization).toBe(
       "Bearer multi-private-google-copilot-token",
     )
-    const debugEntries = listLlmDebugLogs().entries
-    const debugDetails = debugEntries.map((entry) => getLlmDebugLog(entry.id))
+    const debugEntries = (await listLlmDebugLogs()).entries
+    const debugDetails = await Promise.all(
+      debugEntries.map((entry) => getLlmDebugLog(entry.id)),
+    )
     expect(
       debugDetails.some(
         (entry) =>
@@ -671,7 +684,7 @@ test("keeps a multi-account Google model internal while ordinary routing diagnos
       telemetry.accounts.find((entry) => entry.accountId === accountId)
         ?.selected,
     ).toBeGreaterThan(0)
-    const usageAfter = getUsageResponse().lifetime as {
+    const usageAfter = (await getUsageResponse()).lifetime as {
       total_input_tokens: number
       total_output_tokens: number
       total_requests: number
@@ -695,7 +708,7 @@ test("keeps a multi-account Google model internal while ordinary routing diagnos
     consola.level = originalConsolaLevel
     tokenPool.removeAccountForTest(accountId)
     state.isMultiToken = false
-    clearLlmDebugLogs()
+    await clearLlmDebugLogs()
     resetUsageForTest()
   }
 })
@@ -728,7 +741,7 @@ test("keeps Google non-default diagnostics free of route-derived models", async 
   )
 
   try {
-    const response = await server.request(
+    const response = await protocolRequest(
       `/v1/models/${sourceModel}:generateContent`,
       {
         method: "POST",
@@ -768,7 +781,7 @@ test("preserves non-Google diagnostic paths while redacting query credentials", 
   )
 
   try {
-    const response = await server.request(
+    const response = await protocolRequest(
       "/health?api_key=non-google-query-secret&alt=json",
     )
     const diagnostics = JSON.stringify([
@@ -789,7 +802,7 @@ test("preserves non-Google diagnostic paths while redacting query credentials", 
 })
 
 test("adds reasoning defaults on the Google AI responses path", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -837,7 +850,7 @@ test.each([
 ])(
   "rejects unsupported Google action $label without parsing or forwarding",
   async ({ message, path }) => {
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "not-json",
@@ -933,7 +946,10 @@ test.each(["/v1beta/models", "/v1/models", "/models"] as const)(
         `http://localhost${prefix}/${privateModel}:${privateAction}/?alt=sse`,
         {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer " + PROTOCOL_GATEWAY_KEY,
+          },
           body: privateBody,
         },
       )
@@ -945,6 +961,7 @@ test.each(["/v1beta/models", "/v1/models", "/models"] as const)(
           throw new Error("debug logger read an unsupported Google body")
         },
       })
+      await seedProtocolDatabase()
       const response = await server.fetch(request)
 
       expect([400, 404]).toContain(response.status)
@@ -986,7 +1003,7 @@ test.each(["/v1beta/models", "/v1/models", "/models"] as const)(
     )
     state.apiKeyAuth = "gateway-key"
     try {
-      const response = await server.request(
+      const response = await protocolRequest(
         `${prefix}/${privateModel}:${privateAction}/?alt=sse`,
         {
           method: "POST",
@@ -1075,7 +1092,7 @@ test("mounted Google routes match the exported routing contract", async () => {
       : [...routingCase.endpoints]
     state.models = { object: "list", data: [model] }
 
-    const response = await server.request(
+    const response = await protocolRequest(
       "/v1/models/route-model:generateContent",
       {
         method: "POST",
@@ -1116,7 +1133,7 @@ test.each([
     model.supported_endpoints = ["/v1/messages"]
     state.models = { object: "list", data: [model] }
 
-    const response = await server.request(
+    const response = await protocolRequest(
       `/v1/models/route-model:streamGenerateContent${suffix}`,
       {
         method: "POST",
@@ -1171,7 +1188,7 @@ test("emits one Google failure after partial Chat output ends without a terminal
     ],
   })}\n\ndata: [DONE]\n\n`
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/chat-stream-model:streamGenerateContent",
     {
       method: "POST",
@@ -1223,7 +1240,7 @@ test("stops after the first valid Chat terminal and ignores trailing malformed d
     "",
   ].join("\n\n")
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/chat-terminal-model:streamGenerateContent?alt=sse",
     {
       method: "POST",
@@ -1268,7 +1285,7 @@ test("Google Responses stream preserves call IDs from output items for next-turn
   ]
     .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
     .join("")
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/gpt-4o-mini:streamGenerateContent",
     {
       method: "POST",
@@ -1284,7 +1301,7 @@ test("Google Responses stream preserves call IDs from output items for next-turn
   expect(events[0].candidates[0].content.parts).toEqual([
     { functionCall: { id: "call_lookup", name: "lookup", args: { key: "A" } } },
   ])
-  const next = await server.request(
+  const next = await protocolRequest(
     "/v1beta/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -1331,7 +1348,7 @@ test.each(["/chat/completions", "/responses", "/v1/messages"])(
       },
       required: ["nullable"],
     }
-    const response = await server.request(
+    const response = await protocolRequest(
       "/v1beta/models/gpt-4o-mini:generateContent",
       {
         method: "POST",
@@ -1410,7 +1427,7 @@ test("maps Responses failed to one received Google failure and stops", async () 
     "",
   ].join("\n\n")
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:streamGenerateContent",
     {
       method: "POST",
@@ -1461,7 +1478,7 @@ test.each([
     ).mockImplementation(() => "event-id")
 
     try {
-      const response = await server.request(
+      const response = await protocolRequest(
         `/v1/models/chat-http-error-model:streamGenerateContent${suffix}`,
         {
           method: "POST",
@@ -1525,7 +1542,7 @@ test("wraps an exact binary late Chat HTTP body with the fixed local message", a
     }),
   )
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/chat-binary-error-model:streamGenerateContent",
     {
       method: "POST",
@@ -1567,7 +1584,7 @@ test("turns a non-empty malformed Chat frame into one local terminal failure", a
   state.models = { object: "list", data: [model] }
   chatStreamBody = "data: {not-json\n\n"
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/chat-malformed-model:streamGenerateContent",
     {
       method: "POST",
@@ -1630,7 +1647,7 @@ test("preserves a native Messages received failure as one Google terminal", asyn
     "",
   ].join("\n\n")
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/messages-error-model:streamGenerateContent",
     {
       method: "POST",
@@ -1675,7 +1692,7 @@ test.each([
     model.supported_endpoints = [...endpoints]
     state.models = { object: "list", data: [model] }
 
-    const response = await server.request(
+    const response = await protocolRequest(
       "/v1/models/route-model:generateContent",
       {
         method: "POST",
@@ -1708,7 +1725,7 @@ test.each([
 test.each(["/v1beta/models", "/v1/models", "/models"])(
   "supports Google countTokens locally on %s",
   async (prefix) => {
-    const response = await server.request(
+    const response = await protocolRequest(
       `${prefix}/gpt-4o-mini:countTokens?alt=sse`,
       {
         method: "POST",
@@ -1731,7 +1748,7 @@ test("performs no attachment I/O when no endpoint is advertised", async () => {
   model.id = "no-route-file-model"
   model.supported_endpoints = []
   state.models = { object: "list", data: [model] }
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/no-route-file-model:generateContent",
     {
       method: "POST",
@@ -1759,7 +1776,7 @@ test("performs no attachment I/O when no endpoint is advertised", async () => {
 
 test("estimates countTokens for an unknown model without inference dispatch", async () => {
   state.models = { object: "list", data: [] }
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/future-custom-model:countTokens",
     {
       method: "POST",
@@ -1778,7 +1795,7 @@ test("estimates countTokens for an unknown model without inference dispatch", as
 test.each(["/v1beta/models", "/v1/models", "/models"])(
   "returns a fixed invalid JSON error on %s",
   async (prefix) => {
-    const response = await server.request(
+    const response = await protocolRequest(
       `${prefix}/gpt-4o-mini:generateContent`,
       {
         method: "POST",
@@ -1805,7 +1822,7 @@ test("dispatches Google PDF content when the model advertises only Chat", async 
   model.supported_endpoints = ["/chat/completions"]
   state.models = { object: "list", data: [model] }
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/route-model:generateContent",
     {
       method: "POST",
@@ -1839,7 +1856,7 @@ test("rejects Google requests when the model advertises no compatible endpoint",
   model.supported_endpoints = []
   state.models = { object: "list", data: [model] }
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/route-model:generateContent",
     {
       method: "POST",
@@ -1900,7 +1917,7 @@ test("uses the advertised Messages endpoint despite advisory loss", () => {
 })
 
 test("routes Google googleSearch through Copilot native Responses web search", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -1920,7 +1937,7 @@ test("routes Google googleSearch through Copilot native Responses web search", a
 })
 
 test("forwards Google maxOutputTokens above the advertised model limit", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -1942,7 +1959,7 @@ test("forwards Google maxOutputTokens above the advertised model limit", async (
 })
 
 test("adds prompt caching markers on the Google AI responses path", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -2007,7 +2024,7 @@ test("adds prompt caching markers on the Google AI responses path", async () => 
 })
 
 test("detects vision and initiator headers on the Google AI responses path", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -2072,7 +2089,7 @@ test("threads typed native options through the Google PDF Messages path", async 
     })
   })
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/claude-native:generateContent",
     {
       method: "POST",
@@ -2153,7 +2170,7 @@ test("keeps the requested Google model in a redirected native response", async (
     }),
   )
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/claude-source:generateContent",
     {
       method: "POST",
@@ -2184,7 +2201,7 @@ test("keeps the requested Google model in a redirected native response", async (
 })
 
 test("accepts unknown Google root request fields with meaningful content", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -2202,7 +2219,7 @@ test("accepts unknown Google root request fields with meaningful content", async
 })
 
 test("treats unsupported Google code execution as advisory", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1/models/gpt-4o-mini:generateContent",
     {
       method: "POST",
@@ -2224,7 +2241,7 @@ const requestGoogleStream = async (
   suffix = "",
   tools?: Array<Record<string, unknown>>,
 ): Promise<Response> =>
-  await server.request(`/v1/models/${model}:streamGenerateContent${suffix}`, {
+  await protocolRequest(`/v1/models/${model}:streamGenerateContent${suffix}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2443,3 +2460,30 @@ test.each([
     }
   },
 )
+
+async function protocolRequest(
+  input: Parameters<typeof server.request>[0],
+  init?: RequestInit,
+) {
+  await seedProtocolDatabase({
+    gatewayKeys: [
+      PROTOCOL_GATEWAY_KEY,
+      "mounted-query-secret",
+      ...(state.apiKeyAuth ? [state.apiKeyAuth] : []),
+    ],
+  })
+  const headers = new Headers(init?.headers)
+  const requestUrl = new URL(
+    input instanceof Request ? input.url : String(input),
+    "http://localhost",
+  )
+  if (
+    !state.apiKeyAuth
+    && !requestUrl.searchParams.has("key")
+    && !headers.has("authorization")
+    && !headers.has("x-api-key")
+    && !headers.has("x-goog-api-key")
+  )
+    headers.set("authorization", "Bearer " + PROTOCOL_GATEWAY_KEY)
+  return server.request(input, { ...init, headers })
+}
