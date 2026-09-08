@@ -65,6 +65,8 @@ test("Docker Compose preserves automatic secret-management integration", async (
   expect(copilotApi.env_file).toEqual([{ path: ".env", required: false }])
   expect(environment).toContain("OP_TOKEN=${OP_TOKEN:-}")
   expect(environment).toContain("OP_ENV_ID=${OP_ENV_ID:-}")
+  expect(environment).toContain("TURSO_DATABASE_URL")
+  expect(environment).toContain("TURSO_AUTH_TOKEN")
 })
 
 test("deployment defaults remain portable and omit obsolete setup guidance", async () => {
