@@ -299,3 +299,118 @@ test.each([
   expect(await count(storage)).toBe(0)
   expect(await getStoreRevision(storage)).toBe(0)
 })
+
+test("a different mutation recovers after the prior committed marker becomes readable", async () => {
+  const storage = await fixture()
+  let unavailable = false
+  let first = true
+  const injected = faultStorage(storage, {
+    afterCommit: () => {
+      if (first) {
+        first = false
+        unavailable = true
+        throw new StorageCommitUnknownError()
+      }
+    },
+    beforeRead: () => {
+      if (unavailable) throw new StorageUnavailableError()
+    },
+  })
+  await expect(
+    runMutation(injected, context("uncertain"), increment),
+  ).rejects.toMatchObject({ operationId: "uncertain" })
+  unavailable = false
+  expect(await runMutation(injected, context("new", 1), increment)).toEqual({
+    value: { id: "counter-1" },
+    revision: 2,
+  })
+  expect(await count(storage)).toBe(2)
+  expect(await runMutation(injected, context("uncertain"), increment)).toEqual({
+    value: { id: "counter-1" },
+    revision: 1,
+  })
+  expect(await count(storage)).toBe(2)
+})
+
+test("recovery of an older receipt does not bypass the new mutation revision or identity", async () => {
+  const storage = await fixture()
+  let unavailable = false
+  const injected = faultStorage(storage, {
+    afterCommit: () => {
+      unavailable = true
+      throw new StorageCommitUnknownError()
+    },
+    beforeRead: () => {
+      if (unavailable) throw new StorageUnavailableError()
+    },
+  })
+  await expect(
+    runMutation(injected, context("uncertain"), increment),
+  ).rejects.toThrow()
+  unavailable = false
+  await expect(
+    runMutation(injected, context("stale", 0), increment),
+  ).rejects.toBeInstanceOf(StorageConflictError)
+  await expect(
+    runMutation(
+      injected,
+      { ...context("uncertain"), actorId: "wrong-actor" },
+      increment,
+    ),
+  ).rejects.toBeInstanceOf(StorageConflictError)
+  expect(await count(storage)).toBe(1)
+})
+
+test("parallel receipt reconciliation cannot erase a newer uncertain mutation", async () => {
+  const storage = await fixture()
+  const events = {
+    failReads: false,
+    delayReceipt: false,
+    waiting: Promise.withResolvers<undefined>(),
+    release: Promise.withResolvers<undefined>(),
+    lost: false,
+  }
+  const injected: Storage = {
+    read: async (work) => {
+      if (events.failReads) throw new StorageUnavailableError()
+      if (events.delayReceipt) {
+        events.delayReceipt = false
+        const value = await storage.read(work)
+        events.waiting.resolve(undefined)
+        await events.release.promise
+        return value
+      }
+      return storage.read(work)
+    },
+    transaction: async (work) => {
+      const value = await storage.transaction(work)
+      if (!events.lost) {
+        events.lost = true
+        events.failReads = true
+        throw new StorageCommitUnknownError()
+      }
+      return value
+    },
+    atomicBatch: (statements) => storage.atomicBatch(statements),
+    close: () => Promise.resolve(),
+  }
+  await expect(
+    runMutation(injected, context("old"), increment),
+  ).rejects.toThrow()
+  events.failReads = false
+  events.delayReceipt = true
+  const { readCommittedMutation } = await import("~/lib/storage/operations")
+  const staleLookup = readCommittedMutation(injected, context("old"))
+  await events.waiting.promise
+  // eslint-disable-next-line require-atomic-updates -- Explicit barrier schedules the next injected commit response loss.
+  events.lost = false
+  await expect(
+    runMutation(injected, context("new", 1), increment),
+  ).rejects.toMatchObject({ operationId: "new" })
+  events.release.resolve(undefined)
+  expect((await staleLookup)?.revision).toBe(1)
+  await expect(
+    runMutation(injected, context("next", 2), increment),
+  ).rejects.toMatchObject({ operationId: "new" })
+  expect(await count(storage)).toBe(2)
+})

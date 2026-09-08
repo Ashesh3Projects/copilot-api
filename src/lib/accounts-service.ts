@@ -149,17 +149,23 @@ export class AccountsService {
   async list(): Promise<
     ReadonlyArray<AccountRecord & { healthy: boolean; modelCount: number }>
   > {
+    return (await this.listWithRevision()).accounts
+  }
+
+  async listWithRevision() {
     await this.refreshRuntime()
     const runtime = new Map(
       this.pool.getAllAccounts().map((account) => [account.id, account]),
     )
-    return (await this.repository.list())
+    const page = await this.repository.listWithRevision()
+    const accounts = page.accounts
       .filter((record) => record.removedAt === null)
       .map((record) => ({
         ...record,
         healthy: runtime.get(record.id)?.healthy ?? false,
         modelCount: runtime.get(record.id)?.models.size ?? 0,
       }))
+    return { revision: page.revision, accounts }
   }
 
   async create(

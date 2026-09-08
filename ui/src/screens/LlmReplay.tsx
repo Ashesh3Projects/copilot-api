@@ -19,6 +19,10 @@ import { ResponseInspector } from "../components/ResponseInspector"
 import { CopyIcon, PlayIcon, RefreshCwIcon } from "../icons"
 import { ApiError, get, post } from "../lib/api"
 import {
+  canEditReplayCapture,
+  hasReplacementReplayBody,
+} from "../lib/capture-state"
+import {
   formatJsonDocument,
   prepareReplayDocument,
   validateReplayDocument,
@@ -139,7 +143,14 @@ function LlmReplayView({ id }: { id: string }) {
     [deferredBody],
   )
   const validationPending = deferredBody !== body
-  const canRun = validation.ok && !validationPending && !isRunning
+  const replacementReady =
+    data?.replayable === true || hasReplacementReplayBody(originalBody, body)
+  const canRun =
+    validation.ok
+    && !validationPending
+    && !isRunning
+    && replacementReady
+    && Boolean(data && canEditReplayCapture(data))
   const diagnostic =
     validationPending || validation.ok ? null : validation.diagnostic
   const dirty = body !== originalBody
@@ -180,6 +191,7 @@ function LlmReplayView({ id }: { id: string }) {
   }
 
   async function runReplay(): Promise<void> {
+    if (!canRun || !sourceReady) return
     const currentValidation = validateReplayDocument(body)
     if (!currentValidation.ok) {
       setReplayError(currentValidation.diagnostic.message)
@@ -284,6 +296,13 @@ function LlmReplayView({ id }: { id: string }) {
 
       {data ?
         <VStack gap={4}>
+          {!data.replayable ?
+            <Banner
+              status="warning"
+              title="Supply a replacement request"
+              description="The captured body was redacted, omitted, or interrupted. Review the full request, replace any redacted values, and edit it before running a replay."
+            />
+          : null}
           <HStack
             className="replay-header"
             gap={3}

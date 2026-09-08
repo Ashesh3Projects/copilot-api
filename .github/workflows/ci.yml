@@ -33,6 +33,8 @@ jobs:
         run: bun run lint:all
       - name: Run type check
         run: bun run typecheck
+      - name: Run dashboard type check
+        run: npm run typecheck --prefix ui
       - name: Build dashboard UI
         run: bun run build:ui
       - name: Run unit tests

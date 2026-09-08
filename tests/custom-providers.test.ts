@@ -228,6 +228,7 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
+  globalThis.fetch = fetchMock as unknown as typeof fetch
   tokenPool.removeAccountForTest(customFastCollisionAccountId)
   fetchMock.mockClear()
   requests = []
@@ -988,6 +989,8 @@ test("custom Google stream supports JSON-array mode with public identity", async
 })
 
 test("custom Google web-search continuations stay on the provider", async () => {
+  const providerFetch = globalThis.fetch
+  globalThis.fetch = withSyntheticMcp(providerFetch)
   const toolCall = (id: string, query: string) => ({
     id,
     object: "chat.completion",
@@ -1072,6 +1075,8 @@ test("custom Google web-search continuations stay on the provider", async () => 
 })
 
 test("custom provider web-search continuations never switch to Copilot", async () => {
+  const providerFetch = globalThis.fetch
+  globalThis.fetch = withSyntheticMcp(providerFetch)
   const assistantToolCall = {
     id: "chatcmpl-search",
     object: "chat.completion",
@@ -2767,4 +2772,26 @@ async function protocolRequest(
   )
     headers.set("authorization", "Bearer " + PROTOCOL_GATEWAY_KEY)
   return server.request(input, { ...init, headers })
+}
+
+function withSyntheticMcp(providerFetch: typeof fetch): typeof fetch {
+  return ((input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : input)
+    if (url.pathname !== "/mcp/readonly") return providerFetch(input, init)
+    if (typeof init?.body !== "string")
+      throw new Error("Expected MCP JSON body")
+    const body = JSON.parse(init.body) as { method?: string }
+    return Promise.resolve(
+      body.method === "initialize" ?
+        Response.json(
+          { jsonrpc: "2.0", id: "fixture", result: {} },
+          { headers: { "Mcp-Session-Id": "fixture-mcp" } },
+        )
+      : Response.json({
+          jsonrpc: "2.0",
+          id: "fixture",
+          result: { content: [{ type: "text", text: "Fixture web result" }] },
+        }),
+    )
+  }) as typeof fetch
 }

@@ -1,5 +1,6 @@
 import type { MiddlewareHandler } from "hono"
 
+import { withAccountLeases } from "~/lib/account-lease-context"
 import { getAccountsService } from "~/lib/accounts-service"
 import { forwardError } from "~/lib/error"
 import { withRequestSnapshot } from "~/lib/storage/request-snapshot"
@@ -20,7 +21,14 @@ export const storageAdmission: MiddlewareHandler = async (context, next) => {
   try {
     await runtime.snapshot.refreshIfChanged()
     await getAccountsService().refreshRuntime()
-    await withRequestSnapshot(runtime.snapshot.get(), next)
+    const result = await withRequestSnapshot(runtime.snapshot.get(), () =>
+      withAccountLeases(context.req.raw.signal, async () => {
+        await next()
+        return { response: context.res }
+      }),
+    )
+    // eslint-disable-next-line require-atomic-updates -- Hono gives this middleware exclusive response ownership after next() settles.
+    context.res = result.response
   } catch (error) {
     return await forwardError(context, error)
   }

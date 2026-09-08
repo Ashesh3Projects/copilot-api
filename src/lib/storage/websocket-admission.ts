@@ -11,12 +11,13 @@ export type WebSocketAdmission =
 /** Recheck original connection authority for every new inference turn. */
 export async function admitWebSocketTurn(
   request: Request,
+  requiredScopes: ReadonlyArray<string> = ["user:inference"],
 ): Promise<WebSocketAdmission> {
   try {
     const runtime = getStorageRuntime()
     await runtime.snapshot.refreshIfChanged()
     await getAccountsService().refreshRuntime()
-    if (!(await resolveRequestCredential(request, ["user:inference"]))) {
+    if (!(await resolveRequestCredential(request, requiredScopes))) {
       return { status: "unauthorized" }
     }
     return { status: "authorized", snapshot: runtime.snapshot.get() }

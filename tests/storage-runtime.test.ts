@@ -195,10 +195,11 @@ test("another repository's unknown commit cannot enqueue a rejected settings wri
   await expect(
     runMutation(db.storage, context, () => Promise.resolve({ id: "policy-1" })),
   ).rejects.toThrow()
-  db.restoreReads()
   await expect(
     writeSetting("feature_flags", { rejected: true }),
   ).rejects.toThrow()
+  // The attempted setting was rejected while the prior outcome was unreadable.
+  db.restoreReads()
   const recovered = await runMutation(db.storage, context, () => {
     throw new Error("A committed operation must never replay its callback")
   })

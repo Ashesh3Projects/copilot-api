@@ -163,10 +163,7 @@ export function createDashboardAccountRoutes(
   })
   routes.get("/", async (c) => {
     const accounts = options.accounts()
-    return c.json({
-      accounts: await accounts.list(),
-      revision: await getStoreRevision(accounts.repository.storage),
-    })
+    return c.json(await accounts.listWithRevision())
   })
   routes.post("/", async (c) => {
     const accounts = options.accounts()

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { Hono } from "hono"
 import path from "node:path"
 
@@ -31,6 +31,7 @@ const { withStorageDeadline } = await import(
   "../src/lib/storage/operation-budget"
 )
 const { forwardError } = await import("../src/lib/error")
+const { LocalSqliteStorage } = await import("../src/lib/storage/local-sqlite")
 
 let fixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
 let accounts: InstanceType<typeof AccountsService>
@@ -126,6 +127,65 @@ function request(
     : { body: JSON.stringify(options.body) }),
   })
 }
+
+test("account page revision stays paired with its rows when another connection edits", async () => {
+  const created = await request("/accounts", {
+    method: "POST",
+    body: { token: "first-token", label: "original" },
+  })
+  const { account } = (await created.json()) as { account: { id: number } }
+  const peer = new LocalSqliteStorage(fixture.config.path)
+  const originalRead = fixture.storage.read.bind(fixture.storage)
+  let changed = false
+  const read = spyOn(fixture.storage, "read").mockImplementation((work) =>
+    originalRead((session) =>
+      work({
+        execute: (statement) => session.execute(statement),
+        query: async (statement) => {
+          const rows = await session.query(statement)
+          if (
+            !changed
+            && statement.sql === "SELECT * FROM capi_accounts ORDER BY id"
+          ) {
+            changed = true
+            await peer.transaction(async (other) => {
+              await other.execute({
+                sql: "UPDATE capi_accounts SET label='concurrent' WHERE id=?",
+                args: [account.id],
+              })
+              await other.execute({
+                sql: "UPDATE capi_metadata SET value=CAST(value AS INTEGER)+1 WHERE key='config_revision'",
+                args: [],
+              })
+            })
+          }
+          return rows
+        },
+      }),
+    ),
+  )
+  try {
+    const listed = await request("/accounts")
+    const page = (await listed.json()) as {
+      accounts: Array<{ label: string }>
+      revision: number
+    }
+    expect(changed).toBe(true)
+    expect(page.accounts[0].label).toBe("original")
+    const update = await request(`/accounts/${account.id}`, {
+      method: "PATCH",
+      body: { label: "stale editor" },
+      headers: { "If-Match": String(page.revision) },
+    })
+    expect(update.status).toBe(409)
+    expect((await accounts.repository.get(account.id)).record.label).toBe(
+      "concurrent",
+    )
+  } finally {
+    read.mockRestore()
+    await peer.close()
+  }
+})
 
 test("account routes enforce real admin session and CSRF", async () => {
   expect((await app.request("/accounts")).status).toBe(401)

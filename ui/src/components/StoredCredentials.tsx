@@ -7,6 +7,7 @@ import { TextInput } from "@astryxdesign/core/TextInput"
 import { useState } from "react"
 
 import { del, get, post, put } from "../lib/api"
+import { gatewayCreationFeedback } from "../lib/gateway-creation"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
 import { ConfirmButton } from "./common"
@@ -30,6 +31,7 @@ export function StoredCredentials() {
   const toast = useToast()
   const [label, setLabel] = useState("")
   const [created, setCreated] = useState<string>()
+  const [lostKey, setLostKey] = useState<{ id: string; label: string }>()
   const [groq, setGroq] = useState("")
   const [busy, setBusy] = useState(false)
   async function run(work: () => Promise<void>) {
@@ -41,6 +43,7 @@ export function StoredCredentials() {
       toast.error(
         caught instanceof Error ? caught.message : "Credential update failed",
       )
+      reload()
     } finally {
       setBusy(false)
     }
@@ -74,16 +77,40 @@ export function StoredCredentials() {
               isDisabled={busy || !label.trim()}
               onClick={() =>
                 void run(async () => {
-                  const result = await post<{ credential?: string }>(
-                    `${root}/gateway`,
-                    { label },
-                  )
-                  setCreated(result.credential)
+                  const result = await post<{
+                    id: string
+                    label: string
+                    credential?: string
+                  }>(`${root}/gateway`, { label })
+                  const feedback = gatewayCreationFeedback(result)
+                  setCreated(feedback.credential)
+                  if (feedback.lost) setLostKey(feedback.lost)
                   setLabel("")
                 })
               }
             />
           </HStack>
+          {lostKey ?
+            <Banner
+              status="warning"
+              title="The key was created, but its value was not received"
+              description={`The value for "${lostKey.label}" cannot be recovered. Create and save a replacement, then revoke this unused key. Existing clients are unchanged.`}
+              endContent={
+                <ConfirmButton
+                  label="Revoke unused key"
+                  confirmTitle="Revoke the key whose value was lost"
+                  confirmDescription="Only this newly created key is revoked. Keep at least one other active gateway key."
+                  onConfirm={() =>
+                    run(async () => {
+                      await del(`${root}/gateway/${lostKey.id}`)
+                      setLostKey(undefined)
+                      toast.success("Unused key revoked")
+                    })
+                  }
+                />
+              }
+            />
+          : null}
           {created ?
             <VStack gap={2}>
               <Banner

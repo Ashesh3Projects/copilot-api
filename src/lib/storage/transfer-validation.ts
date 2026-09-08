@@ -56,12 +56,35 @@ export function validateTransferSetting(
     namespace === "app"
     && value
     && typeof value === "object"
-    && ("auth" in value || "customProviders" in value || "groqApiKey" in value)
+    && hasLegacyCredentialValues(value)
   )
     throw new StorageSchemaError(
       "Transferred credentials must use their dedicated tables",
     )
 }
+
+/** Early database defaults carried empty legacy fields; they confer no authority. */
+function hasLegacyCredentialValues(value: object): boolean {
+  if ("auth" in value) {
+    const auth = value.auth
+    if (
+      !auth
+      || typeof auth !== "object"
+      || Array.isArray(auth)
+      || Object.keys(auth).some((key) => key !== "apiKeys")
+      || ("apiKeys" in auth
+        && (!Array.isArray(auth.apiKeys) || auth.apiKeys.length > 0))
+    )
+      return true
+  }
+  return (
+    ("customProviders" in value
+      && (!Array.isArray(value.customProviders)
+        || value.customProviders.length > 0))
+    || ("groqApiKey" in value && value.groqApiKey !== "")
+  )
+}
+
 export async function validateTransferDomains(
   session: SqlSession,
 ): Promise<void> {

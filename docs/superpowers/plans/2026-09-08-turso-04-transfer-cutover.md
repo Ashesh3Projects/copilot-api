@@ -118,7 +118,7 @@ Wire format v1:
 - Header is AES-GCM AAD; derive 32-byte key with scrypt N=32768,r=8,p=1,maxmem=64 MiB; reject any unsupported version before key derivation.
 - One AES-256-GCM encrypted stream, final 16-byte auth tag. Decryptor holds only the last 16 ciphertext bytes while streaming.
 - Plaintext consists of UTF-8 NDJSON logical records with an authenticated final manifest. Each record has monotonic sequence, fixed table kind, key and value. Terminal manifest contains exact record counts and SHA-256 of preceding record bytes; reject duplicate key, missing/reordered sequence or missing terminal record.
-- A decoded record is at most 8 MiB. Fields larger than that are encoded as ordered bounded continuation records for a named allowlisted field, with original length/checksum; no application setting/request limit is imposed by transfer framing. Limit frame allocation before parsing.
+- A decoded frame is at most 8 MiB. Logical fields larger than that are encoded as ordered bounded continuation records for a named allowlisted field, with original length/checksum; no application setting/request limit is imposed by transfer framing. Limit frame allocation before parsing.
 - Transfer deadline 30 minutes, cancelable, individual database calls remain 10 seconds. No unbounded memory history snapshot and no local staging.
 - Per-table record ordering and continuation kinds are fixed in transfer-records.ts; reject unrecognized kinds instead of executing input SQL.
 

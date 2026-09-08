@@ -21,7 +21,15 @@ import { initSentry } from "./lib/sentry"
 import { generateEnvScript } from "./lib/shell"
 import { installShutdown } from "./lib/shutdown"
 import { state } from "./lib/state"
-import { initializeStorageRuntime } from "./lib/storage/runtime"
+import {
+  StorageUnavailableError,
+  StorageCommitUnknownError,
+  StorageSchemaError,
+} from "./lib/storage/errors"
+import {
+  initializeStorageRuntime,
+  peekStorageRuntime,
+} from "./lib/storage/runtime"
 import { createHistoryRuntime } from "./lib/telemetry-writer"
 import { tokenPool } from "./lib/token-pool"
 import { isDirectConnectEnabled } from "./routes/direct-connect/route"
@@ -167,6 +175,37 @@ interface StartFetchServer {
 // Upgrade dispatch covers four independently secured WebSocket protocols.
 
 export async function handleStartFetch(
+  req: Request,
+  bunServer: StartFetchServer,
+): Promise<Response> {
+  try {
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const runtime = peekStorageRuntime()
+      if (runtime) await runtime.snapshot.refreshIfChanged()
+    }
+    return await dispatchStartFetch(req, bunServer)
+  } catch (error) {
+    if (
+      error instanceof StorageUnavailableError
+      || error instanceof StorageCommitUnknownError
+      || error instanceof StorageSchemaError
+    ) {
+      return Response.json(
+        {
+          error: {
+            code: "storage_unavailable",
+            message: "Database storage is temporarily unavailable.",
+            type: "server_error",
+          },
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      )
+    }
+    throw error
+  }
+}
+
+async function dispatchStartFetch(
   req: Request,
   bunServer: StartFetchServer,
 ): Promise<Response> {

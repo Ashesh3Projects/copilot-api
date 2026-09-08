@@ -177,6 +177,13 @@ concurrent writes can grow the WAL while that snapshot prevents checkpointing
 past the reader. Allow disk headroom and schedule large backups during quieter
 write periods; do not remove the WAL to reclaim space during a transfer.
 
+Backup frames are capped at 8 MiB and database pages/batches are byte-bounded.
+Large individual logical fields use continuation frames so existing settings are not
+truncated or made unrestorable. The current database drivers and decoder still
+materialize a single logical row/field; memory therefore scales with the largest
+individual value, not just the frame size. Only restore trusted operator backups
+with sufficient memory. This is not a blanket 8 MiB logical-record limit.
+
 Keep the password and backup protected. Do not pass the password in a command
 argument or environment variable; neither is supported. Preserve binary output
 when using shell redirection, especially with older Windows shells.
@@ -193,12 +200,16 @@ Restore preserves account IDs and client credential state while invalidating
 administrator sessions. Active bridge jobs, sockets, and connection-local
 conversation state do not become resumable through backup/restore.
 
-An interrupted import or restore leaves an incomplete-transfer marker that
+An interrupted import or definitely rolled-back restore leaves an incomplete-transfer marker that
 blocks readiness. To abandon only that transfer, use its exact reported ID:
 
 ```sh
 bun src/main.ts storage discard-incomplete --restore-id EXACT_TRANSFER_ID
 ```
+
+If the final commit outcome cannot be confirmed, restore reports `storage_commit_unknown`
+with its operation ID instead of claiming rollback. A matching committed receipt
+allows automatic reconciliation; do not discard or serve an unverified replacement.
 
 This command is restricted to records owned by that incomplete empty-target
 transfer. Retain the source and backup, then preview/apply or restore again.

@@ -28,3 +28,16 @@ test("blank secrets retain stored values, explicit clearing never sends replacem
     }),
   ).toEqual({ apiKey: "new" })
 })
+
+test("provider editing keeps the originally loaded revision through background list refreshes", async () => {
+  const source = await Bun.file(
+    new URL("../ui/src/screens/CustomProviders.tsx", import.meta.url),
+  ).text()
+  expect(source).toContain("setFormRevision(page?.revision)")
+  expect(source).toMatch(
+    /api\("POST", "\/dashboard\/api\/custom-providers", payload, \{\s*expectedRevision: formRevision/,
+  )
+  expect(source).toContain(
+    "if (caught instanceof ApiError && caught.status === 409) closeForm()",
+  )
+})

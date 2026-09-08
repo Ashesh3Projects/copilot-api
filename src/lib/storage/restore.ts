@@ -15,9 +15,13 @@ import {
   BACKUP_VERSION,
   deriveBackupKey,
 } from "~/lib/config-backup"
-import { StorageSchemaError } from "~/lib/storage/errors"
+import {
+  StorageCommitUnknownError,
+  StorageSchemaError,
+} from "~/lib/storage/errors"
 import { parseStorageCounter } from "~/lib/storage/migrations"
 import { initialTables } from "~/lib/storage/migrations/001-initial"
+import { readStoreRevision } from "~/lib/storage/operations"
 import {
   assertEmptyTransferTarget,
   insertTransferRecords,
@@ -357,6 +361,56 @@ async function requireMarker(
     throw new StorageSchemaError("Transfer ownership changed")
 }
 
+interface RestoreCompletion {
+  operationId: string
+  inputDigest: string
+  resultJson: string
+}
+
+async function recordRestoreCompletion(
+  session: SqlSession,
+  completion: RestoreCompletion,
+): Promise<void> {
+  await session.execute({
+    sql: "INSERT INTO capi_applied_operations (id,kind,actor_id,input_digest,committed_revision,result_json,created_at) VALUES (?,'restore.complete','owner:restore',?,?,?,?)",
+    args: [
+      completion.operationId,
+      completion.inputDigest,
+      await readStoreRevision(session),
+      completion.resultJson,
+      Date.now(),
+    ],
+  })
+}
+
+async function reconcileRestoreCompletion(
+  target: Storage,
+  completion: RestoreCompletion,
+): Promise<boolean> {
+  try {
+    return await target.read(async (session) => {
+      const rows = await session.query({
+        sql: "SELECT kind,actor_id,input_digest,committed_revision,result_json FROM capi_applied_operations WHERE id=?",
+        args: [completion.operationId],
+      })
+      const row = rows[0]
+      return (
+        rows.length === 1
+        && row.kind === "restore.complete"
+        && row.actor_id === "owner:restore"
+        && row.input_digest === completion.inputDigest
+        && typeof row.committed_revision === "number"
+        && Number.isSafeInteger(row.committed_revision)
+        && row.committed_revision >= 0
+        && row.result_json === completion.resultJson
+      )
+    })
+  } catch {
+    // An unavailable or conflicting receipt proves neither success nor rollback.
+    return false
+  }
+}
+
 /** This database was empty when its marker was committed; every transferred row belongs to that marker. */
 export async function discardIncompleteTransfer(
   target: Storage,
@@ -402,6 +456,8 @@ export async function restoreBackup(
   signal?: AbortSignal,
 ): Promise<TransferProgress> {
   const operationId = randomUUID()
+  let markerCommitted = false
+  let completion: RestoreCompletion | undefined
   const cancellation = new AbortController()
   const timeout = setTimeout(() => cancellation.abort(), TRANSFER_TIMEOUT_MS)
   const operationSignal =
@@ -422,6 +478,7 @@ export async function restoreBackup(
         args: [TRANSFER_MARKER, operationId],
       })
     })
+    markerCommitted = true
     const decoder = new RecordDecoder(target, operationId, operationSignal)
     let header = Buffer.alloc(0)
     let tail = Buffer.alloc(0)
@@ -464,6 +521,7 @@ export async function restoreBackup(
       operationSignal.throwIfAborted()
       await requireMarker(session, operationId)
       await validateTransferredState(session)
+      operationSignal.throwIfAborted()
       const store = await session.query({
         sql: "SELECT value FROM capi_metadata WHERE key='store_id'",
         args: [],
@@ -482,20 +540,43 @@ export async function restoreBackup(
         })
         if (rows[0]?.count !== count) invalid()
       }
+      operationSignal.throwIfAborted()
       await session.execute({
         sql: "DELETE FROM capi_admin_sessions",
         args: [],
       })
       await session.execute({ sql: "DELETE FROM capi_setup_codes", args: [] })
+      operationSignal.throwIfAborted()
       await session.execute({
         sql: "DELETE FROM capi_metadata WHERE key=? AND value=?",
         args: [TRANSFER_MARKER, operationId],
       })
+      operationSignal.throwIfAborted()
+      const receipt = {
+        operationId,
+        inputDigest: sha256(JSON.stringify(decoder.manifest)),
+        resultJson: JSON.stringify({ records: decoder.records }),
+      }
+      await recordRestoreCompletion(session, receipt)
+      operationSignal.throwIfAborted()
+      completion = receipt
     })
     return { operationId, phase: "complete", records: decoder.records }
-  } catch {
+  } catch (error) {
+    if (error instanceof StorageCommitUnknownError) {
+      if (completion && (await reconcileRestoreCompletion(target, completion)))
+        return {
+          operationId,
+          phase: "complete",
+          records: (JSON.parse(completion.resultJson) as { records: number })
+            .records,
+        }
+      throw new StorageCommitUnknownError(operationId)
+    }
     throw new StorageSchemaError(
-      `Encrypted restore failed; replacement remains incomplete (restore ID ${operationId})`,
+      markerCommitted ?
+        `Encrypted restore failed; replacement remains incomplete (restore ID ${operationId})`
+      : `Encrypted restore failed before replacement initialization (restore ID ${operationId})`,
     )
   } finally {
     clearTimeout(timeout)

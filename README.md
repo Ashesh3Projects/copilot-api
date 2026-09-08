@@ -22,6 +22,12 @@ workflows.
 > respect upstream service policies, and do not use this project to evade
 > upstream restrictions.
 
+> [!IMPORTANT]
+> **Upgrading to 4.0.0:** durable state now lives in SQLite (default) or optional Turso.
+> Existing JSON files and credential environment variables are not loaded automatically.
+> Keep the old data, import explicitly into an empty replacement database, verify it,
+> and only then switch the serving deployment. See the [migration runbook](docs/turso-storage.md#explicit-legacy-import).
+
 ## Contents
 
 - [Compatibility](#compatibility)

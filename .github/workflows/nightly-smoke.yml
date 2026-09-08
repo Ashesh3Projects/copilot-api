@@ -14,6 +14,9 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      DATA_DIR: ${{ github.workspace }}/.superpowers/test-data/nightly
+      NPM_CONFIG_REGISTRY: https://packagefeedproxy.microsoft.io/npm/
 
     steps:
       - uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f # v6
@@ -29,42 +32,47 @@ jobs:
       - name: Install dependencies & build
         run: bun install --frozen-lockfile && bun run build
 
-      - name: Start copilot-api
+      - name: Prepare isolated database and start copilot-api
         run: |
-          bun run dist/main.js start -g "$GH_TOKEN" --host 0.0.0.0 --debug \
-            > tests/smoke/server.log 2>&1 &
-          echo "Waiting for server..."
+          set -euo pipefail
+          SMOKE_GATEWAY_KEY=$(bun -e 'process.stdout.write(crypto.randomUUID() + crypto.randomUUID())')
+          echo "::add-mask::$SMOKE_GATEWAY_KEY"
+          echo "SMOKE_GATEWAY_KEY=$SMOKE_GATEWAY_KEY" >> "$GITHUB_ENV"
+          export SMOKE_GATEWAY_KEY
+          bun tests/smoke/prepare-database.ts
+          bun run dist/main.js start --host 127.0.0.1 > tests/smoke/server.log 2>&1 &
+          pid=$!
+          echo "Waiting for database and model readiness..."
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:4141/v1/models > /dev/null 2>&1; then
-              echo "Server is up (models loaded)"
-              break
+            if curl -sf http://localhost:4141/health/ready > /dev/null \
+              && curl -sf -H "Authorization: Bearer $SMOKE_GATEWAY_KEY" http://localhost:4141/v1/models \
+                | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin)["data"] else 1)'; then
+              echo "Server is up (database and models ready)"
+              exit 0
             fi
-            echo "  attempt $i/30..."
+            kill -0 "$pid" || exit 1
             sleep 3
           done
-          # Print available models for debugging
-          echo "--- Available models ---"
-          curl -sf http://localhost:4141/v1/models | python3 -c "import sys,json; [print(f'  {m[\"id\"]}') for m in json.load(sys.stdin)['data']]" || true
+          echo "::error::Smoke server failed readiness checks."
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
       - name: Install CLI tools
         run: |
-          npm i -g @anthropic-ai/claude-code@latest &
-          npm i -g @openai/codex@latest &
-          npm i -g @google/gemini-cli@latest &
-          wait
+          npm i -g @anthropic-ai/claude-code@latest
+          npm i -g @openai/codex@latest
+          npm i -g @google/gemini-cli@latest
           echo "--- Installed versions ---"
-          claude --version || echo "claude not found"
-          codex --version || echo "codex not found"
-          gemini --version || echo "gemini not found"
+          claude --version
+          codex --version
+          gemini --version
 
       - name: Run smoke tests
+        env:
+          SMOKE_REQUIRE_CLIENTS: "1"
         run: |
           chmod +x tests/smoke/run-smoke-tests.sh
           tests/smoke/run-smoke-tests.sh http://localhost:4141
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
       - name: Print server logs
         if: always()

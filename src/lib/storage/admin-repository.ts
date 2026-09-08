@@ -223,6 +223,23 @@ function sessionRecord(row: Record<string, unknown>): AdminSessionRecord {
   }
 }
 
+async function isReservedGateway(
+  session: SqlSession,
+  gatewayDigest: string,
+  gatewayLiteral: string,
+): Promise<boolean> {
+  const base64 = Buffer.from(gatewayDigest, "hex").toString("base64url")
+  const literal =
+    /^[a-f\d]{64}$/i.test(gatewayLiteral) ?
+      gatewayLiteral.toLowerCase()
+    : gatewayLiteral
+  const reserved = await session.query({
+    sql: "SELECT digest FROM capi_inference_credentials WHERE digest IN (?, ?, ?) UNION ALL SELECT digest FROM capi_gateway_credentials WHERE digest = ? LIMIT 1",
+    args: [gatewayDigest, base64, literal, literal],
+  })
+  return reserved.length > 0
+}
+
 // eslint-disable-next-line max-lines-per-function -- related transaction operations share one explicit storage dependency
 export function createAdminRepository(storage: Storage) {
   return {
@@ -256,6 +273,7 @@ export function createAdminRepository(storage: Storage) {
     async setup(input: {
       codeDigest: string
       passwordHash: string
+      gatewayLiteral: string
       gateway: { id: string; digest: string; label: string; createdAt: number }
       session: AdminSessionRecord
     }): Promise<"ok" | "configured" | "invalid"> {
@@ -264,6 +282,14 @@ export function createAdminRepository(storage: Storage) {
         { kind: "setup", actor: input.codeDigest, input },
         async (session) => {
           if (await readAdmin(session)) return "configured"
+          if (
+            await isReservedGateway(
+              session,
+              input.gateway.digest,
+              input.gatewayLiteral,
+            )
+          )
+            return "invalid"
           const consumed = await session.execute({
             sql: "UPDATE capi_setup_codes SET consumed_at = ? WHERE digest = ? AND expires_at > ? AND consumed_at IS NULL AND invalidated_at IS NULL",
             args: [
@@ -315,18 +341,14 @@ export function createAdminRepository(storage: Storage) {
             args: [input.gatewayDigest],
           })
           if (gateway.length === 0) return false
-          const base64 = Buffer.from(input.gatewayDigest, "hex").toString(
-            "base64url",
+          if (
+            await isReservedGateway(
+              session,
+              input.gatewayDigest,
+              input.gatewayLiteral,
+            )
           )
-          const literal =
-            /^[a-f\d]{64}$/i.test(input.gatewayLiteral) ?
-              input.gatewayLiteral.toLowerCase()
-            : input.gatewayLiteral
-          const reserved = await session.query({
-            sql: "SELECT digest FROM capi_inference_credentials WHERE digest IN (?, ?, ?) UNION ALL SELECT digest FROM capi_gateway_credentials WHERE digest = ? LIMIT 1",
-            args: [input.gatewayDigest, base64, literal, literal],
-          })
-          if (reserved.length > 0) return false
+            return false
           await session.execute({
             sql: "DELETE FROM capi_admin_sessions WHERE expires_at <= ? OR session_version <> ?",
             args: [input.session.createdAt, current.sessionVersion],

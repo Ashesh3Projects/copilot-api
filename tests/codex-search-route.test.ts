@@ -69,9 +69,13 @@ beforeEach(async () => {
   resetWebSearchSessionsForTest()
   state.accountType = "individual"
   state.apiKeyAuth = undefined
-  state.githubToken = "github-token"
+  state.githubToken = undefined
+  state.copilotToken = undefined
   state.isMultiToken = false
-  await seedProtocolDatabase()
+  const account = tokenPool.addAccount("github-token", "individual", 0)
+  account.copilotToken = "copilot-token"
+  account.healthy = true
+  await seedProtocolDatabase({ singleAccount: false })
 })
 
 test("serves Codex Desktop standalone web search through Copilot MCP", async () => {

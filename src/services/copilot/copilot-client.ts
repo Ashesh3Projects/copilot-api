@@ -808,7 +808,8 @@ export async function copilotFetch(
         path,
         requestInit,
         url,
-        accountId: telemetryState.telemetry?.accountId,
+        accountId:
+          telemetryState.telemetry?.accountId ?? getActiveAccount()?.id,
       })
 
       const transportInit = createCopilotTransportInit({

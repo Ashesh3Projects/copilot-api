@@ -226,9 +226,10 @@ export async function readCommittedMutation<T>(
   return withStorageDeadline(Date.now() + 30_000, async () => {
     const state = states.get(storage)
     if (state?.pending) {
-      if (state.pending.operationId !== context.operationId)
-        throw new StorageCommitUnknownError(state.pending.operationId)
-      return reconcile<T>(storage, context, state)
+      if (state.pending.operationId === context.operationId)
+        return reconcile<T>(storage, context, state)
+      // Confirm the older operation using its saved identity, without replaying it.
+      await reconcile(storage, state.pending, state)
     }
     return storage.read((session) => findOperation<T>(session, context))
   })
@@ -239,13 +240,15 @@ async function reconcile<T>(
   context: MutationContext,
   state: MutationState,
 ): Promise<Committed<T>> {
+  const pending = state.pending
   try {
     assertBudgetRemaining()
     const result = await storage.read((session) =>
       findOperation<T>(session, context),
     )
     if (result) {
-      state.pending = undefined
+      // A concurrent lookup must not clear a newer mutation's unknown outcome.
+      if (state.pending === pending) state.pending = undefined
       return result
     }
   } catch (error) {
@@ -261,10 +264,10 @@ async function executeMutation<T>(
 ): Promise<Committed<T>> {
   const { context, state } = mutation
   if (state.pending) {
-    if (state.pending.operationId !== context.operationId) {
-      throw new StorageCommitUnknownError(state.pending.operationId)
-    }
-    return reconcile(storage, context, state)
+    if (state.pending.operationId === context.operationId)
+      return reconcile(storage, context, state)
+    // Clients may reload after an outage instead of resubmitting the old ID.
+    await reconcile(storage, state.pending, state)
   }
   for (let attempt = 0; ; attempt++) {
     try {

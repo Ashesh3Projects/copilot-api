@@ -162,6 +162,7 @@ async function seedSource(storage: Storage) {
     await admin.setup({
       codeDigest: "fixture-setup-digest",
       passwordHash,
+      gatewayLiteral: "fixture-gateway-transfer-secret",
       gateway: {
         id: "transfer-gateway",
         digest: credentialDigest("fixture-gateway-transfer-secret"),

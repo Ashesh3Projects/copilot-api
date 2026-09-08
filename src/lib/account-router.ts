@@ -13,7 +13,10 @@ import type { Model } from "~/services/copilot/get-models"
 import type { RetryBudget } from "~/services/copilot/transport-retry"
 
 import {
+  getActiveAccount,
+  getTurnAccount,
   leaseAccount,
+  retainTurnAccount,
   unavailableAccount,
   withAccountLeases,
   withActiveAccount,
@@ -39,6 +42,7 @@ import {
   type UpstreamSendReason,
 } from "~/lib/routing-telemetry"
 import { state } from "~/lib/state"
+import { getRequestSnapshot } from "~/lib/storage/request-snapshot"
 import { peekStorageRuntime } from "~/lib/storage/runtime"
 import { tokenPool } from "~/lib/token-pool"
 import { copilotFetch, copilotHeaders } from "~/services/copilot/copilot-client"
@@ -659,9 +663,12 @@ async function singleTokenRoutedFetch(options: {
   shouldRecordSelection: boolean
 }): Promise<RoutedFetchResult> {
   const { context, modelId, shouldRecordSelection } = options
+  const account = getActiveAccount()
+  if (account) setLastUsedRoutedAccountId(account.id)
   if (shouldRecordSelection) {
     recordRoutingSelection({
-      eligibleAccountIds: [],
+      ...(account ? { accountId: account.id } : {}),
+      eligibleAccountIds: account ? [account.id] : [],
       mode: "single",
       model: modelId,
     })
@@ -673,13 +680,14 @@ async function singleTokenRoutedFetch(options: {
       maxHttpRetryDelaySeconds: context.maxHttpRetryDelaySeconds,
       retryBudget: context.retryBudget,
       telemetry: copilotTelemetry({
+        accountId: account?.id,
         model: modelId,
         path: context.path,
         reason: context.reason,
       }),
     },
   )
-  return { response, account: undefined }
+  return { response, account }
 }
 
 function createNoControlPlaneAccountResult(): RoutedControlPlaneFetchResult {
@@ -728,7 +736,7 @@ export async function routedControlPlaneFetch(
   options: RoutedControlPlaneFetchOptions,
 ): Promise<RoutedControlPlaneFetchResult> {
   if (peekStorageRuntime()) {
-    await getAccountsService().refreshRuntime()
+    if (!getRequestSnapshot()) await getAccountsService().refreshRuntime()
     return await withAccountLeases(options.signal, () =>
       routedControlPlaneFetchInner(options),
     )
@@ -736,6 +744,7 @@ export async function routedControlPlaneFetch(
   return await routedControlPlaneFetchInner(options)
 }
 
+// eslint-disable-next-line max-lines-per-function -- Preserve the single-account and pooled control-plane continuity branches together.
 async function routedControlPlaneFetchInner(
   options: RoutedControlPlaneFetchOptions,
 ): Promise<RoutedControlPlaneFetchResult> {
@@ -749,6 +758,7 @@ async function routedControlPlaneFetchInner(
       const selected = tokenPool.getFirstHealthyAccount()
       if (!selected) return createNoControlPlaneAccountResult()
       const account = leaseAccount(selected)
+      setLastUsedRoutedAccountId(account.id)
       return await withActiveAccount(account, async () => {
         const response = await copilotFetch(
           options.path,
@@ -866,10 +876,16 @@ export async function routedFetch(
   init: RequestInit | undefined,
   options: RoutedFetchOptions,
 ): Promise<{ response: Response; account: Account | undefined }> {
-  if (peekStorageRuntime()) await getAccountsService().refreshRuntime()
-  const result = await withAccountLeases(init?.signal, () =>
-    routedFetchInner(path, init, options),
-  )
+  if (peekStorageRuntime() && !getRequestSnapshot())
+    await getAccountsService().refreshRuntime()
+  const result = await withAccountLeases(init?.signal, async () => {
+    const single =
+      getTurnAccount(options.modelId)?.single ?? !usesPooledAccounts()
+    const result = await routedFetchInner(path, init, options)
+    if (result.account)
+      retainTurnAccount(options.modelId, result.account, single)
+    return result
+  })
   if (
     path === "/chat/completions"
     || path === "/responses"
@@ -916,6 +932,30 @@ async function routedFetchInner(
     sessionTokenPinsAccount: false,
     retryBudget,
   }
+  const continuation = getTurnAccount(modelId)
+  if (continuation) {
+    const pin =
+      routedAccountPin?.accountId
+      ?? asyncPinnedAccountId
+      ?? selectedAccountPin?.accountId
+    if (pin !== undefined && pin !== continuation.account.id)
+      throw unavailableAccount()
+    setLastUsedRoutedAccountId(continuation.account.id)
+    if (continuation.single)
+      return withActiveAccount(continuation.account, () =>
+        singleTokenRoutedFetch({ context, modelId, shouldRecordSelection }),
+      )
+    const binding = bindSessionTokenToAccount({
+      accountSubject: continuation.account.copilotAccountSubject,
+      accountToken: continuation.account.copilotToken,
+      headerOptions: context.headerOptions,
+    })
+    return fetchWithRoutedAccount(
+      { ...context, ...binding, sessionTokenPinsAccount: true },
+      continuation.account,
+      reason,
+    )
+  }
   setLastUsedRoutedAccountId(undefined)
 
   if (!usesPooledAccounts()) {
@@ -923,7 +963,9 @@ async function routedFetchInner(
       const account = tokenPool.getFirstHealthyAccount()
       if (!account) throw unavailableAccount()
       const pinnedId =
-        routedAccountPin?.accountId ?? selectedAccountPin?.accountId
+        routedAccountPin?.accountId
+        ?? asyncPinnedAccountId
+        ?? selectedAccountPin?.accountId
       if (pinnedId !== undefined && account.id !== pinnedId)
         throw unavailableAccount()
       const snapshot = leaseAccount(account)
@@ -995,6 +1037,10 @@ async function routedFetchInner(
   if (mutableAccountPin && result.account) {
     mutableAccountPin.accountId = result.account.id
   }
+  // A hosted follow-up may create a fresh local pin; preserve initial failover
+  // in the enclosing model selection as well, rather than its stale first pick.
+  if (selectedAccountPin && result.account)
+    selectedAccountPin.accountId = result.account.id
   return result
 }
 

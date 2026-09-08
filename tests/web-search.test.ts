@@ -12,6 +12,7 @@ import type {
 } from "../src/services/copilot/create-responses"
 
 import { state } from "../src/lib/state"
+import { tokenPool } from "../src/lib/token-pool"
 import { chatCompletionsToResponses } from "../src/routes/chat-completions/responses-fallback"
 import { translateGoogleToOpenAI } from "../src/routes/google-ai/request-translation"
 import { asAnthropicUnknownContentType } from "../src/routes/messages/anthropic-types"
@@ -28,7 +29,10 @@ import {
   executeWebSearch,
   resetWebSearchSessionsForTest,
 } from "../src/services/copilot/mcp-web-search"
-import { useProtocolDatabase } from "./helpers/protocol-database"
+import {
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
 
 useProtocolDatabase()
 
@@ -230,12 +234,17 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   resetWebSearchSessionsForTest()
   state.accountType = "individual"
-  state.githubToken = "github-token"
+  state.githubToken = undefined
+  state.copilotToken = undefined
   state.isMultiToken = false
+  const account = tokenPool.addAccount("github-token", "individual", 0)
+  account.copilotToken = "copilot-token"
+  account.healthy = true
+  await seedProtocolDatabase({ singleAccount: false })
 })
 
 test("uses the current Copilot CLI MCP web-search contract and reuses its session", async () => {

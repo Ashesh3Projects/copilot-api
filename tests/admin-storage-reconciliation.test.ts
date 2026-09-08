@@ -52,6 +52,42 @@ async function markers() {
   )
 }
 
+test.each(["hex", "base64url"] as const)(
+  "setup rejects an inference reservation committed before its final transaction (%s)",
+  async (encoding) => {
+    const { code } = await issueAdminSetupCode()
+    const hex = credentialDigest(gateway)
+    const reserved =
+      encoding === "hex" ? hex : Buffer.from(hex, "hex").toString("base64url")
+    fixture.beforeNextTransaction((storage) =>
+      storage.atomicBatch([
+        {
+          sql: "INSERT INTO capi_inference_credentials(digest,id,kind,principal_id,enabled,scopes_json,created_at,updated_at) VALUES(?,?,'managed','fixture:inference',0,'[\"user:inference\"]',0,0)",
+          args: [reserved, "fixture-reservation"],
+        },
+      ]),
+    )
+    expect(await setupAdminAuth(gateway, password, code)).toHaveProperty(
+      "error",
+    )
+    expect(await createAdminRepository(fixture.storage).get()).toBeNull()
+    expect(
+      await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT COUNT(*) AS count FROM capi_admin_sessions",
+          args: [],
+        }),
+      ),
+    ).toEqual([{ count: 0 }])
+    const fresh = await setupAdminAuth(
+      "different initial gateway",
+      password,
+      code,
+    )
+    expect(fresh).toHaveProperty("session")
+  },
+)
+
 test("administrator mutations reconcile committed-but-lost responses without replay or raw operation results", async () => {
   fixture.loseNextCommitResponse()
   const { code } = await issueAdminSetupCode()

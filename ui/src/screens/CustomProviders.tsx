@@ -181,17 +181,20 @@ export default function CustomProvidersScreen() {
 
   const [isFormOpen, setIsFormOpen] = useState(false)
   const [form, setForm] = useState<ProviderFormState>(emptyForm)
+  const [formRevision, setFormRevision] = useState<number>()
   const [editingId, setEditingId] = useState<string | null>(null)
   const [isSaving, setIsSaving] = useState(false)
 
   function openCreate() {
     setForm(emptyForm())
+    setFormRevision(page?.revision)
     setEditingId(null)
     setIsFormOpen(true)
   }
 
   function openEdit(provider: CustomProvider) {
     setForm(formFromProvider(provider))
+    setFormRevision(page?.revision)
     setEditingId(provider.id)
     setIsFormOpen(true)
   }
@@ -253,6 +256,7 @@ export default function CustomProvidersScreen() {
       reload()
     } catch (caught) {
       toast.error(errorMessage(caught, "Failed to delete provider"))
+      reload()
     }
   }
 
@@ -320,13 +324,14 @@ export default function CustomProvidersScreen() {
     setIsSaving(true)
     try {
       await api("POST", "/dashboard/api/custom-providers", payload, {
-        expectedRevision: page?.revision,
+        expectedRevision: formRevision,
       })
       toast.success(editingId ? "Provider updated" : "Provider created")
       closeForm()
       reload()
     } catch (caught) {
       toast.error(errorMessage(caught, "Failed to save provider"))
+      if (caught instanceof ApiError && caught.status === 409) closeForm()
       reload()
     } finally {
       setIsSaving(false)

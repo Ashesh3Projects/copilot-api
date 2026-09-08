@@ -205,6 +205,7 @@ export async function setupAdminAuth(
   const result = await repository().setup({
     codeDigest: digest(setupCode),
     passwordHash,
+    gatewayLiteral: gatewayKey.trim(),
     gateway: {
       id: randomUUID(),
       digest: credentialDigest(gatewayKey.trim()),

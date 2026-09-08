@@ -198,6 +198,20 @@ export class AccountsRepository {
     )
   }
 
+  listWithRevision(): Promise<{
+    revision: number
+    accounts: ReadonlyArray<AccountRecord>
+  }> {
+    return this.storage.read(async (session) => {
+      const revision = await readStoreRevision(session)
+      const rows = await session.query({
+        sql: "SELECT * FROM capi_accounts ORDER BY id",
+        args: [],
+      })
+      return { revision, accounts: rows.map((row) => decodeAccount(row)) }
+    })
+  }
+
   snapshot(): Promise<{
     revision: number
     accounts: Array<AccountWithCredential>

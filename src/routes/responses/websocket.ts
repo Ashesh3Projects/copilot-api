@@ -8,6 +8,7 @@ import type { RoutingAffinity } from "~/lib/routing-affinity"
 import type { NativeMessagesRequestOptions } from "~/routes/messages/native-handler"
 import type { Model } from "~/services/copilot/get-models"
 
+import { withAccountLeaseScope } from "~/lib/account-lease-context"
 import {
   runWithRoutedModelSelection,
   selectRoutedModel,
@@ -328,11 +329,8 @@ async function handleResponsesWebSocketMessage(
       ws.data,
       parsedPayload,
     )
-    await runWithWebSocketRequestContext(
-      affinity,
-      attribution,
-      turn,
-      async () => {
+    await runWithWebSocketRequestContext(affinity, attribution, turn, () =>
+      withAccountLeaseScope(turn.abortController.signal, async () => {
         await runWithModelFallback(
           {
             headers: mergeFallbackIdentityHeaders(
@@ -355,7 +353,7 @@ async function handleResponsesWebSocketMessage(
             })
           },
         )
-      },
+      }),
     )
     if (turn.terminal.state === "open") {
       await failWebSocketTurn(ws, turn, { kind: "source_ended" })

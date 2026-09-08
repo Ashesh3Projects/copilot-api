@@ -3,10 +3,18 @@ set -euo pipefail
 
 SERVER_URL="${1:?Usage: $0 <server-url>}"
 export SERVER_URL
+: "${SMOKE_GATEWAY_KEY:?Supply the explicitly provisioned smoke gateway key}"
+export SMOKE_GATEWAY_KEY
 PASS=0
 FAIL=0
 SKIP=0
 RESULTS=()
+
+if [ "${SMOKE_REQUIRE_CLIENTS:-0}" = "1" ]; then
+  for client in claude codex gemini; do
+    command -v "$client" >/dev/null || { echo "Required smoke client missing: $client"; exit 1; }
+  done
+fi
 
 run_test() {
   local name="$1"; shift
@@ -59,7 +67,7 @@ echo "==============================="
 run_test "api:messages-endpoint" '
   response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$SERVER_URL/v1/messages" \
     -H "Content-Type: application/json" \
-    -H "x-api-key: dummy" \
+    -H "x-api-key: $SMOKE_GATEWAY_KEY" \
     -H "anthropic-version: 2023-06-01" \
     -d "{
       \"model\": \"claude-sonnet-4.6\",
@@ -84,7 +92,7 @@ echo "==============================="
 
 if command -v claude &>/dev/null; then
   export ANTHROPIC_BASE_URL="$SERVER_URL"
-  export ANTHROPIC_AUTH_TOKEN="dummy"
+  export ANTHROPIC_AUTH_TOKEN="$SMOKE_GATEWAY_KEY"
   export ANTHROPIC_MODEL="claude-sonnet-4.6"
   export ANTHROPIC_SMALL_FAST_MODEL="gpt-4o-mini"
   export DISABLE_NON_ESSENTIAL_MODEL_CALLS="1"
@@ -124,7 +132,7 @@ echo "  Codex CLI Tests"
 echo "==============================="
 
 if command -v codex &>/dev/null; then
-  export OPENAI_API_KEY="dummy"
+  export OPENAI_API_KEY="$SMOKE_GATEWAY_KEY"
   CODEX_BASE_URL_CONFIG="openai_base_url=\"$SERVER_URL/v1\""
   export CODEX_BASE_URL_CONFIG
 
@@ -166,7 +174,7 @@ echo "  Gemini CLI Tests"
 echo "==============================="
 
 if command -v gemini &>/dev/null; then
-  export GEMINI_API_KEY="dummy"
+  export GEMINI_API_KEY="$SMOKE_GATEWAY_KEY"
   export GOOGLE_GEMINI_BASE_URL="$SERVER_URL"
   export GEMINI_CLI_SYSTEM_SETTINGS_PATH="$PWD/tests/smoke/gemini-system-settings.json"
 

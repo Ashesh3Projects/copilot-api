@@ -77,9 +77,6 @@ You interact with the user through a terminal. You have 2 ways of communicating 
 - Tone of your updates MUST match your personality.`
 
 const defaultConfig: AppConfig = {
-  auth: {
-    apiKeys: [],
-  },
   extraPrompts: {
     "gpt-5-mini": gpt5ExplorationPrompt,
     "gpt-5.1-codex-max": gpt5ExplorationPrompt,

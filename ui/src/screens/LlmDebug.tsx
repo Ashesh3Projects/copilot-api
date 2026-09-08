@@ -53,7 +53,10 @@ import {
   Trash2Icon,
 } from "../icons"
 import { ApiError, del, get } from "../lib/api"
-import { canReplayCapture, captureOmissionMessage } from "../lib/capture-state"
+import {
+  canEditReplayCapture,
+  captureOmissionMessage,
+} from "../lib/capture-state"
 import { formatDuration } from "../lib/duration-format"
 import { parseJsonBody } from "../lib/json-tree"
 import { requestPayloadView } from "../lib/llm-debug-detail-view"
@@ -565,7 +568,7 @@ function LlmDebugDetailView({ id }: { id: string }) {
     toast.success("Copied")
   }
 
-  const showReplay = data ? canReplayCapture(data) : false
+  const showReplay = data ? canEditReplayCapture(data) : false
   const captureWarning =
     data ?
       (captureOmissionMessage(data.request, data.status)
@@ -591,13 +594,13 @@ function LlmDebugDetailView({ id }: { id: string }) {
             onClick={() => copy(globalThis.location.href)}
           />
           <Button
-            label="Replay"
+            label={data?.replayable ? "Replay" : "Edit and replay"}
             variant="primary"
             icon={<PlayIcon />}
             isDisabled={!showReplay}
             tooltip={
               data && !showReplay ?
-                "Replay requires an intact, unredacted POST /chat/completions or /responses capture"
+                "Replay supports POST /chat/completions and /responses captures"
               : undefined
             }
             onClick={() => navigate("llm-replay", id)}

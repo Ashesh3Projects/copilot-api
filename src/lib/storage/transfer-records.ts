@@ -294,6 +294,12 @@ export async function* transferRecords(
         predicates.push(`key IN (${metadataKeys.map(() => "?").join(",")})`)
         args.push(...metadataKeys)
       }
+      if (table === "capi_applied_operations") {
+        // Promotion receipts reconcile this replacement operation only. Carrying
+        // them into later replacements changes otherwise identical logical data.
+        predicates.push("kind != ?")
+        args.push("restore.complete")
+      }
       if (after.length > 0) {
         predicates.push(
           keys.length === 1 ?

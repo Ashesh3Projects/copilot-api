@@ -1,4 +1,55 @@
 const LEGACY_STORAGE_KEYS = ["dashboard_api_key", "ff_api_key"]
+interface PendingMutation {
+  id: string
+  revision?: number
+  createdAt: number
+}
+// Only hashes and operation metadata are retained, never request bodies or credentials.
+const pendingMutations = new Map<string, PendingMutation>()
+async function mutationAttempt(
+  method: string,
+  path: string,
+  request: { body?: string; options?: MutationOptions },
+): Promise<{ key?: string; value: PendingMutation }> {
+  const now = Date.now()
+  if (request.options?.operationId)
+    return {
+      value: {
+        id: request.options.operationId,
+        revision: request.options.expectedRevision,
+        createdAt: now,
+      },
+    }
+  for (const [key, value] of pendingMutations)
+    if (now - value.createdAt > 30 * 60_000) pendingMutations.delete(key)
+  const bytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      JSON.stringify([method, path, request.body ?? null]),
+    ),
+  )
+  const key = Array.from(new Uint8Array(bytes), (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("")
+  let value = pendingMutations.get(key)
+  if (!value) {
+    if (pendingMutations.size >= 64)
+      pendingMutations.delete(pendingMutations.keys().next().value ?? "")
+    value = {
+      id: crypto.randomUUID(),
+      revision: request.options?.expectedRevision,
+      createdAt: now,
+    }
+    pendingMutations.set(key, value)
+  }
+  return { key, value }
+}
+function finishMutation(
+  attempt: { key?: string; value: PendingMutation } | undefined,
+): void {
+  if (attempt?.key && pendingMutations.get(attempt.key) === attempt.value)
+    pendingMutations.delete(attempt.key)
+}
 
 export function clearLegacyCredentials(): void {
   for (const key of LEGACY_STORAGE_KEYS) {
@@ -56,6 +107,19 @@ export interface MutationOptions {
   expectedRevision?: number
   operationId?: string
 }
+function mutationHeaders(
+  attempt: { value: PendingMutation } | undefined,
+): Record<string, string> {
+  if (!attempt) return {}
+  const csrf = getCookie("__Host-copilot_admin_csrf")
+  return {
+    "idempotency-key": attempt.value.id,
+    ...(attempt.value.revision === undefined ?
+      {}
+    : { "if-match": JSON.stringify(String(attempt.value.revision)) }),
+    ...(csrf ? { "x-copilot-csrf": csrf } : {}),
+  }
+}
 // eslint-disable-next-line max-params -- Optional revision and operation metadata are independent from the request body.
 export async function api<T>(
   method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
@@ -63,24 +127,26 @@ export async function api<T>(
   body?: unknown,
   mutation?: MutationOptions,
 ): Promise<T> {
-  const headers: Record<string, string> = {}
+  const serialized = body === undefined ? undefined : JSON.stringify(body)
+  const attempt =
+    method === "GET" ? undefined : (
+      await mutationAttempt(method, path, {
+        body: serialized,
+        options: mutation,
+      })
+    )
+  const headers = mutationHeaders(attempt)
   if (body !== undefined) headers["content-type"] = "application/json"
-  if (!["GET"].includes(method)) {
-    headers["idempotency-key"] = mutation?.operationId ?? crypto.randomUUID()
-    if (mutation?.expectedRevision !== undefined)
-      headers["if-match"] = JSON.stringify(String(mutation.expectedRevision))
-    const csrfToken = getCookie("__Host-copilot_admin_csrf")
-    if (csrfToken) headers["x-copilot-csrf"] = csrfToken
-  }
 
   const response = await fetch(path, {
     method,
     headers,
     credentials: "same-origin",
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: serialized,
   })
 
   if (!response.ok) {
+    if (response.status < 500) finishMutation(attempt)
     const message = await extractErrorMessage(
       response,
       `Request failed with status ${response.status}`,
@@ -90,10 +156,12 @@ export async function api<T>(
 
   const contentType = response.headers.get("content-type") ?? ""
   if (!contentType.includes("application/json")) {
+    finishMutation(attempt)
     return undefined as T
   }
-
-  return (await response.json()) as T
+  const result = (await response.json()) as T
+  finishMutation(attempt)
+  return result
 }
 
 export function get<T>(path: string): Promise<T> {
