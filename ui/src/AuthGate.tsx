@@ -135,6 +135,32 @@ export function AuthGate({ children }: { children: ReactNode }) {
             placeholder="Enter the gateway key"
             hasAutoFocus
           />
+          {status === "setup" ?
+            <>
+              <Button
+                label="Generate a random gateway key"
+                variant="secondary"
+                onClick={() =>
+                  setGatewayKey(
+                    crypto.randomUUID().replaceAll("-", "")
+                      + crypto.randomUUID().replaceAll("-", ""),
+                  )
+                }
+              />
+              <Text color="secondary">
+                Save this key in your password manager before completing setup.
+                Use a long random API secret, not a memorable password. Imported
+                existing keys stay compatible.
+              </Text>
+              {gatewayKey ?
+                <TextInput
+                  label="Gateway key to save"
+                  value={gatewayKey}
+                  onChange={() => {}}
+                />
+              : null}
+            </>
+          : null}
           <TextInput
             type="password"
             label={status === "setup" ? "New admin password" : "Admin password"}
