@@ -35,6 +35,7 @@ import {
   assertEndpointTranslationSupported,
   createEndpointTranslationError,
 } from "~/lib/error"
+import { isModelFallbackActive } from "~/lib/model-fallback"
 import { createNativeMessages } from "~/routes/messages/native-handler"
 import { createWebSearchAnthropicTool } from "~/services/copilot/mcp-web-search"
 
@@ -346,6 +347,23 @@ async function convertTolerantResponsesInput(
     }
     if (type === "reasoning") {
       const summary = Array.isArray(raw.summary) ? raw.summary : []
+      if (
+        isModelFallbackActive()
+        && typeof raw.encrypted_content === "string"
+      ) {
+        appendAssistantBlock(messages, {
+          type: "thinking",
+          thinking: summary
+            .flatMap((entry) =>
+              isRecord(entry) && typeof entry.text === "string" ?
+                [entry.text]
+              : [],
+            )
+            .join(""),
+          signature: raw.encrypted_content,
+        })
+        continue
+      }
       for (const entry of summary) {
         if (isRecord(entry) && typeof entry.text === "string" && entry.text) {
           appendTolerantTextMessage(messages, "assistant", entry.text)

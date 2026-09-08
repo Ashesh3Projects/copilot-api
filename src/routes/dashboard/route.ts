@@ -61,6 +61,11 @@ import {
   dashboardAuthRoutes,
   getRefreshedSessionCookieHeaders,
 } from "./auth-route"
+import {
+  handleClearFallbackCache,
+  handleGetFallbacks,
+  handleSetFallbacks,
+} from "./fallbacks"
 import { handleReplayLlmDebugLog } from "./llm-debug-replay"
 import { DASHBOARD_HTML } from "./page-generated"
 import { handleExportSettings } from "./settings-export"
@@ -150,6 +155,11 @@ dashboardRoutes.patch(
   handleToggleModelRedirect,
 )
 dashboardRoutes.post("/api/model-redirects/:id/move", handleMoveModelRedirect)
+
+// Model Fallbacks
+dashboardRoutes.get("/api/fallbacks", handleGetFallbacks)
+dashboardRoutes.put("/api/fallbacks", handleSetFallbacks)
+dashboardRoutes.delete("/api/fallbacks/cache", handleClearFallbackCache)
 
 // Model Settings
 dashboardRoutes.get("/api/model-settings", handleListModelSettings)

@@ -46,6 +46,7 @@ export interface ResponsesWebSocketTurn {
   model?: string
   reasoningEffort?: string
   requestedModel?: string
+  continuationModel?: string
   routingState: { lastUsedAccountId?: number }
   telemetryState: RoutingTelemetryRequestState
   sequence: number

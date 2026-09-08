@@ -42,6 +42,10 @@ import {
   isHTTPError,
 } from "~/lib/error"
 import {
+  applyModelFallbackToPayload,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
+import {
   applyModelRedirect,
   formatModelRedirectResult,
   type ModelRedirectVerbosity,
@@ -124,11 +128,19 @@ export async function handleCompletion(c: Context) {
     createSentryInvokeAgentSpanOptions(model, conversationId),
     async () => {
       recordCopilotRequestNormalization("chat", prepared.normalizationClasses)
-      return await handleCompletionInner(c, {
-        preparedSource,
-        sourceFindings: prepared.findings,
-        nativeOptions,
-      })
+      return await runWithModelFallback(
+        {
+          headers: c.req.raw.headers,
+          payload: preparedSource,
+          signal: c.req.raw.signal,
+        },
+        async () =>
+          await handleCompletionInner(c, {
+            preparedSource: structuredClone(preparedSource),
+            sourceFindings: prepared.findings,
+            nativeOptions,
+          }),
+      )
     },
   )
 }
@@ -169,12 +181,12 @@ async function handleCompletionInner(
     )
 
   const unnormalizedModel = replacedPayload.model
-  const customReferenceBeforeCopilot = resolveCustomProviderModel({
+  let customReferenceBeforeCopilot = resolveCustomProviderModel({
     model: unnormalizedModel,
     kind: "chat",
     copilotModelIds: getCopilotModelIds(),
   })
-  const normalizedModel = normalizeModelName(unnormalizedModel)
+  let normalizedModel = normalizeModelName(unnormalizedModel)
   const payloadEffort = getPayloadReasoningEffort(replacedPayload)
   const requestedEffort = getNormalizedRequestedEffort(c, {
     model: normalizedModel,
@@ -183,17 +195,26 @@ async function handleCompletionInner(
   })
 
   if (customReferenceBeforeCopilot) {
+    applyModelFallbackToPayload(replacedPayload)
+    normalizedModel = normalizeModelName(replacedPayload.model)
+    customReferenceBeforeCopilot = resolveCustomProviderModel({
+      model: replacedPayload.model,
+      kind: "chat",
+      copilotModelIds: getCopilotModelIds(),
+    })
+  }
+  if (customReferenceBeforeCopilot) {
     const customSource = structuredClone(
       replacedPayload,
     ) as unknown as PreparedChatCompletionsSource
-    customSource.model = unnormalizedModel
+    customSource.model = replacedPayload.model
     const customCandidate = await prepareCustomProviderChatCandidate({
       source: customSource,
       signal: c.req.raw.signal,
     })
     const customPayload = {
       ...customCandidate.payload,
-      model: unnormalizedModel,
+      model: replacedPayload.model,
     }
     return await executeCustomProviderRequest(c, {
       reference: customReferenceBeforeCopilot,
@@ -205,11 +226,16 @@ async function handleCompletionInner(
     })
   }
 
-  const { targetModel, reasoningEffort, redirected, verbosity } =
-    await resolveRedirectedModel(c, {
-      model: normalizedModel,
-      effort: requestedEffort,
-    })
+  const {
+    targetModel,
+    reasoningEffort: redirectedReasoningEffort,
+    redirected,
+    verbosity,
+  } = await resolveRedirectedModel(c, {
+    model: normalizedModel,
+    effort: requestedEffort,
+  })
+  let reasoningEffort = redirectedReasoningEffort
   const redirectedSource = structuredClone(
     replacedPayload,
   ) as unknown as PreparedChatCompletionsSource
@@ -221,6 +247,26 @@ async function handleCompletionInner(
   })
 
   redirectedSource.model = targetModel
+
+  const modelBeforeFallback = redirectedSource.model
+  const fallbackPayload = applyRoutableModelFallback(
+    c,
+    redirectedSource as unknown as ChatCompletionsPayload & { model: string },
+  )
+  redirectedSource.model = fallbackPayload.model
+  applyModelFallbackToPayload(redirectedSource)
+  if (redirectedSource.model !== targetModel) {
+    reasoningEffort = normalizeReasoningEffortForModel(
+      redirectedSource.model,
+      reasoningEffort,
+    )
+    applyRedirectedReasoningEffort({
+      c,
+      payload: redirectedSource as unknown as ChatCompletionsPayload,
+      model: redirectedSource.model,
+      effort: reasoningEffort,
+    })
+  }
 
   const customReference = resolveCustomProviderModel({
     model: redirectedSource.model,
@@ -242,13 +288,8 @@ async function handleCompletionInner(
     })
   }
 
-  const modelBeforeFallback = redirectedSource.model
-  const fallbackPayload = applyRoutableModelFallback(
-    c,
-    redirectedSource as unknown as ChatCompletionsPayload & { model: string },
-  )
   const routableSource = structuredClone(
-    fallbackPayload,
+    redirectedSource,
   ) as unknown as PreparedChatCompletionsSource
   const inboundSessionToken = c.req.header("copilot-session-token")
   const copilotSessionToken =

@@ -14,6 +14,7 @@ import type { ResponsesWireBody } from "~/services/copilot/responses-contract"
 import { fetchUrlAsDataUri } from "~/lib/attachments"
 import { getConfig } from "~/lib/config"
 import { createEvaluatedTranslationCheck } from "~/lib/endpoint-routing"
+import { isModelFallbackActive } from "~/lib/model-fallback"
 import {
   fitChatCompletionsCompactionPayload,
   isResponsesCompactionRequest,
@@ -303,6 +304,35 @@ async function convertInput(
     }
     if (type === "reasoning") {
       const summary = Array.isArray(raw.summary) ? raw.summary : []
+      if (isModelFallbackActive()) {
+        const reasoningText = summary
+          .flatMap((entry) =>
+            isRecord(entry) && typeof entry.text === "string" ?
+              [entry.text]
+            : [],
+          )
+          .join("")
+        const reasoningOpaque =
+          typeof raw.id === "string" && !raw.id.startsWith("rs_") ?
+            raw.id
+          : undefined
+        const encryptedContent =
+          typeof raw.encrypted_content === "string" ?
+            raw.encrypted_content
+          : undefined
+        if (reasoningOpaque || encryptedContent) {
+          messages.push({
+            role: "assistant",
+            content: null,
+            ...(reasoningText ? { reasoning_text: reasoningText } : {}),
+            ...(reasoningOpaque ? { reasoning_opaque: reasoningOpaque } : {}),
+            ...(encryptedContent ?
+              { encrypted_content: encryptedContent }
+            : {}),
+          })
+          continue
+        }
+      }
       for (const entry of summary) {
         if (isRecord(entry) && typeof entry.text === "string" && entry.text) {
           messages.push({ role: "assistant", content: entry.text })

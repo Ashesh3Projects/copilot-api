@@ -395,6 +395,10 @@ The dashboard is the recommended interface for these controls:
 
 - **Redirects** map an exact source model/effort to a target model/effort. Rules
   are ordered and can chain only through later rules.
+- **Fallbacks** switch models only after upstream HTTP 422, with up to three
+  hops and loop prevention. Conversation routes and old-thinking fingerprints
+  stay in memory; optional client notices are configurable. See the
+  [fallback configuration guide](docs/model-fallbacks.md).
 - **Model settings** override capability assumptions and discovery behavior for
   a model.
 - **Replacements** transform matching message text with literal or regular-
@@ -512,6 +516,7 @@ Open `/dashboard` on the same host as the API. The dashboard includes:
 - replay for logged Chat Completions and Responses attempts;
 - GrowthBook feature flags and Codex/ChatGPT Statsig overrides;
 - request replacements and ordered model redirects;
+- HTTP 422 model fallback chains and conversation cache controls;
 - per-model settings and per-account model routing;
 - custom provider configuration;
 - managed IP allowlists and managed inference-only Codex JWT digests; and
@@ -769,6 +774,7 @@ The default data directory is `~/.local/share/copilot-api`. Override it with
 | `config.json` | Gateway keys, custom providers, prompt/model defaults, voice settings |
 | `replacements.json` | Request replacement rules |
 | `model_redirects.json` | Ordered model redirect rules |
+| `model_fallbacks.json` | HTTP 422 fallback rules and cache/notice settings; excludes conversation state |
 | `model_settings.json` | Per-model capability and behavior overrides |
 | `model_routing.json` | Per-account model enablement overrides |
 | `feature_flags.json` | GrowthBook/Claude Code flag overrides |

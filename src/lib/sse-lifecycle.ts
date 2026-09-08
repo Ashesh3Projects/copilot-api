@@ -26,6 +26,8 @@
  * one-shot per-request stream.
  */
 
+import { shouldAwaitModelFallbackBeforePreflush } from "~/lib/model-fallback"
+
 export const SSE_HEARTBEAT_INTERVAL_MS = 15_000
 export const SSE_HEARTBEAT_COMMENT = ": keepalive\n\n"
 export const SSE_PREFLUSH_DEADLINE_MS = 25_000
@@ -246,6 +248,9 @@ export function unwrapSsePreflushSettlement<T>(
 export async function raceSsePreflush<T>(
   pending: Promise<T>,
 ): Promise<SsePreflushResult<T>> {
+  if (shouldAwaitModelFallbackBeforePreflush()) {
+    return { kind: "settled", value: await pending }
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined
   const observed = pending.then<
     SsePreflushSettlement<T>,

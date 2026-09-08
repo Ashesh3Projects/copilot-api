@@ -10,15 +10,33 @@ import {
   runWithRoutedModelSelection,
   selectRoutedModel,
 } from "~/lib/account-router"
+import {
+  createCustomProviderChatCompletions,
+  resolveCustomProviderModel,
+} from "~/lib/custom-providers"
 import { getModelEndpointSupport } from "~/lib/endpoint-routing"
 import { createHandlerLogger } from "~/lib/logger"
-import { parseModelSuffix } from "~/lib/model-suffix"
+import {
+  applyModelFallbackToPayload,
+  isModelFallbackActive,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
+import { getLoadedModelFallbackConfig } from "~/lib/model-fallback-config"
+import { applyModelRedirect } from "~/lib/model-redirect"
+import { normalizeModelName } from "~/lib/model-resolver"
+import {
+  normalizeReasoningEffortForModel,
+  parseModelSuffix,
+} from "~/lib/model-suffix"
 import { setRequestContext } from "~/lib/request-logger"
 import { installResponsesRoutingAffinity } from "~/lib/routing-affinity"
+import { state } from "~/lib/state"
+import { tokenPool } from "~/lib/token-pool"
 import { createNativeMessages } from "~/routes/messages/native-handler"
 import {
   type CompactionPayloadFitResult,
   fitResponsesCompactionPayload,
+  fitChatCompletionsCompactionPayload,
 } from "~/services/copilot/compaction-payload"
 import {
   type ChatCompletionResponse,
@@ -247,18 +265,27 @@ async function compactWithMessages(
 export const handleCompact = async (c: Context) => {
   const body = await readResponsesRequestJson<CompactRequestBody>(c.req.raw)
   installResponsesRoutingAffinity(body.client_metadata)
+  return await runWithModelFallback(
+    { headers: c.req.raw.headers, payload: body, signal: c.req.raw.signal },
+    async () => await handleCompactAttempt(c, structuredClone(body)),
+  )
+}
 
-  const { baseModel } = parseModelSuffix(body.model)
-  const model = baseModel
+const handleCompactAttempt = async (c: Context, body: CompactRequestBody) => {
+  const requestedModel = body.model
+  const sourceModel = await resolveCompactFallbackSource(requestedModel)
+  // The fallback executor owns this fresh payload clone for the whole attempt.
+  // eslint-disable-next-line require-atomic-updates
+  body.model = sourceModel
+  applyModelFallbackToPayload(body)
+  const model = body.model
 
   setRequestContext(c, {
-    requestedModel: body.model,
+    requestedModel,
     provider: "Compact",
     model,
   })
-  logger.debug("Compact request for model:", model)
 
-  // Build the compaction payload — send conversation to model with compaction prompt
   const compactionPrompt = getCompactionPrompt()
   const compactionUserMessage: ResponseInputItem = {
     type: "message",
@@ -271,8 +298,6 @@ export const handleCompact = async (c: Context) => {
     compactionUserMessage,
   ]
 
-  // Expand any previous compaction items so the upstream API doesn't
-  // try to decrypt our fake base64 encrypted_content
   const tempPayload = { input, model } as ResponsesPayload
   expandCompactionItems(tempPayload)
   const expandedInput = tempPayload.input as Array<ResponseInputItem>
@@ -284,12 +309,13 @@ export const handleCompact = async (c: Context) => {
     tool_choice: "none",
     store: false,
   }
-  const routedModel = selectRoutedModel(model)
+  const customReference = resolveCompactCustomFallback(model)
+  const routedModel = customReference ? {} : selectRoutedModel(model)
   const support = getModelEndpointSupport(routedModel.model)
   const { summaryText, usage } = await runWithRoutedModelSelection(
     routedModel,
     async () => {
-      if (support.responses) {
+      if (!customReference && support.responses) {
         // Use native Responses API
         const fitted = fitResponsesCompactionPayload(responsesPayload)
         const fittedPayload = fitted.payload
@@ -309,7 +335,7 @@ export const handleCompact = async (c: Context) => {
         logger.debug("Compact Responses result received")
         return responsesCompactionSummary(result)
       }
-      if (support.messages && !support.chat) {
+      if (!customReference && support.messages && !support.chat) {
         return await compactWithMessages(c, responsesPayload, routedModel.model)
       }
       // Fall back to ChatCompletions
@@ -327,10 +353,17 @@ export const handleCompact = async (c: Context) => {
         temperature: 0,
       }
 
-      const response = await createChatCompletions(ccPayload, {
-        compaction: true,
-        signal: c.req.raw.signal,
-      })
+      const response =
+        customReference ?
+          await createCustomProviderChatCompletions(
+            customReference,
+            fitChatCompletionsCompactionPayload(ccPayload).payload,
+            { signal: c.req.raw.signal },
+          )
+        : await createChatCompletions(ccPayload, {
+            compaction: true,
+            signal: c.req.raw.signal,
+          })
       const result = response as ChatCompletionResponse
       logger.debug("Compact ChatCompletions result received")
       return chatCompactionSummary(result)
@@ -346,4 +379,36 @@ export const handleCompact = async (c: Context) => {
 
   const compactedResponse = buildCompactedResponse(summaryText, usage)
   return c.json(compactedResponse)
+}
+
+function resolveCompactCustomFallback(model: string) {
+  return isModelFallbackActive() ?
+      resolveCustomProviderModel({
+        model,
+        kind: "chat",
+        copilotModelIds: new Set(
+          state.models?.data.map((entry) => entry.id) ?? [],
+        ),
+      })
+    : undefined
+}
+
+async function resolveCompactFallbackSource(
+  requestedModel: string,
+): Promise<string> {
+  const { baseModel, reasoningEffort } = parseModelSuffix(requestedModel)
+  if (!getLoadedModelFallbackConfig().enabled) return baseModel
+  const normalized = normalizeModelName(baseModel)
+  const redirect = await applyModelRedirect({
+    model: normalized,
+    effort: normalizeReasoningEffortForModel(normalized, reasoningEffort),
+  })
+  const model = normalizeModelName(redirect.model)
+  if (
+    !model.endsWith("-1m")
+    && tokenPool.hasEnabledAccountForKnownModel(model) === undefined
+    && state.models?.data.some((entry) => entry.id === `${model}-1m`)
+  )
+    return `${model}-1m`
+  return model
 }

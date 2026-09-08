@@ -11,6 +11,7 @@ export const CONFIG_EXPORT_FILENAMES = [
   "model_redirects.json",
   "model_settings.json",
   "model_routing.json",
+  "model_fallbacks.json",
   "replacements.json",
   "ip_allowlist.json",
 ] as const

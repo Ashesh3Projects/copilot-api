@@ -44,6 +44,12 @@ import {
 } from "~/lib/error"
 import { createHandlerLogger } from "~/lib/logger"
 import {
+  applyModelFallbackToPayload,
+  captureModelFallbackNotice,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
+import { applyMessagesModelFallbackNotice } from "~/lib/model-fallback-notice"
+import {
   applyModelRedirect,
   formatModelRedirectResult,
 } from "~/lib/model-redirect"
@@ -285,7 +291,25 @@ export async function handleCompletion(c: Context) {
         preparedMessages.normalizationClasses,
       )
       recordCopilotMessagesBeta(nativeOptions.anthropicBeta)
-      return await handleCompletionInner(c, anthropicPayload, nativeOptions)
+      return await runWithModelFallback(
+        {
+          headers: c.req.raw.headers,
+          payload: anthropicPayload,
+          signal: c.req.raw.signal,
+        },
+        async () => {
+          const response = await handleCompletionInner(
+            c,
+            structuredClone(anthropicPayload),
+            nativeOptions,
+          )
+          return await applyMessagesModelFallbackNotice(
+            response,
+            { payload: anthropicPayload, headers: c.req.raw.headers },
+            captureModelFallbackNotice(),
+          )
+        },
+      )
     },
   )
 }
@@ -346,7 +370,7 @@ async function handleCompletionInner(
       },
     })
   }
-  const redirectEffort = normalizeReasoningEffortForModel(
+  let redirectEffort = normalizeReasoningEffortForModel(
     redirect.model,
     redirect.effort,
   )
@@ -389,6 +413,12 @@ async function handleCompletionInner(
     )
   }
 
+  const beforeModelFallback = anthropicPayload.model
+  applyModelFallbackToPayload(anthropicPayload)
+  redirectEffort = normalizeReasoningEffortForModel(
+    anthropicPayload.model,
+    redirectEffort,
+  )
   const customReference = resolveCustomChatModel(anthropicPayload.model)
   if (customReference) {
     const customCandidate = await prepareMessagesChatCandidate({
@@ -426,7 +456,8 @@ async function handleCompletionInner(
         token: inboundSessionToken,
         requestedModel: baseModel,
         finalModel: anthropicPayload.model,
-        modelWasRedirected,
+        modelWasRedirected:
+          modelWasRedirected || anthropicPayload.model !== beforeModelFallback,
       })
     ) ?
       inboundSessionToken

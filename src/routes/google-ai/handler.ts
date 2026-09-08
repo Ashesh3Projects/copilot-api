@@ -44,6 +44,12 @@ import {
 } from "~/lib/error"
 import { createHandlerLogger } from "~/lib/logger"
 import {
+  applyModelFallbackToPayload,
+  applyModelFallbackTransition,
+  createModelFallbackCredentialScope,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
+import {
   applyModelRedirect,
   formatModelRedirectResult,
 } from "~/lib/model-redirect"
@@ -444,6 +450,19 @@ async function resolveGoogleModelRedirect(
 }
 
 export async function handleGoogleAI(c: Context) {
+  const payload: unknown = await c.req.json<unknown>().catch(() => undefined)
+  return await runWithModelFallback(
+    {
+      headers: c.req.raw.headers,
+      credentialScope: createModelFallbackCredentialScope(c.req.raw),
+      payload,
+      signal: c.req.raw.signal,
+    },
+    async () => await handleGoogleAIInner(c),
+  )
+}
+
+async function handleGoogleAIInner(c: Context) {
   setRequestContext(c, { suppressModelDiagnostics: true })
   // Extract model and action from URL path
   // URL path: /v1/models/{model}:{action} or /models/{model}:{action}
@@ -464,12 +483,17 @@ export async function handleGoogleAI(c: Context) {
 
   const { baseModel, reasoningEffort: suffixEffort } =
     parseModelSuffix(rawModel)
-  const customReferenceBeforeRedirect = resolveCustomGoogleModel(baseModel)
+  let customReferenceBeforeRedirect = resolveCustomGoogleModel(baseModel)
+  const directModel = { model: baseModel }
+  if (customReferenceBeforeRedirect && !isCount) {
+    applyModelFallbackToPayload(directModel)
+    customReferenceBeforeRedirect = resolveCustomGoogleModel(directModel.model)
+  }
   if (customReferenceBeforeRedirect) {
     return await handleCustomGoogleRequest(c, {
       isCount,
       isStream,
-      model: baseModel,
+      model: directModel.model,
       outputMode,
       rawModel,
       reasoningEffort: normalizeReasoningEffortForModel(
@@ -481,8 +505,14 @@ export async function handleGoogleAI(c: Context) {
   }
 
   // Apply silent model redirect. The public modelVersion remains rawModel.
-  const { model, reasoningEffort, verbosity } =
-    await resolveGoogleModelRedirect(c, rawModel)
+  const {
+    model: redirectedModel,
+    reasoningEffort,
+    verbosity,
+  } = await resolveGoogleModelRedirect(c, rawModel)
+  const modelPayload = { model: redirectedModel }
+  if (!isCount) applyModelFallbackToPayload(modelPayload)
+  const model = modelPayload.model
   const customReference = resolveCustomGoogleModel(model)
   if (customReference) {
     return await handleCustomGoogleRequest(c, {
@@ -495,9 +525,9 @@ export async function handleGoogleAI(c: Context) {
       reference: customReference,
     })
   }
-  const routedModel = selectRoutedModel(model)
-  const selectedModel = routedModel.model
-  const support = getModelEndpointSupport(selectedModel)
+  let routedModel = selectRoutedModel(model)
+  let selectedModel = routedModel.model
+  let support = getModelEndpointSupport(selectedModel)
   const hasInferenceEndpoint =
     support.chat || support.responses || support.messages
   if (!isCount && !hasInferenceEndpoint) {
@@ -518,7 +548,9 @@ export async function handleGoogleAI(c: Context) {
   }
   let preparedGoogle
   try {
-    preparedGoogle = prepareGoogleRequest(parsed)
+    const transitionSource: unknown = structuredClone(parsed)
+    applyModelFallbackTransition(transitionSource)
+    preparedGoogle = prepareGoogleRequest(transitionSource)
   } catch (error) {
     if (error instanceof InvalidGoogleRequestBodyError) {
       return googleActionError(c, "Invalid JSON request body")
@@ -568,6 +600,12 @@ export async function handleGoogleAI(c: Context) {
   const finalPayload = {
     ...structuredClone(replacedPayload),
     model: normalizeModelName(replacedPayload.model),
+  }
+  applyModelFallbackToPayload(finalPayload)
+  if (finalPayload.model !== model) {
+    routedModel = selectRoutedModel(finalPayload.model)
+    selectedModel = routedModel.model
+    support = getModelEndpointSupport(selectedModel)
   }
 
   // Find the selected model for token counting and capability checks
@@ -671,7 +709,9 @@ async function handleCustomGoogleRequest(
   }
   let preparedGoogle
   try {
-    preparedGoogle = prepareGoogleRequest(parsed)
+    const transitionSource: unknown = structuredClone(parsed)
+    applyModelFallbackTransition(transitionSource)
+    preparedGoogle = prepareGoogleRequest(transitionSource)
   } catch (error) {
     if (error instanceof InvalidGoogleRequestBodyError) {
       return googleActionError(c, "Invalid JSON request body")
@@ -711,6 +751,7 @@ async function handleCustomGoogleRequest(
   }
   const { payload: replacedPayload, appliedRules } =
     await applyReplacementsToPayload(candidate.payload)
+  applyModelFallbackTransition(replacedPayload)
   recordCopilotTranslationFindings("chat", candidate.endpoint, candidate.check)
   setRequestContext(c, {
     requestedModel: options.rawModel,

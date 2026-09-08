@@ -25,6 +25,7 @@ import {
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
+import { recordModelFallbackResponse } from "~/lib/model-fallback"
 import {
   getRoutingTelemetryRequestState,
   updateRoutingTelemetryRequestState,
@@ -456,6 +457,7 @@ async function fetchCustomProvider(
       body,
       signal: options?.signal,
     })
+    if (path === "/chat/completions") recordModelFallbackResponse(response)
     void captureCustomProviderDebugResponse(logId, response)
     recordCustomProviderCall({
       outcome: customProviderOutcome(response),

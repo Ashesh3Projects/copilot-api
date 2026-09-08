@@ -25,6 +25,11 @@ const METADATA_ELIGIBLE_EVENT_TYPES = new Set([
   "response.incomplete",
 ])
 const SAFE_EVENT_HEADER_NAMES = new Set([
+  "openai-model",
+  "x-copilot-api-fallback-from",
+  "x-copilot-api-fallback-to",
+  "x-copilot-api-fallback-reason",
+  "x-copilot-api-fallback-cached",
   "x-copilot-api-exp-assignment-context",
   "x-copilot-service-request-id",
   "x-github-copilot-request-te",
@@ -32,6 +37,13 @@ const SAFE_EVENT_HEADER_NAMES = new Set([
 ])
 const QUOTA_SNAPSHOT_PREFIX = "x-quota-snapshot-"
 const AFFINITY_CLIENT_METADATA_KEYS = new Set(["session_id", "thread_id"])
+const FALLBACK_IDENTITY_HEADERS = [
+  "thread-id",
+  "x-thread-id",
+  "x-claude-code-session-id",
+  "x-client-session-id",
+  "session-id",
+]
 const RESPONSES_TERMINAL_TYPES = new Set([
   "error",
   "response.completed",
@@ -47,6 +59,7 @@ export type EmittedWebSocketTerminal =
 
 export interface ParsedResponseCreateFrame {
   attribution: CopilotRequestAttribution
+  requestHeaders?: Headers
   initiator?: "agent" | "user"
   nativeMessagesOptions: AnthropicRequestHeaderOptions
   payload: ResponsesPayload
@@ -100,17 +113,35 @@ export function parseResponsesWebSocketFrame(
   payload.stream = true
 
   const initiator = parseInitiator(parsed, resolveFrameHeaders(parsed.headers))
+  const requestHeaders = mergeFallbackIdentityHeaders(
+    resolveFrameHeaders(parsed.headers),
+  )
 
   return {
     ok: true,
     value: {
       attribution: resolveFrameAttribution(parsed),
+      ...(Array.from(requestHeaders.keys()).length > 0 ?
+        { requestHeaders }
+      : {}),
       ...(initiator ? { initiator } : {}),
       nativeMessagesOptions: extractNativeMessagesOptions(parsed.headers),
       payload,
       requestedModel: getRequestedModel(parsed),
     },
   }
+}
+
+export function mergeFallbackIdentityHeaders(
+  current?: Headers,
+  update?: Headers,
+): Headers {
+  const headers = new Headers()
+  for (const name of FALLBACK_IDENTITY_HEADERS) {
+    const value = update?.get(name) ?? current?.get(name)
+    if (value) headers.set(name, value)
+  }
+  return headers
 }
 
 export function addResponsesWebSocketMetadata(
