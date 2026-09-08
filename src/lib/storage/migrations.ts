@@ -1,0 +1,133 @@
+import { createHash, randomUUID } from "node:crypto"
+
+import type { SqlSession, Storage } from "~/lib/storage/types"
+
+import {
+  StorageCommitUnknownError,
+  StorageSchemaError,
+} from "~/lib/storage/errors"
+import {
+  initialIndexes,
+  initialMigration,
+  initialTables,
+} from "~/lib/storage/migrations/001-initial"
+
+const checksum = createHash("sha256")
+  .update(JSON.stringify(initialMigration))
+  .digest("hex")
+const counterKeys = [
+  "config_revision",
+  "history_activity_generation",
+  "history_debug_generation",
+] as const
+
+export function parseStorageCounter(value: unknown): number {
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new StorageSchemaError("Invalid storage counter")
+  }
+  const counter = Number(value)
+  if (!Number.isSafeInteger(counter)) {
+    throw new StorageSchemaError("Storage counter exceeds supported range")
+  }
+  return counter
+}
+
+async function applicationObjects(session: SqlSession) {
+  return session.query({
+    sql: "SELECT name, type FROM sqlite_master WHERE substr(name, 1, 5) = 'capi_'",
+    args: [],
+  })
+}
+
+async function validateSchema(session: SqlSession): Promise<void> {
+  const objects = await applicationObjects(session)
+  const tables = new Set(
+    objects.filter((row) => row.type === "table").map((row) => row.name),
+  )
+  const indexes = new Set(
+    objects.filter((row) => row.type === "index").map((row) => row.name),
+  )
+  if (
+    Object.keys(initialTables).some((name) => !tables.has(name))
+    || Object.keys(initialIndexes).some((name) => !indexes.has(name))
+  ) {
+    throw new StorageSchemaError("Application schema is incomplete")
+  }
+  const migrations = await session.query({
+    sql: "SELECT version, name, checksum FROM capi_schema_migrations ORDER BY version",
+    args: [],
+  })
+  if (
+    migrations.length !== 1
+    || migrations[0]?.version !== initialMigration.version
+    || migrations[0].name !== initialMigration.name
+    || migrations[0].checksum !== checksum
+  ) {
+    throw new StorageSchemaError("Unsupported or changed schema migration")
+  }
+  const rows = await session.query({
+    sql: "SELECT key, value FROM capi_metadata",
+    args: [],
+  })
+  const metadata = new Map(rows.map((row) => [row.key, row.value]))
+  if (
+    metadata.get("schema_version") !== String(initialMigration.version)
+    || typeof metadata.get("store_id") !== "string"
+    || !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/.test(
+      String(metadata.get("store_id")),
+    )
+  ) {
+    throw new StorageSchemaError("Required storage metadata is invalid")
+  }
+  for (const key of counterKeys) parseStorageCounter(metadata.get(key))
+  const lifetime = await session.query({
+    sql: "SELECT id FROM capi_usage_lifetime",
+    args: [],
+  })
+  if (lifetime.length !== 1 || lifetime[0]?.id !== 1) {
+    throw new StorageSchemaError("Usage lifetime singleton is missing")
+  }
+}
+
+/** All DDL and migration metadata commit together; never repair partial schemas. */
+export async function migrateStorage(storage: Storage): Promise<void> {
+  try {
+    await storage.transaction(async (session) => {
+      const objects = await applicationObjects(session)
+      if (objects.length === 0) {
+        for (const sql of initialMigration.statements) {
+          await session.execute({ sql, args: [] })
+        }
+        const metadata: Array<[string, string]> = [
+          ["schema_version", String(initialMigration.version)],
+          ["store_id", randomUUID()],
+          ...counterKeys.map((key): [string, string] => [key, "0"]),
+        ]
+        for (const [key, value] of metadata) {
+          await session.execute({
+            sql: "INSERT INTO capi_metadata (key, value) VALUES (?, ?)",
+            args: [key, value],
+          })
+        }
+        await session.execute({
+          sql: "INSERT INTO capi_schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+          args: [
+            initialMigration.version,
+            initialMigration.name,
+            checksum,
+            Date.now(),
+          ],
+        })
+      }
+      await validateSchema(session)
+    })
+  } catch (error) {
+    if (!(error instanceof StorageCommitUnknownError)) throw error
+    // The adapter opens a fresh read session; no DDL is replayed after ambiguity.
+    try {
+      await storage.read(validateSchema)
+    } catch {
+      throw error
+    }
+  }
+}
