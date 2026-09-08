@@ -3,13 +3,14 @@ import type { Context, MiddlewareHandler } from "hono"
 import consola from "consola"
 import { createHash, timingSafeEqual } from "node:crypto"
 
-import { getConfig } from "./config"
+import { createCredentialsRepository } from "~/lib/storage/credentials-repository"
+import { getStorageRuntime } from "~/lib/storage/runtime"
+
 import {
   extractRequestCredential,
   resolveRequestCredential,
 } from "./credential-resolver"
 import { resolveProtectedCredential } from "./protected-credential"
-import { state } from "./state"
 
 interface AuthMiddlewareOptions {
   getApiKeys?: () => Array<string>
@@ -39,14 +40,10 @@ export function normalizeApiKeys(apiKeys: unknown): Array<string> {
   return [...new Set(normalizedKeys)]
 }
 
-export function getConfiguredApiKeys(): Array<string> {
-  const config = getConfig()
-  return normalizeApiKeys(config.auth?.apiKeys)
-}
-
-export function getActiveApiKeys(): Array<string> {
-  if (state.apiKeyAuth) return [state.apiKeyAuth]
-  return getConfiguredApiKeys()
+export function hasActiveGatewayCredentials(): Promise<boolean> {
+  return createCredentialsRepository(
+    getStorageRuntime().storage,
+  ).hasActiveGatewayCredentials()
 }
 
 export function extractRequestApiKey(c: Context): string | null {
@@ -70,7 +67,6 @@ function createUnauthorizedResponse(c: Context): Response {
 export function createAuthMiddleware(
   options: AuthMiddlewareOptions = {},
 ): MiddlewareHandler {
-  const getApiKeys = options.getApiKeys ?? getConfiguredApiKeys
   const allowUnauthenticatedPaths = options.allowUnauthenticatedPaths ?? ["/"]
   const allowOptionsBypass = options.allowOptionsBypass ?? false
 
@@ -83,10 +79,7 @@ export function createAuthMiddleware(
       return next()
     }
 
-    const apiKeys = getApiKeys()
-    if (apiKeys.length === 0) {
-      return next()
-    }
+    const apiKeys = options.getApiKeys?.() ?? []
 
     const auth = await resolveProtectedCredential<unknown>(
       c.req.raw,

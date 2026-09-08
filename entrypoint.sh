@@ -1,25 +1,17 @@
 #!/bin/sh
-if [ "$1" = "--auth" ]; then
-  exec bun run dist/main.js auth
+set -eu
+# Resolve optional 1Password variables once, without runtime package downloads.
+if [ -n "${OP_TOKEN:-}" ] && [ -z "${CAPI_ENV_RESOLVED:-}" ]; then
+  export CAPI_ENV_RESOLVED=1
+  exec bun /app/node_modules/varlock/bin/cli.js run -- /entrypoint.sh "$@"
 fi
-
-# Build base CLI args
-ARGS=""
-[ -n "$COPILOT_HOST" ] && ARGS="$ARGS --host $COPILOT_HOST"
-[ "$COPILOT_VERBOSE" = "true" ] && ARGS="$ARGS --verbose"
-[ "$COPILOT_DEBUG" = "true" ] && ARGS="$ARGS --debug"
-[ -n "$GH_TOKEN" ] && ARGS="$ARGS -g $GH_TOKEN"
-
-# --api-key-auth with no value tells the app to read COPILOT_API_KEY_AUTH from env
-# This works whether the env var comes from .env, docker env, or varlock
-ARGS="$ARGS --api-key-auth"
-
-CMD="bun run dist/main.js start $ARGS $*"
-
-# Run with varlock (resolves 1Password secrets into env) or directly
-if [ -n "$OP_TOKEN" ] && [ -f ".env.schema" ]; then
-  echo "Resolving secrets from 1Password via varlock..."
-  exec bunx varlock run -- $CMD
-else
-  exec $CMD
-fi
+case "${1:-}" in
+  admin|storage|config|auth|debug|check-usage) exec bun /app/dist/main.js "$@" ;;
+  --auth) shift; exec bun /app/dist/main.js auth "$@" ;;
+  start) shift ;;
+esac
+set -- start "$@"
+[ -z "${COPILOT_HOST:-}" ] || set -- "$@" --host "$COPILOT_HOST"
+[ "${COPILOT_VERBOSE:-}" != "true" ] || set -- "$@" --verbose
+[ "${COPILOT_DEBUG:-}" != "true" ] || set -- "$@" --debug
+exec bun /app/dist/main.js "$@"

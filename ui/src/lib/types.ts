@@ -150,7 +150,8 @@ export interface CustomProvider {
   type: "openai-compatible"
   baseUrl: string
   apiKeyConfigured: boolean
-  apiKeyEnv?: string
+  enabled: boolean
+  revision: number
   headerNames: Array<string>
   models: Array<CustomProviderModel>
   passReasoningEffort?: boolean
@@ -161,6 +162,8 @@ export interface ModelRoutingAccount {
   accountType: string
   githubUsername?: string
   healthy: boolean
+  enabled?: boolean
+  deleting?: boolean
   modelsCount: number
 }
 
@@ -360,7 +363,8 @@ export interface LlmDebugEntry {
   startedAt: string
   durationMs?: number
   endedAt?: string
-  status: "pending" | "complete" | "error" | "aborted"
+  replayable: boolean
+  status: "pending" | "complete" | "error" | "aborted" | "interrupted"
   stream?: boolean
 }
 
@@ -373,7 +377,13 @@ export interface LlmDebugLogError {
   stack?: string
 }
 
-export interface LlmDebugLogRequest {
+export interface CapturedBodyState {
+  redacted?: boolean
+  truncated?: boolean
+  omittedReason?: string
+  bodyBytesComplete?: boolean
+}
+export interface LlmDebugLogRequest extends CapturedBodyState {
   body: string | null
   bodyBytes: number
   headers: Record<string, string>
@@ -382,7 +392,7 @@ export interface LlmDebugLogRequest {
   url: string
 }
 
-export interface LlmDebugLogResponse {
+export interface LlmDebugLogResponse extends CapturedBodyState {
   body: string | null
   bodyBytes: number
   bodyReadError?: LlmDebugLogError
@@ -402,7 +412,8 @@ export interface LlmDebugDetail {
   startedAtMs: number
   durationMs?: number
   endedAt?: string
-  status: "pending" | "complete" | "error" | "aborted"
+  replayable: boolean
+  status: "pending" | "complete" | "error" | "aborted" | "interrupted"
   stream?: boolean
 }
 

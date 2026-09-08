@@ -80,8 +80,12 @@ export async function enableCopilotModelPolicy(
     signal,
   })
   if (localError) throw localError
-  if (response.ok) return { success: true }
+  if (response.ok) {
+    await response.body?.cancel()
+    return { success: true }
+  }
   if (response.status === 403) {
+    await response.body?.cancel()
     return {
       success: false,
       can_be_enabled: false,

@@ -1,9 +1,11 @@
-import crypto from "node:crypto"
 import { createHash, randomUUID } from "node:crypto"
-import fs from "node:fs"
-import path from "node:path"
 
-import { PATHS } from "~/lib/paths"
+import type { Storage } from "~/lib/storage/types"
+
+import { StorageConflictError } from "~/lib/storage/errors"
+import { withStorageDeadline } from "~/lib/storage/operation-budget"
+import { createPolicyRepository } from "~/lib/storage/policy-repository"
+import { getStorageRuntime } from "~/lib/storage/runtime"
 
 export interface TrustedJwtDigestEntry {
   id: string
@@ -29,22 +31,21 @@ export class TrustedJwtDigestConflictError extends Error {
 }
 
 export interface TrustedJwtDigestStore {
-  readonly filePath: string
-  list(): Array<TrustedJwtDigestEntry>
-  add(input: { label: string; digest: string }): TrustedJwtDigestEntry
-  setEnabled(id: string, enabled: boolean): TrustedJwtDigestEntry | null
-  remove(id: string): boolean
-  findEnabledCredential(rawCredential: string): TrustedJwtDigestEntry | null
+  list(): Promise<Array<TrustedJwtDigestEntry>>
+  add(input: { label: string; digest: string }): Promise<TrustedJwtDigestEntry>
+  setEnabled(
+    id: string,
+    enabled: boolean,
+  ): Promise<TrustedJwtDigestEntry | null>
+  remove(id: string): Promise<boolean>
+  findEnabledCredential(
+    rawCredential: string,
+  ): Promise<TrustedJwtDigestEntry | null>
   /** Match a raw credential against all records, including disabled entries. */
-  matchesCredentialDigest(rawCredential: string): boolean
-  containsDigestLiteral(value: string): boolean
+  matchesCredentialDigest(rawCredential: string): Promise<boolean>
+  containsDigestLiteral(value: string): Promise<boolean>
   replaceForTest(entries: ReadonlyArray<TrustedJwtDigestEntry>): void
   resetAfterTest(): void
-}
-
-interface TrustedJwtDigestFile {
-  version: 1
-  entries: Array<TrustedJwtDigestEntry>
 }
 
 const DIGEST_PATTERN = /^[a-f\d]{64}$/i
@@ -53,7 +54,6 @@ const UUID_PATTERN =
 // eslint-disable-next-line no-control-regex -- labels must reject ASCII controls
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/
 const MAX_LABEL_LENGTH = 80
-const FILE_FIELDS = new Set(["entries", "version"])
 const ENTRY_FIELDS = new Set([
   "createdAt",
   "digest",
@@ -156,206 +156,106 @@ function validateEntries(
   return entries
 }
 
-function validateFile(value: unknown): TrustedJwtDigestFile {
-  if (
-    !isRecord(value)
-    || !hasOnlyFields(value, FILE_FIELDS)
-    || value.version !== 1
-    || !Array.isArray(value.entries)
-  ) {
-    return validationError("invalid trusted JWT digest registry")
-  }
-  return { version: 1, entries: validateEntries(value.entries) }
-}
-
-function cloneEntry(entry: TrustedJwtDigestEntry): TrustedJwtDigestEntry {
-  return { ...entry }
-}
-
-function cloneEntries(
-  entries: ReadonlyArray<TrustedJwtDigestEntry>,
-): Array<TrustedJwtDigestEntry> {
-  return entries.map((entry) => cloneEntry(entry))
-}
-
-function isMissingFileError(error: unknown): boolean {
-  return (
-    typeof error === "object"
-    && error !== null
-    && "code" in error
-    && error.code === "ENOENT"
-  )
-}
-
-function createTemporaryFilePath(filePath: string): string {
-  return path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${randomUUID()}.tmp`,
-  )
-}
-
-function persistEntries(
-  filePath: string,
-  entries: ReadonlyArray<TrustedJwtDigestEntry>,
-): void {
-  const contents = `${JSON.stringify({ version: 1, entries }, null, 2)}\n`
-  const directory = path.dirname(filePath)
-  const temporaryPath = createTemporaryFilePath(filePath)
-
-  try {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
-    fs.writeFileSync(temporaryPath, contents, {
-      encoding: "utf8",
-      mode: 0o600,
-    })
-    fs.renameSync(temporaryPath, filePath)
-    try {
-      fs.chmodSync(filePath, 0o600)
-    } catch {
-      // Best effort on filesystems that do not support POSIX modes.
-    }
-  } catch (error) {
-    try {
-      fs.rmSync(temporaryPath, { force: true })
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "failed to persist trusted JWT digests",
-      )
-    }
-    throw error
-  }
-}
-
-function digestCredential(rawCredential: string): Buffer {
+function digestCredential(rawCredential: string): string {
   // Random bearer/JWT lookup contract, not human-password verification.
   // lgtm [js/insufficient-password-hash]
-  return createHash("sha256").update(rawCredential.trim(), "utf8").digest()
-}
-
-function matchesDigest(
-  credentialDigest: Buffer,
-  entry: TrustedJwtDigestEntry,
-): boolean {
-  return crypto.timingSafeEqual(
-    credentialDigest,
-    Buffer.from(entry.digest, "hex"),
-  )
-}
-
-function matchCredentialEntries(
-  rawCredential: string,
-  entries: ReadonlyArray<TrustedJwtDigestEntry>,
-): Array<TrustedJwtDigestEntry> {
-  const credentialDigest = digestCredential(rawCredential)
-  return entries.filter((entry) => matchesDigest(credentialDigest, entry))
-}
-
-function readEntriesFromDisk(filePath: string): Array<TrustedJwtDigestEntry> {
-  try {
-    const raw = fs.readFileSync(filePath)
-    // @ts-expect-error JSON.parse accepts UTF-8 buffers at runtime; this avoids
-    // an unnecessary intermediate string for the complete registry read.
-    return validateFile(JSON.parse(raw) as unknown).entries
-  } catch (error) {
-    if (isMissingFileError(error)) return []
-    throw error
-  }
+  return createHash("sha256").update(rawCredential.trim(), "utf8").digest("hex")
 }
 
 export function createTrustedJwtDigestStore(
-  filePath = PATHS.TRUSTED_JWT_DIGESTS_PATH,
+  storage?: Storage,
 ): TrustedJwtDigestStore {
-  let cachedEntries: Array<TrustedJwtDigestEntry> | null = null
-  let persistenceEnabled = true
-
-  function getEntries(): Array<TrustedJwtDigestEntry> {
-    if (cachedEntries !== null) return cachedEntries
-    cachedEntries = readEntriesFromDisk(filePath)
-    return cachedEntries
+  let testEntries: Array<TrustedJwtDigestEntry> | undefined
+  const repository = () =>
+    createPolicyRepository(storage ?? getStorageRuntime().storage)
+  async function findDigest(
+    digest: string,
+  ): Promise<TrustedJwtDigestEntry | null> {
+    if (testEntries !== undefined) {
+      const entry = testEntries.find((item) => item.digest === digest)
+      return entry ? { ...entry } : null
+    }
+    return repository().findDigest(digest)
   }
-
-  function persist(nextEntries: ReadonlyArray<TrustedJwtDigestEntry>): void {
-    if (persistenceEnabled) persistEntries(filePath, nextEntries)
-  }
-
   return {
-    filePath,
-    list(): Array<TrustedJwtDigestEntry> {
-      return cloneEntries(getEntries())
+    async list() {
+      return testEntries === undefined ?
+          repository().listDigests()
+        : testEntries.map((entry) => ({ ...entry }))
     },
-    add(input: { label: string; digest: string }): TrustedJwtDigestEntry {
-      const entries = getEntries()
-      const label = normalizeLabel(input.label)
-      const digest = normalizeDigest(input.digest)
-      if (entries.some((entry) => entry.digest === digest)) {
-        throw new TrustedJwtDigestConflictError("digest is already registered")
-      }
-      const timestamp = new Date().toISOString()
-      const entry: TrustedJwtDigestEntry = {
-        id: randomUUID(),
-        label,
-        digest,
-        enabled: true,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      }
-      const nextEntries = [...entries, entry]
-      persist(nextEntries)
-      cachedEntries = nextEntries
-      return cloneEntry(entry)
+    async add(input) {
+      return withStorageDeadline(Date.now() + 30_000, async () => {
+        const label = normalizeLabel(input.label)
+        const digest = normalizeDigest(input.digest)
+        if (await findDigest(digest))
+          throw new TrustedJwtDigestConflictError(
+            "digest is already registered",
+          )
+        const timestamp = new Date().toISOString()
+        const entry: TrustedJwtDigestEntry = {
+          id: randomUUID(),
+          label,
+          digest,
+          enabled: true,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }
+        if (testEntries !== undefined) testEntries = [...testEntries, entry]
+        else {
+          try {
+            await repository().addDigest(entry)
+          } catch (error) {
+            if (
+              error instanceof StorageConflictError
+              && (await findDigest(digest))
+            )
+              throw new TrustedJwtDigestConflictError(
+                "digest is already registered",
+              )
+            throw error
+          }
+        }
+        return { ...entry }
+      })
     },
-    setEnabled(id: string, enabled: boolean): TrustedJwtDigestEntry | null {
-      if (typeof enabled !== "boolean") {
+    async setEnabled(id, enabled) {
+      if (typeof enabled !== "boolean")
         return validationError("enabled must be a boolean")
-      }
-      const entries = getEntries()
-      const index = entries.findIndex((entry) => entry.id === id)
-      if (index === -1) return null
-      const entry = entries[index]
-      const updated: TrustedJwtDigestEntry = {
-        ...entry,
-        enabled,
-        updatedAt: new Date().toISOString(),
-      }
-      const nextEntries = entries.map((existing, entryIndex) =>
-        entryIndex === index ? updated : existing,
-      )
-      persist(nextEntries)
-      cachedEntries = nextEntries
-      return cloneEntry(updated)
+      if (testEntries === undefined)
+        return repository().setDigestEnabled(id, enabled)
+      const entry = testEntries.find((item) => item.id === id)
+      if (!entry) return null
+      const updated = { ...entry, enabled, updatedAt: new Date().toISOString() }
+      testEntries = testEntries.map((item) => (item.id === id ? updated : item))
+      return { ...updated }
     },
-    remove(id: string): boolean {
-      const entries = getEntries()
-      const nextEntries = entries.filter((entry) => entry.id !== id)
-      if (nextEntries.length === entries.length) return false
-      persist(nextEntries)
-      cachedEntries = nextEntries
-      return true
+    async remove(id) {
+      if (testEntries === undefined) return repository().removeDigest(id)
+      const before = testEntries.length
+      testEntries = testEntries.filter((entry) => entry.id !== id)
+      return before !== testEntries.length
     },
-    findEnabledCredential(rawCredential: string): TrustedJwtDigestEntry | null {
-      const entries = getEntries()
+    async findEnabledCredential(rawCredential) {
       const candidate = rawCredential.trim().toLowerCase()
-      if (entries.some((entry) => entry.digest === candidate)) return null
-      const match = matchCredentialEntries(rawCredential, entries).find(
-        (entry) => entry.enabled,
-      )
-      return match ? cloneEntry(match) : null
+      if (DIGEST_PATTERN.test(candidate) && (await findDigest(candidate)))
+        return null
+      const match = await findDigest(digestCredential(rawCredential))
+      return match?.enabled ? match : null
     },
-    matchesCredentialDigest(rawCredential: string): boolean {
-      return matchCredentialEntries(rawCredential, getEntries()).length > 0
+    async matchesCredentialDigest(rawCredential) {
+      return (await findDigest(digestCredential(rawCredential))) !== null
     },
-    containsDigestLiteral(value: string): boolean {
+    async containsDigestLiteral(value) {
       const candidate = value.trim().toLowerCase()
-      return getEntries().some((entry) => entry.digest === candidate)
+      return (
+        DIGEST_PATTERN.test(candidate) && (await findDigest(candidate)) !== null
+      )
     },
-    replaceForTest(entries: ReadonlyArray<TrustedJwtDigestEntry>): void {
-      cachedEntries = validateEntries(entries)
-      persistenceEnabled = false
+    replaceForTest(entries) {
+      testEntries = validateEntries(entries)
     },
-    resetAfterTest(): void {
-      cachedEntries = null
-      persistenceEnabled = true
+    resetAfterTest() {
+      testEntries = undefined
     },
   }
 }

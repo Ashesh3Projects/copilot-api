@@ -9,6 +9,10 @@ import {
 } from "~/routes/chat-completions/chat-candidates"
 import { prepareChatCompletionsRequest } from "~/routes/chat-completions/chat-contract"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 
 afterEach(() => {

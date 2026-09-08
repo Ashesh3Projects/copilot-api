@@ -18,6 +18,14 @@ import { state } from "~/lib/state"
 import { selectChatUpstreamEndpoint } from "~/routes/chat-completions/handler"
 import { server } from "~/server"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 test.each([
   { name: "empty body", body: "" },
   {
@@ -31,11 +39,16 @@ test.each([
   )
 
   try {
-    const response = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body,
+      }),
+    )
     const responseBody = await response.json()
     const diagnostics = JSON.stringify([
       responseBody,
@@ -390,11 +403,16 @@ test.each([
     supported_endpoints: ["/v1/messages"],
   })
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "route-model", stream: false, ...body }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "route-model", stream: false, ...body }),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/v1/messages")
@@ -1058,26 +1076,31 @@ async function postChatRoute(options: {
     { role: "user", content },
   ]
 
-  return await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: options.model ?? "route-model",
-      messages,
-      ...(options.maxTokens !== undefined ?
-        { max_tokens: options.maxTokens }
-      : {}),
-      ...(options.maxCompletionTokens !== undefined ?
-        { max_completion_tokens: options.maxCompletionTokens }
-      : {}),
-      ...(options.hasTools || tools !== undefined ? { tools } : {}),
-      ...(options.toolChoice !== undefined ?
-        { tool_choice: options.toolChoice }
-      : {}),
-      ...(options.thinkingBudget ? { thinking_budget: 1024 } : {}),
-      stream: false,
+  return await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: options.model ?? "route-model",
+        messages,
+        ...(options.maxTokens !== undefined ?
+          { max_tokens: options.maxTokens }
+        : {}),
+        ...(options.maxCompletionTokens !== undefined ?
+          { max_completion_tokens: options.maxCompletionTokens }
+        : {}),
+        ...(options.hasTools || tools !== undefined ? { tools } : {}),
+        ...(options.toolChoice !== undefined ?
+          { tool_choice: options.toolChoice }
+        : {}),
+        ...(options.thinkingBudget ? { thinking_budget: 1024 } : {}),
+        stream: false,
+      }),
     }),
-  })
+  )
 }
 
 function createRouteContent(options: {

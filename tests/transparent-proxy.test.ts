@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeEach, expect, mock, test } from "bun:test"
 
 import { setIpAllowlistForTest } from "../src/lib/ip-allowlist"
@@ -10,6 +12,12 @@ import {
 } from "../src/lib/ip-blocker"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalApiKeyAuth = state.apiKeyAuth
 const originalFetch = globalThis.fetch
@@ -27,13 +35,14 @@ const fetchMock = mock((url: string | URL | Request, _init?: RequestInit) => {
   })
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   state.apiKeyAuth = "test-secret-key"
   resetIpSecurityForTest()
   setIpAllowlistForTest([])
   fetchMock.mockClear()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch =
     fetchMock as unknown as typeof fetch
+  await seedProtocolDatabase({ gatewayKeys: ["test-secret-key"] })
 })
 
 afterAll(() => {

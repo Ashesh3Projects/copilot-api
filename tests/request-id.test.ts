@@ -24,11 +24,18 @@ import {
   type RoutingAffinity,
 } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let lastHeaders: Record<string, string> | undefined
@@ -94,23 +101,47 @@ beforeEach(() => {
   state.githubToken = "github-token"
   state.isMultiToken = false
   state.manualApprove = false
-  state.models = undefined
+  state.models = {
+    object: "list",
+    data: [
+      {
+        id: "gpt-4o",
+        name: "GPT-4o",
+        object: "model",
+        version: "test",
+        vendor: "openai",
+        model_picker_enabled: true,
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: { max_output_tokens: 4096 },
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+    ],
+  }
   resetRoutingTelemetryForTest()
 })
 
 test("reuses an inbound request ID for both upstream and client responses", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-request-id": "req-from-client",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-request-id": "req-from-client",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastHeaders?.["X-Request-Id"]).toBe("req-from-client")
@@ -118,17 +149,20 @@ test("reuses an inbound request ID for both upstream and client responses", asyn
 })
 
 test("generates a request ID when the client does not supply one", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   const generatedRequestId = response.headers.get("x-request-id")
 
@@ -141,18 +175,21 @@ test("generates a request ID when the client does not supply one", async () => {
 })
 
 test("exposes Copilot client session affinity in the provider path", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-client-session-id": "copilot-conversation",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-client-session-id": "copilot-conversation",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastRoutingAffinity).toEqual({
@@ -171,22 +208,25 @@ test("redacts routing affinity headers from debug request logs", async () => {
   const consoleLog = spyOn(console, "log").mockImplementation(() => undefined)
   state.debug = true
   try {
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-claude-code-session-id": rawAffinityIds[0] ?? "",
-        "x-client-session-id": rawAffinityIds[1] ?? "",
-        "session-id": rawAffinityIds[2] ?? "",
-        "thread-id": rawAffinityIds[3] ?? "",
-        "x-harmless-debug-header": "harmless-visible-value",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "x-claude-code-session-id": rawAffinityIds[0] ?? "",
+          "x-client-session-id": rawAffinityIds[1] ?? "",
+          "session-id": rawAffinityIds[2] ?? "",
+          "thread-id": rawAffinityIds[3] ?? "",
+          "x-harmless-debug-header": "harmless-visible-value",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     const output = consoleLog.mock.calls.flat().join("\n")
@@ -215,82 +255,107 @@ test("redacts routing affinity metadata from debug request bodies", async () => 
   const consoleLog = spyOn(console, "log").mockImplementation(() => undefined)
   state.debug = true
   try {
-    await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
-        harmless_root: "keep-root",
-        session_id: rawIds[4],
-        thread_id: rawIds[5],
-        client_metadata: {
-          session_id: rawIds[0],
-          thread_id: rawIds[1],
-          device_id: "keep-device",
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
         },
-        metadata: {
-          user_id: JSON.stringify({
-            session_id: rawIds[3],
-            account_uuid: "keep-account",
-          }),
-        },
-        unrelated_tool_arguments: {
-          session_id: "keep-unrelated-session",
-          thread_id: "keep-unrelated-thread",
-        },
-      }),
-    })
-    await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
-        client_metadata: JSON.stringify({
-          session_id: rawIds[2],
-          device_id: "keep-string-device",
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+          harmless_root: "keep-root",
+          session_id: rawIds[4],
+          thread_id: rawIds[5],
+          client_metadata: {
+            session_id: rawIds[0],
+            thread_id: rawIds[1],
+            device_id: "keep-device",
+          },
+          metadata: {
+            user_id: JSON.stringify({
+              session_id: rawIds[3],
+              account_uuid: "keep-account",
+            }),
+          },
+          unrelated_tool_arguments: {
+            session_id: "keep-unrelated-session",
+            thread_id: "keep-unrelated-thread",
+          },
         }),
       }),
-    })
-    await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
-        client_metadata: `{"session_id":"${rawIds[6]}`,
-      }),
-    })
-    await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
-        metadata: JSON.stringify({
-          harmless_metadata: "keep-outer-metadata",
-          user_id: JSON.stringify({
-            session_id: "outer-metadata-session-private",
-            account_uuid: "keep-outer-account",
+    )
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+          client_metadata: JSON.stringify({
+            session_id: rawIds[2],
+            device_id: "keep-string-device",
           }),
         }),
       }),
-    })
-    await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "Hello" }],
-        max_tokens: 32,
-        metadata: `{"user_id":"outer-malformed-private`,
+    )
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+          client_metadata: `{"session_id":"${rawIds[6]}`,
+        }),
       }),
-    })
+    )
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+          metadata: JSON.stringify({
+            harmless_metadata: "keep-outer-metadata",
+            user_id: JSON.stringify({
+              session_id: "outer-metadata-session-private",
+              account_uuid: "keep-outer-account",
+            }),
+          }),
+        }),
+      }),
+    )
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          max_tokens: 32,
+          metadata: `{"user_id":"outer-malformed-private`,
+        }),
+      }),
+    )
 
     const output = consoleLog.mock.calls.flat().join("\n")
     for (const rawId of rawIds) expect(output).not.toContain(rawId)
@@ -647,17 +712,20 @@ test("forwards upstream quota snapshot headers to the client response", async ()
     "x-quota-snapshot-chat": "remaining=42;limit=100",
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(response.headers.get("x-quota-snapshot-chat")).toBe(
@@ -677,17 +745,20 @@ test("does not forward stale quota headers from a failed upstream retry attempt"
     }),
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(response.headers.get("x-quota-snapshot-chat")).toBeNull()
@@ -709,18 +780,21 @@ test("publishes safe metadata from only the final returned attempt", async () =>
     }),
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-request-id": "gateway-request-id",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-request-id": "gateway-request-id",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.headers.get("x-copilot-service-request-id")).toBe(
     "successful-attempt",
@@ -745,15 +819,20 @@ test("publishes safe metadata from a terminal upstream error", async () => {
     ),
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(400)
   expect(response.headers.get("retry-after")).toBe("15")
@@ -763,15 +842,20 @@ test("publishes safe metadata from a terminal upstream error", async () => {
 })
 
 test("records one routed client request after HTTP model handling", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      max_tokens: 32,
-      messages: [{ role: "user", content: "Hello" }],
-      model: "gpt-4o",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        max_tokens: 32,
+        messages: [{ role: "user", content: "Hello" }],
+        model: "gpt-4o",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   const snapshot = getRoutingTelemetrySnapshot({
@@ -787,7 +871,7 @@ test("records one routed client request after HTTP model handling", async () => 
 })
 
 test("does not record non-model dashboard traffic", async () => {
-  await server.request("/dashboard")
+  await seedProtocolDatabase().then(() => server.request("/dashboard"))
 
   const snapshot = getRoutingTelemetrySnapshot({
     accounts: [],

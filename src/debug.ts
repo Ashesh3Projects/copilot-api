@@ -2,10 +2,14 @@
 
 import { defineCommand } from "citty"
 import consola from "consola"
-import fs from "node:fs/promises"
 import os from "node:os"
 
-import { PATHS } from "./lib/paths"
+import packageJson from "../package.json" with { type: "json" }
+import {
+  initializeStorageRuntime,
+  closeStorageRuntime,
+} from "./lib/storage/runtime"
+import { hasStoredAccounts } from "./lib/storage/runtime-status"
 
 interface DebugInfo {
   version: string
@@ -15,29 +19,12 @@ interface DebugInfo {
     platform: string
     arch: string
   }
-  paths: {
-    APP_DIR: string
-    GITHUB_TOKEN_PATH: string
-  }
+  storage: { kind: string }
   tokenExists: boolean
 }
 
 interface RunDebugOptions {
   json: boolean
-}
-
-async function getPackageVersion(): Promise<string> {
-  try {
-    const packageJsonPath = new URL("../package.json", import.meta.url).pathname
-    // @ts-expect-error https://github.com/sindresorhus/eslint-plugin-unicorn/blob/v59.0.1/docs/rules/prefer-json-parse-buffer.md
-    // JSON.parse() can actually parse buffers
-    const packageJson = JSON.parse(await fs.readFile(packageJsonPath)) as {
-      version: string
-    }
-    return packageJson.version
-  } catch {
-    return "unknown"
-  }
 }
 
 function getRuntimeInfo() {
@@ -51,44 +38,27 @@ function getRuntimeInfo() {
   }
 }
 
-async function checkTokenExists(): Promise<boolean> {
-  try {
-    const stats = await fs.stat(PATHS.GITHUB_TOKEN_PATH)
-    if (!stats.isFile()) return false
-
-    const content = await fs.readFile(PATHS.GITHUB_TOKEN_PATH, "utf8")
-    return content.trim().length > 0
-  } catch {
-    return false
-  }
-}
-
 async function getDebugInfo(): Promise<DebugInfo> {
-  const [version, tokenExists] = await Promise.all([
-    getPackageVersion(),
-    checkTokenExists(),
-  ])
-
-  return {
-    version,
-    runtime: getRuntimeInfo(),
-    paths: {
-      APP_DIR: PATHS.APP_DIR,
-      GITHUB_TOKEN_PATH: PATHS.GITHUB_TOKEN_PATH,
-    },
-    tokenExists,
+  const runtime = await initializeStorageRuntime()
+  try {
+    const tokenExists = await hasStoredAccounts(runtime.storage)
+    return {
+      version: packageJson.version,
+      runtime: getRuntimeInfo(),
+      storage: { kind: runtime.config.kind },
+      tokenExists,
+    }
+  } finally {
+    await closeStorageRuntime()
   }
 }
-
 function printDebugInfoPlain(info: DebugInfo): void {
   consola.info(`copilot-api debug
 
 Version: ${info.version}
 Runtime: ${info.runtime.name} ${info.runtime.version} (${info.runtime.platform} ${info.runtime.arch})
 
-Paths:
-- APP_DIR: ${info.paths.APP_DIR}
-- GITHUB_TOKEN_PATH: ${info.paths.GITHUB_TOKEN_PATH}
+Database: ${info.storage.kind}
 
 Token exists: ${info.tokenExists ? "Yes" : "No"}`)
 }

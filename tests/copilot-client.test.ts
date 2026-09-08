@@ -10,8 +10,8 @@ import {
 } from "bun:test"
 import consola from "consola"
 
-/* eslint-disable max-lines -- Copilot client integration cases share singleton fetch fixtures */
 import { runWithCopilotRequestAttribution } from "../src/lib/copilot-request-context"
+/* eslint-disable max-lines -- Copilot client integration cases share singleton fetch fixtures */
 import {
   clearLlmDebugLogs,
   getLlmDebugLog,
@@ -20,7 +20,7 @@ import {
 } from "../src/lib/llm-debug-log"
 import { runWithRoutingAffinity } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
@@ -43,6 +43,9 @@ import {
   PRE_HEADER_MAX_DELAY_SECONDS,
   setTransportEventSinkForTest,
 } from "../src/services/copilot/transport-retry"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalState = {
@@ -148,7 +151,7 @@ afterAll(() => {
   Object.assign(state, originalState)
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   queuedResults.length = 0
   capturedRequests.length = 0
@@ -158,7 +161,7 @@ beforeEach(() => {
     httpRetrySleeps.push(ms)
     return Promise.resolve()
   })
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetRoutingTelemetryForTest()
   state.accountType = "individual"
   state.githubInstanceDomain = "github.com"
@@ -670,7 +673,7 @@ test("does not retry aborted upstream fetches", async () => {
   expect(thrownError.message).toContain("aborted")
 
   expect(capturedRequests).toHaveLength(1)
-  expect(listLlmDebugLogs().entries[0]?.status).toBe("aborted")
+  expect((await listLlmDebugLogs()).entries[0]?.status).toBe("aborted")
 })
 
 test("marks an aborted debug clone-body read as aborted", async () => {
@@ -683,9 +686,13 @@ test("marks an aborted debug clone-body read as aborted", async () => {
   Object.defineProperty(response, "clone", {
     configurable: true,
     value: () =>
-      ({
-        text: () => Promise.reject(abortError),
-      }) as unknown as Response,
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(abortError)
+          },
+        }),
+      ),
   })
   queuedResults.push(response)
 
@@ -699,7 +706,7 @@ test("marks an aborted debug clone-body read as aborted", async () => {
   })
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  const entry = listLlmDebugLogs().entries[0]
+  const entry = (await listLlmDebugLogs()).entries[0]
   expect(entry).toBeDefined()
   expect(entry.status).toBe("aborted")
   expect(entry.responseStatus).toBe(200)
@@ -730,18 +737,16 @@ test("captures raw LLM request and response attempts for dashboard debugging", a
   await response.text()
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  const logs = listLlmDebugLogs()
+  const logs = await listLlmDebugLogs()
   expect(logs.count).toBe(1)
   expect(logs.entries[0]?.model).toBe("gpt-debug")
   expect(logs.entries[0]?.requestId).toBe("req-capture")
   expect(logs.entries[0]?.requestPreview).toContain("debug capture")
   expect(logs.entries[0]?.responseStatus).toBe(200)
   expect(logs.entries[0]?.responsePreview).toContain("choices")
-  const detail = getLlmDebugLog(logs.entries[0]?.id ?? "")
+  const detail = await getLlmDebugLog(logs.entries[0]?.id ?? "")
   expect(detail?.request.body).toBe(requestBody)
-  expect(detail?.request.headers.Authorization).toBe(
-    "Bearer expired-copilot-token",
-  )
+  expect(detail?.request.headers.Authorization).toBe("[REDACTED]")
   expect(detail?.response?.body).toBe('{"choices":[]}')
 })
 
@@ -772,8 +777,8 @@ test("keeps raw native Responses terminal bodies exact in LLM Debug", async () =
   await response.text()
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  const summary = listLlmDebugLogs().entries[0]
-  const detail = getLlmDebugLog(summary.id)
+  const summary = (await listLlmDebugLogs()).entries[0]
+  const detail = await getLlmDebugLog(summary.id)
   expect(detail?.response?.body).toBe(rawBody)
   expect(detail?.response?.body).toContain(privateMarker)
 })
@@ -1320,7 +1325,7 @@ test("keeps revoked transport values bounded on the Responses debug path", async
   ).toBe(true)
 
   expect(capturedRequests).toHaveLength(1)
-  const entry = listLlmDebugLogs().entries[0]
+  const entry = (await listLlmDebugLogs()).entries[0]
   expect(entry.status).toBe("error")
   expect(entry.errorMessage).toBe("Unknown thrown value")
 })
@@ -1500,9 +1505,9 @@ test("records the connection error code and full path in LLM debug", async () =>
   }
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  const summary = listLlmDebugLogs().entries[0]
+  const summary = (await listLlmDebugLogs()).entries[0]
   expect(summary).toBeDefined()
-  const entry = getLlmDebugLog(summary.id)
+  const entry = await getLlmDebugLog(summary.id)
   expect(entry?.error?.code).toBe("ECONNRESET")
   expect(entry?.error?.errno).toBe(0)
   expect(entry?.error?.path).toBe(
@@ -1581,8 +1586,8 @@ test("records cause-level errno and full path in LLM debug", async () => {
   }
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  const summary = listLlmDebugLogs().entries[0]
-  const entry = getLlmDebugLog(summary.id)
+  const summary = (await listLlmDebugLogs()).entries[0]
+  const entry = await getLlmDebugLog(summary.id)
   expect(entry?.error?.code).toBe("ECONNRESET")
   expect(entry?.error?.errno).toBe(0)
   expect(entry?.error?.path).toBe(

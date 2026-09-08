@@ -12,6 +12,10 @@ import {
   validateModelFallbackConfig,
 } from "~/lib/model-fallback-config"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 function history(signatures: Array<string>) {
   return {
     model: "race-a",

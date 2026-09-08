@@ -8,6 +8,14 @@ import { state } from "~/lib/state"
 import { responsesWebSocket } from "~/routes/responses/websocket"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
 const pdf = Buffer.from("%PDF-1.4\nsynthetic fixture\n%%EOF").toString("base64")
@@ -131,6 +139,9 @@ function setEndpoints(endpoints: Array<string>): void {
 function socket() {
   const sent: Array<string> = []
   const data: ResponsesWebSocketData = {
+    authenticationRequest: new Request("http://localhost/responses", {
+      headers: { authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}` },
+    }),
     activeTurns: new Map(),
     closed: false,
     nextTurnSequence: 0,
@@ -157,9 +168,11 @@ async function dispatch(
 ) {
   if (transport === "ws") {
     const ws = socket()
-    await responsesWebSocket.message(
-      ws,
-      JSON.stringify({ type: "response.create", ...body }),
+    await seedProtocolDatabase().then(() =>
+      responsesWebSocket.message(
+        ws,
+        JSON.stringify({ type: "response.create", ...body }),
+      ),
     )
     expect(
       ws.sent.map((frame) => JSON.parse(frame) as { type: string }).at(-1)
@@ -167,11 +180,16 @@ async function dispatch(
     ).toBe("response.completed")
     return
   }
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...body, stream: transport === "http-stream" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...body, stream: transport === "http-stream" }),
+    }),
+  )
   expect(response.status).toBe(200)
   await response.text()
 }
@@ -228,13 +246,15 @@ test("translated PDF dispatch resolves each URL once", async () => {
 test("native WebSocket warmup never fetches attachments or dispatches inference", async () => {
   setEndpoints(["/responses", "/v1/messages", "/chat/completions"])
   const ws = socket()
-  await responsesWebSocket.message(
-    ws,
-    JSON.stringify({
-      type: "response.create",
-      ...requestBody({ file_url: "https://example.test/fixture.pdf" }),
-      generate: false,
-    }),
+  await seedProtocolDatabase().then(() =>
+    responsesWebSocket.message(
+      ws,
+      JSON.stringify({
+        type: "response.create",
+        ...requestBody({ file_url: "https://example.test/fixture.pdf" }),
+        generate: false,
+      }),
+    ),
   )
   expect(
     ws.sent.map((frame) => JSON.parse(frame) as { type: string }).at(-1)?.type,

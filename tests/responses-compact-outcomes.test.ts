@@ -6,6 +6,14 @@ import { state } from "~/lib/state"
 import { tokenPool } from "~/lib/token-pool"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
 let upstreamBody: Record<string, unknown>
@@ -98,14 +106,20 @@ function responsesResult(
 }
 
 function compactRequest(headers: Record<string, string> = {}) {
-  return server.request("/v1/responses/compact", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify({
-      model: "compact-model",
-      input: [{ role: "user", content: "Keep the current task state." }],
+  return seedProtocolDatabase().then(() =>
+    server.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify({
+        model: "compact-model",
+        input: [{ role: "user", content: "Keep the current task state." }],
+      }),
     }),
-  })
+  )
 }
 
 async function readSummary(response: Response): Promise<string> {
@@ -274,27 +288,32 @@ test.each([
       stop_sequence: null,
       usage: { input_tokens: 10, output_tokens: 5 },
     }
-    const response = await server.request("/v1/responses/compact", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "compact-model",
-        input: [
-          {
-            type: "custom_tool_call",
-            call_id: "call_summary",
-            name: "exec",
-            input: "run build",
-          },
-          {
-            type: "custom_tool_call_output",
-            call_id: "call_summary",
-            output,
-          },
-          { role: "user", content: "Keep the build result." },
-        ],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses/compact", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "compact-model",
+          input: [
+            {
+              type: "custom_tool_call",
+              call_id: "call_summary",
+              name: "exec",
+              input: "run build",
+            },
+            {
+              type: "custom_tool_call_output",
+              call_id: "call_summary",
+              output,
+            },
+            { role: "user", content: "Keep the build result." },
+          ],
+        }),
       }),
-    })
+    )
     expect(await readSummary(response)).toBe("The tool result is retained.")
     expect(upstreamPath).toBe("/v1/messages")
     expect(JSON.stringify(upstreamBody)).toContain("BUILD SUCCEEDED")
@@ -309,15 +328,20 @@ test("ordinary Responses still forwards an incomplete generation", async () => {
     status: "incomplete",
     incomplete_details: { reason: "max_output_tokens" },
   }
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "compact-model",
-      input: "hello",
-      stream: false,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "compact-model",
+        input: "hello",
+        stream: false,
+      }),
     }),
-  })
+  )
   expect(response.status).toBe(200)
   expect(await response.json()).toMatchObject({
     status: "incomplete",

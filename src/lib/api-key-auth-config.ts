@@ -1,12 +1,12 @@
+/** Legacy flags are accepted only as explicit migration input, never runtime authority. */
 export function resolveApiKeyAuth(
   cliValue: string | undefined,
-  environmentValue: string | undefined,
+  _environmentValue: string | undefined,
 ): string | undefined {
-  if (cliValue === undefined) return undefined
-  if (cliValue !== "" && cliValue !== "true") return cliValue
-  if (environmentValue) return environmentValue
-
-  throw new Error(
-    "--api-key-auth requires a value or COPILOT_API_KEY_AUTH environment variable",
-  )
+  if (cliValue !== undefined) {
+    throw new Error(
+      "--api-key-auth no longer configures runtime credentials; use admin --setup-code or storage import-legacy --from-env",
+    )
+  }
+  return undefined
 }

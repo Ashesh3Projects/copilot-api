@@ -1,0 +1,52 @@
+# Independent CodeQL triage for PR #112
+
+Reviewed source baseline: 09377f7. Production-source review was read-only. Alert metadata was fetched with a read-only GitHub REST query scoped to refs/pull/112/merge; no alert dismissal, scanner/configuration weakening, or remote mutation was performed. Recommendations below are per actual input flow, not a blanket SHA-256 exemption.
+
+## Dispositions
+
+| Alert | Source / actual role | Recommended disposition |
+| --- | --- | --- |
+| 17 | src/lib/oauth-store.ts:62-63 createPkceChallenge hashes an OAuth PKCE verifier to an S256 challenge; OAuthRepository.exchangeAuthorizationCode recomputes it and checks the stored challenge plus client, redirect URI, state, code lifetime/consumption. | False-positive password classification. SHA-256/base64url is the S256 protocol operation, not a reusable human-password verifier. Keep it unchanged; substituting Argon2 would break interoperability. |
+| 18 | src/lib/storage/account-mutation.ts:8-22 canonicalizes actual repository arguments and hashes them into input_digest. bindAccountMutation includes kind, prior request digest, and actual argument values. Account credentials remain in their dedicated credential rows; authorization does not accept this marker digest. | False-positive password classification. This is collision-resistant operation identity, needed to reject reusing a receipt for different account/credential input. Do not remove secret-dependent input binding or replace it with randomized hashing. |
+| 19 | src/lib/storage/admin-repository.ts:30-31 hashes mutation metadata / actor values. Setup and password-change metadata contain an already salted Argon2id PHC verifier, not the raw administrator password. The actual capi_admin.password_hash receives that PHC string, and login uses Bun.password.verify after parameter validation. | False-positive password classification for the reported hash-of-hash flow. This SHA-256 does not create a cheaper password verifier: testing a password candidate still requires the original Argon2 derivation with its salt. Keep the operation fingerprint; actual password KDF is detailed below. |
+| 20 | src/lib/storage/credentials-repository.ts:15-16 credentialDigest serves generated gateway/inference/OAuth secret lookups, imported/user-selected gateway lookups, and operation binding. Newly generated gateway keys use randomBytes(32); initial browser setup accepts any nonempty operator value. | Mixed-use accepted design, not blanket false positive. SHA-256 is suitable for lookup of high-entropy random bearer values. Low-entropy manual keys remain inexpensive to guess offline if digest state is obtained. Preserve compatible lookup semantics, explicitly document this limitation, recommend/generated CSPRNG keys, and classify an accepted-risk/wont-fix disposition for weak manual-key compatibility rather than asserting all callers have high entropy. |
+| 21 | src/lib/storage/providers-repository.ts:168-184 hashes the serialized provider mutation input (including API key / clear flags) into request input_digest. | False-positive password classification. The digest binds an operation to its exact authenticated request; it is not the provider's password-verification mechanism. Provider secrets must remain recoverable for outbound authentication in capi_provider_secrets. A digest is not encryption and this conclusion does not claim low-entropy input secrecy. |
+| 22 | src/lib/storage/providers-repository.ts:256-267 hashes prior input_digest plus validated repository input. It prevents a copied operation identity being reused to rotate another credential or change another provider. | False-positive password classification for operation identity. Preserve deterministic, secret-dependent binding; targeted copied-identity and uncertain-commit tests pass. |
+| 23 | src/lib/storage/transfer-records.ts:349-350 shared sha256 helper covers backup field/checksum/manifest validation and legacy source fingerprints, but ALSO src/lib/storage/legacy-import.ts:331-332 imported gateway key IDs and lookup digests. | Mixed-use accepted design, same weak-manual-key caveat as 20. Integrity/manifest/source-fingerprint uses are not password storage. Imported gateway digests deliberately preserve legacy authority and may originate from low-entropy keys. Do not dismiss the entire helper as integrity-only or high-entropy-only. Preserve compatibility and explicitly document the accepted lookup risk. |
+| 24 | tests/legacy-import-credentials.test.ts:13-14 hashes a freshly created Argon2id verifier to reproduce the legacy credentialFingerprint format; other calls use synthetic OAuth-token fixtures. The test imports and compares the original Argon2id PHC verifier. | False-positive / test-fixture classification. No production plaintext password is being converted into a SHA-256 login verifier. Keep the fixture format test. |
+| 7 (and equivalent existing 6) | src/lib/request-auth.ts:101-112 resolveCustomApiKeys hashes both in-memory supplied and expected bearer values only to obtain fixed-length buffers for timingSafeEqual. These digests are not persisted by this function. The custom getApiKeys path is separate from the default database resolver. | False-positive password-storage classification. Transient fixed-length comparison is not password-at-rest storage. This does not upgrade the entropy of an operator-selected key. |
+| 12 | src/start.ts:414-417 sets NODE_TLS_REJECT_UNAUTHORIZED=0 only when the operator explicitly supplies --insecure. The option is not the default and startup warns; it globally disables upstream certificate verification for the process. | True behavior, intentional operator option / accepted risk (wont-fix if retained), not false positive. Retaining a compatibility escape hatch does not make TLS verification effective under that flag. Disclose the scope and prefer installing trusted CA roots. |
+| 2 / 3 | src/routes/dashboard/api.ts call sites invoke session-store createSession and environment-store enqueueWork; scanner traces to Math.random in session-ID generation. Session IDs enter bridge coordination/capability contexts. | Source correction is appropriate. Use cryptographic randomness while preserving any externally required ID shape. Parent owns the active fix and regression. Do not close solely from call-site auth or by suppressing the rule. This review does not certify the parent's in-progress source diff. |
+
+Other repository alerts (including 10 and 16) appeared in the scoped API metadata but were outside the parent's listed PR annotations; they were not adjudicated or modified in this report.
+
+## Actual administrator password boundary
+
+src/lib/admin-auth.ts:83-88 uses Bun.password.hash with Argon2id, memoryCost 65,536 KiB, timeCost 3. validateAdminPasswordHash enforces Argon2id v19 PHC format, memory 65,536..1,048,576 KiB, time 3..10, parallelism 1..16, canonical salt at least 16 bytes, and hash at least 32 bytes. Login validates the stored PHC string and calls Bun.password.verify. Setup, login, password change/reset, and transfer imports preserve that boundary.
+
+The compatibility password minimum is four characters; that is the administrator PASSWORD minimum, not a gateway key minimum. A separate correct gateway key is also required for dashboard login. This review does not claim that a four-character password has strong entropy merely because the KDF parameters are strong.
+
+## Genuine manual bearer-key limitation
+
+The initial gateway-key path requires only a trimmed nonempty key (src/lib/admin-auth.ts:193-211 and auth-route.ts:157-166); the initial UI also checks nonemptiness. A local synthetic probe successfully set up gateway key x, resolved that key from the credentials repository, and verified the independent administrator verifier remained Argon2id. Thus high entropy is a user responsibility in this compatibility path, not an enforced invariant.
+
+The generated-key path uses randomBytes(32). The recommended compatible improvement is to offer/recommend generating a cryptographically random initial gateway key and clearly warn against short or memorable manual keys; retain accepted existing keys and import semantics. A different slow-verifier/index design would require a separate compatibility, performance, and migration decision; it should not be improvised to make this password-hash alert disappear. SHA-256 operation fingerprints and hashes are not guarantees of secrecy for low-entropy inputs.
+
+Parent confirmed retention of the compatible bearer lookup design with explicit documentation of this risk. Any alert administration should preserve that accepted-risk rationale for 20/23; do not describe those complete helpers as purely nonsecurity checksums or universally high-entropy tokens. Inform the user of the retained weak-manual-key limitation as part of the release assessment.
+
+## Verification
+
+49 tests passed / 0 failed, 233 assertions in fresh local runs with synthetic credentials, isolated DATA_DIR/TEMP/TMP, and Turso variables cleared before imports:
+
+- Independent triage probes: 2 pass, 6 assertions; PKCE standard S256 vector and one-character manual gateway plus actual Argon2 verification.
+- Administrator auth: 13 pass, 76 assertions; setup, login, password changes, rollback, session invalidation, Argon2 bounds, and OAuth preservation.
+- OAuth storage: 11 pass, 50 assertions; digest storage, wrong PKCE bindings, durable scopes/revocation and refresh.
+- Provider credential storage: 12 pass, 44 assertions; rotation, copied operation identities, commit reconciliation, and separate provider metadata/secret storage.
+- GitHub auth flow: 3 pass, 21 assertions; S256 and loopback callback/state behavior.
+- Legacy credential import plus nightly contracts: 8 pass, 36 assertions.
+
+Logs and audit probes are under final_storage/codeql-independent-test.log, codeql-boundary-tests.log, and codeql-targeted-test.log. No credential cracking, third-party probing, or raw live credential data was used.
+
+## Prior nightly P2 closure
+
+Reviewed the parent's fix: sequential CLI installs, unconditional version checks, SMOKE_REQUIRE_CLIENTS=1 in nightly, and a preflight requiring all three clients before any test. The original missing-client reproducer now exits 1 with Required smoke client missing: claude before running the direct probe. The five nightly contract tests pass, and mandatory npm run typecheck --prefix ui is now present in CI. The previously reported false-green nightly issue is closed for the reviewed code.

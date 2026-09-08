@@ -3,6 +3,10 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 import { adaptResponsesToChatCandidate } from "~/routes/responses/responses-chat-adapter"
 import { COMPACTION_PAYLOAD_MAX_BYTES } from "~/services/copilot/compaction-payload"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 
 afterEach(() => {

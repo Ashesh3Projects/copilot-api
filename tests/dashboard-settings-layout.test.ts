@@ -8,6 +8,8 @@ import { renderToStaticMarkup } from "../ui/node_modules/react-dom/server.bun.js
 import { createElement } from "../ui/node_modules/react/index.js"
 
 const settingsBundle = {
+  credentials: [],
+  groq: false,
   settings: {
     version: "2.0.10",
     port: "4141",

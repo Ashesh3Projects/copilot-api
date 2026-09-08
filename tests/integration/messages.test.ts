@@ -1,6 +1,9 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
 import {
+  useIntegrationFixture,
   initializeTestState,
   postJSON,
   collectSSEEvents,
@@ -46,6 +49,8 @@ interface AnthropicStreamEvent {
   index?: number
   usage?: AnthropicUsage
 }
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

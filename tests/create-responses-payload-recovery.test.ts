@@ -8,6 +8,13 @@ import {
   RESPONSES_RECOVERY_MARGIN_BYTES,
 } from "~/services/copilot/responses-payload-recovery"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalAccountType = state.accountType
 const originalCopilotToken = state.copilotToken
@@ -55,25 +62,27 @@ test("recovers oversized ordinary Responses payloads before one upstream dispatc
     "BEGIN-ORDINARY\n" + "x".repeat(26 * 1024 * 1024) + "\nEND-ORDINARY"
   const inlineFile = `data:application/pdf;base64,${"A".repeat(7 * 1024 * 1024)}`
 
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          type: "custom_tool_call_output",
-          call_id: "call_ordinary",
-          output: [
-            { type: "input_text", text: preservedOutput },
-            {
-              type: "input_file",
-              filename: "oversized.pdf",
-              file_data: inlineFile,
-            },
-          ],
-        },
-      ],
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_ordinary",
+            output: [
+              { type: "input_text", text: preservedOutput },
+              {
+                type: "input_file",
+                filename: "oversized.pdf",
+                file_data: inlineFile,
+              },
+            ],
+          },
+        ],
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(requestBodies).toHaveLength(1)
@@ -92,19 +101,23 @@ test("recovers oversized ordinary Responses payloads before one upstream dispatc
 })
 
 test("rejects oversized ordinary preserved text without calling upstream", async () => {
-  const error = await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      createResponses(
         {
-          type: "message",
-          role: "developer",
-          content: "preserved".repeat(4 * 1024 * 1024),
+          model: "gpt-4o",
+          input: [
+            {
+              type: "message",
+              role: "developer",
+              content: "preserved".repeat(4 * 1024 * 1024),
+            },
+          ],
         },
-      ],
-    },
-    { vision: false, initiator: "user" },
-  ).catch((caught: unknown) => caught)
+        { vision: false, initiator: "user" },
+      ),
+    )
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(LocalHTTPError)
   expect((error as LocalHTTPError).response.status).toBe(413)
@@ -118,25 +131,27 @@ test("removes the vision header when recovery removes every attachment", async (
   const preservedOutput = "x".repeat(31 * 1024 * 1024)
   const inlineFile = `data:application/pdf;base64,${"A".repeat(2 * 1024 * 1024)}`
 
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          type: "custom_tool_call_output",
-          call_id: "call_header",
-          output: [
-            { type: "input_text", text: preservedOutput },
-            {
-              type: "input_file",
-              filename: "header.pdf",
-              file_data: inlineFile,
-            },
-          ],
-        },
-      ],
-    },
-    { vision: true, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_header",
+            output: [
+              { type: "input_text", text: preservedOutput },
+              {
+                type: "input_file",
+                filename: "header.pdf",
+                file_data: inlineFile,
+              },
+            ],
+          },
+        ],
+      },
+      { vision: true, initiator: "user" },
+    ),
   )
 
   expect(requestBodies).toHaveLength(1)
@@ -145,23 +160,25 @@ test("removes the vision header when recovery removes every attachment", async (
 })
 
 test("sets the vision header from nested recovered screenshots", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          type: "function_call_output",
-          call_id: "call_nested_header",
-          output: [
-            {
-              type: "computer_screenshot",
-              image_url: "data:image/png;base64,abc",
-            },
-          ],
-        },
-      ],
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            type: "function_call_output",
+            call_id: "call_nested_header",
+            output: [
+              {
+                type: "computer_screenshot",
+                image_url: "data:image/png;base64,abc",
+              },
+            ],
+          },
+        ],
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(requestBodies).toHaveLength(1)
@@ -179,23 +196,25 @@ test.skipIf(typeof Bun.Image !== "function")(
     const originalImage = `data:image/png;base64,${paddedPng.toString("base64")}`
     const history = "x".repeat(32_625 * 1024)
 
-    await createResponses(
-      {
-        model: "gpt-4o",
-        input: [
-          {
-            type: "function_call_output",
-            call_id: "call_incident_history",
-            output: history,
-          },
-          {
-            type: "function_call_output",
-            call_id: "call_incident_image",
-            output: [{ type: "input_image", image_url: originalImage }],
-          },
-        ],
-      },
-      { vision: true, initiator: "user" },
+    await seedProtocolDatabase().then(() =>
+      createResponses(
+        {
+          model: "gpt-4o",
+          input: [
+            {
+              type: "function_call_output",
+              call_id: "call_incident_history",
+              output: history,
+            },
+            {
+              type: "function_call_output",
+              call_id: "call_incident_image",
+              output: [{ type: "input_image", image_url: originalImage }],
+            },
+          ],
+        },
+        { vision: true, initiator: "user" },
+      ),
     )
 
     expect(requestBodies).toHaveLength(1)

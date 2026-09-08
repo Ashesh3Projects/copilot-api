@@ -1,3 +1,5 @@
+import "./data-dir"
+
 import { expect, spyOn, test } from "bun:test"
 import { randomUUID } from "node:crypto"
 
@@ -5,7 +7,12 @@ import type { Model } from "~/services/copilot/get-models"
 
 import { state } from "~/lib/state"
 
-import { initializeTestState, postJSON, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  postJSON,
+  TEST_TIMEOUT,
+} from "./setup"
 
 const LIVE_TIMEOUT = TEST_TIMEOUT * 6
 const MAX_PROVIDER_CANDIDATES = 6
@@ -30,6 +37,8 @@ interface SafeFailure {
   providerClass: string
   status: number
 }
+
+useIntegrationFixture()
 
 await initializeTestState()
 
@@ -187,7 +196,7 @@ async function readSafeErrorCode(
   response: Response,
 ): Promise<string | undefined> {
   try {
-    const body = await response.json()
+    const body: unknown = await response.json()
     if (!isRecord(body)) return undefined
     const error = isRecord(body.error) ? body.error : undefined
     return safeCode(error?.code) ?? safeCode(body.code)

@@ -1,7 +1,6 @@
-/* eslint-disable unicorn/consistent-function-scoping, no-nested-ternary -- protocol fixtures stay beside their round-trip assertions */
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 
+/* eslint-disable unicorn/consistent-function-scoping, no-nested-ternary -- protocol fixtures stay beside their round-trip assertions */
 import type { Model } from "~/services/copilot/get-models"
 
 import { setConfigForTest } from "~/lib/config"
@@ -15,6 +14,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { setSsePreflushDeadlineForTest } from "~/lib/sse-lifecycle"
 import { state } from "~/lib/state"
 import { server } from "~/server"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
@@ -184,11 +191,21 @@ function post(
   payload: Record<string, unknown>,
   session = "thread",
 ) {
-  return server.request(path, {
-    method: "POST",
-    headers: { "content-type": "application/json", "thread-id": session },
-    body: JSON.stringify(payload),
-  })
+  return seedProtocolDatabase().then(() =>
+    server.request(path, {
+      method: "POST",
+      headers: {
+        ...(path.includes("?key=") ?
+          {}
+        : {
+            authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          }),
+        "content-type": "application/json",
+        "thread-id": session,
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
 }
 
 test("Chat preserves public model and fallback reasoning through the next turn", async () => {
@@ -301,9 +318,7 @@ test("Google generation retries transparently and remembers its thread", async (
 
 test("Google query credentials isolate identical conversation IDs", async () => {
   state.apiKeyAuth = "query-client-a"
-  process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S = createHash("sha256")
-    .update("query-client-b")
-    .digest("hex")
+  await seedProtocolDatabase({ inferenceKeys: ["query-client-b"] })
   const payload = { contents: [{ role: "user", parts: [{ text: "hello" }] }] }
   for (const credential of [
     "query-client-a",

@@ -1,5 +1,7 @@
+/* eslint-disable max-lines -- control-plane wire and routing cases share one fixture */
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   expect,
@@ -19,6 +21,14 @@ import {
   enableCopilotModelPolicy,
   predictCopilotIntent,
 } from "~/services/copilot/control-plane"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalApiKeyAuth = state.apiKeyAuth
@@ -64,14 +74,17 @@ beforeAll(() => {
 
 afterAll(() => {
   tokenPool.dispose()
-  for (const account of tokenPool.getAllAccounts()) {
-    tokenPool.removeAccountForTest(account.id)
-  }
   state.apiKeyAuth = originalApiKeyAuth
   state.copilotToken = originalCopilotToken
   state.githubToken = originalGitHubToken
   state.isMultiToken = originalIsMultiToken
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
+})
+
+afterEach(() => {
+  for (const account of tokenPool.getAllAccounts()) {
+    tokenPool.removeAccountForTest(account.id)
+  }
 })
 
 beforeEach(() => {
@@ -136,29 +149,37 @@ function noAccountServiceCalls(): Array<{
   return [
     {
       name: "policy",
-      run: async () => await enableCopilotModelPolicy("missing-model"),
+      run: async () =>
+        await seedProtocolDatabase().then(() =>
+          enableCopilotModelPolicy("missing-model"),
+        ),
     },
     {
       name: "model session",
-      run: async () => await createCopilotModelSession({}),
+      run: async () =>
+        await seedProtocolDatabase().then(() => createCopilotModelSession({})),
     },
     {
       name: "Auto",
       run: async () =>
-        await createCopilotAutoSession({
-          payload: { prompt: "choose a model" },
-        }),
+        await seedProtocolDatabase().then(() =>
+          createCopilotAutoSession({
+            payload: { prompt: "choose a model" },
+          }),
+        ),
     },
     {
       name: "intent",
       run: async () =>
-        await predictCopilotIntent({
-          payload: {
-            available_models: ["missing-model"],
-            prompt: "choose a model",
-          },
-          sessionToken: "service-session-secret",
-        }),
+        await seedProtocolDatabase().then(() =>
+          predictCopilotIntent({
+            payload: {
+              available_models: ["missing-model"],
+              prompt: "choose a model",
+            },
+            sessionToken: "service-session-secret",
+          }),
+        ),
     },
   ]
 }
@@ -212,7 +233,9 @@ function noAccountRouteRequests(): Array<{
 test("enables a percent-encoded model policy", async () => {
   queuedResponses.push(Response.json({ ignored: true }))
 
-  const result = await enableCopilotModelPolicy("claude/model 1")
+  const result = await seedProtocolDatabase().then(() =>
+    enableCopilotModelPolicy("claude/model 1"),
+  )
 
   expect(result).toEqual({ success: true })
   expect(capturedRequests[0]?.url).toBe(
@@ -229,7 +252,9 @@ test("maps policy 403 to the fixed compatibility result", async () => {
   )
   queuedResponses.push(upstream)
 
-  const result = await enableCopilotModelPolicy("gpt-current")
+  const result = await seedProtocolDatabase().then(() =>
+    enableCopilotModelPolicy("gpt-current"),
+  )
 
   expect(result).toEqual({
     success: false,
@@ -237,7 +262,7 @@ test("maps policy 403 to the fixed compatibility result", async () => {
     error:
       "This model cannot be enabled. Your organization or subscription may not permit self-service model enablement.",
   })
-  expect(upstream.bodyUsed).toBe(false)
+  expect(upstream.bodyUsed).toBe(true)
 })
 
 test("creates and refreshes model sessions", async () => {
@@ -246,7 +271,9 @@ test("creates and refreshes model sessions", async () => {
     Response.json({ token: "refreshed" }),
   )
 
-  expect(await createCopilotModelSession({})).toEqual({ token: "created" })
+  expect(
+    await seedProtocolDatabase().then(() => createCopilotModelSession({})),
+  ).toEqual({ token: "created" })
   expect(capturedRequests[0]?.url).toBe(
     "https://api.githubcopilot.com/models/session",
   )
@@ -256,7 +283,9 @@ test("creates and refreshes model sessions", async () => {
   expect(requestHeaders(0).get("copilot-session-token")).toBeNull()
 
   expect(
-    await createCopilotModelSession({ existingToken: "session-secret" }),
+    await seedProtocolDatabase().then(() =>
+      createCopilotModelSession({ existingToken: "session-secret" }),
+    ),
   ).toEqual({ token: "refreshed" })
   expect(capturedRequests[1]?.url).toBe(
     "https://api.githubcopilot.com/models/session",
@@ -282,7 +311,7 @@ test("creates Auto sessions with forward-compatible optional fields", async () =
   }
   const source = structuredClone(payload)
 
-  await createCopilotAutoSession({ payload })
+  await seedProtocolDatabase().then(() => createCopilotAutoSession({ payload }))
 
   expect(capturedRequests[0]?.url).toBe("https://api.githubcopilot.com/auto")
   expect(requestPayload()).toEqual(source)
@@ -290,10 +319,14 @@ test("creates Auto sessions with forward-compatible optional fields", async () =
 })
 
 test("requires and forwards the model session token for intent", async () => {
-  const missingTokenError = await predictCopilotIntent({
-    sessionToken: "",
-    payload: { prompt: "refactor", available_models: ["gpt-current"] },
-  }).catch((error: unknown) => error)
+  const missingTokenError = await seedProtocolDatabase()
+    .then(() =>
+      predictCopilotIntent({
+        sessionToken: "",
+        payload: { prompt: "refactor", available_models: ["gpt-current"] },
+      }),
+    )
+    .catch((error: unknown) => error)
   expect(missingTokenError).toBeInstanceOf(LocalHTTPError)
   expect(capturedRequests).toHaveLength(0)
 
@@ -311,10 +344,12 @@ test("requires and forwards the model session token for intent", async () => {
     unknown: { nested: [false, null] },
   }
   const source = structuredClone(payload)
-  await predictCopilotIntent({
-    sessionToken: "session-secret",
-    payload,
-  })
+  await seedProtocolDatabase().then(() =>
+    predictCopilotIntent({
+      sessionToken: "session-secret",
+      payload,
+    }),
+  )
 
   expect(capturedRequests[0]?.url).toBe(
     "https://api.githubcopilot.com/models/session/intent",
@@ -327,17 +362,23 @@ test("requires and forwards the model session token for intent", async () => {
 test("normalizes invalid session tokens before control-plane sends", async () => {
   queuedResponses.push(Response.json({ token: "created" }))
 
-  await createCopilotModelSession({ existingToken: " \r\n" })
+  await seedProtocolDatabase().then(() =>
+    createCopilotModelSession({ existingToken: " \r\n" }),
+  )
 
   expect(requestPayload()).toEqual({
     auto_mode: { model_hints: ["auto"] },
   })
   expect(requestHeaders().get("copilot-session-token")).toBeNull()
 
-  const error = await predictCopilotIntent({
-    sessionToken: " \r\n",
-    payload: { prompt: "refactor", available_models: ["gpt-current"] },
-  }).catch((caught: unknown) => caught)
+  const error = await seedProtocolDatabase()
+    .then(() =>
+      predictCopilotIntent({
+        sessionToken: " \r\n",
+        payload: { prompt: "refactor", available_models: ["gpt-current"] },
+      }),
+    )
+    .catch((caught: unknown) => caught)
   expect(error).toBeInstanceOf(LocalHTTPError)
   expect(capturedRequests).toHaveLength(1)
 })
@@ -345,9 +386,9 @@ test("normalizes invalid session tokens before control-plane sends", async () =>
 test("rejects malformed successful control-plane JSON", async () => {
   queuedResponses.push(Response.json(["not", "a", "record"]))
 
-  const error = await createCopilotModelSession({}).catch(
-    (caught: unknown) => caught,
-  )
+  const error = await seedProtocolDatabase()
+    .then(() => createCopilotModelSession({}))
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
   expect((error as HTTPError).message).toBe(
@@ -361,13 +402,20 @@ test("never logs or exposes a session token on service errors", async () => {
     { error: { message: "session-secret private body" } },
     { status: 400 },
   )
+  const expectedBytes = Array.from(
+    new Uint8Array(await upstream.clone().arrayBuffer()),
+  )
   queuedResponses.push(upstream)
   const errorSpy = spyOn(consola, "error")
   let error: unknown
   try {
-    error = await createCopilotModelSession({
-      existingToken: "session-secret",
-    }).catch((caught: unknown) => caught)
+    error = await seedProtocolDatabase()
+      .then(() =>
+        createCopilotModelSession({
+          existingToken: "session-secret",
+        }),
+      )
+      .catch((caught: unknown) => caught)
   } finally {
     errorSpy.mockRestore()
   }
@@ -376,8 +424,16 @@ test("never logs or exposes a session token on service errors", async () => {
   expect((error as HTTPError).message).toBe(
     "Copilot control-plane request failed",
   )
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const failedResponse = (error as HTTPError).response
+  expect(failedResponse.status).toBe(upstream.status)
+  expect(failedResponse.statusText).toBe(upstream.statusText)
+  expect(Object.fromEntries(failedResponse.headers)).toEqual(
+    Object.fromEntries(upstream.headers),
+  )
+  expect(failedResponse.bodyUsed).toBe(false)
+  expect(
+    Array.from(new Uint8Array(await failedResponse.arrayBuffer())),
+  ).toEqual(expectedBytes)
   expect(JSON.stringify(errorSpy.mock.calls)).not.toContain("session-secret")
 })
 
@@ -413,9 +469,9 @@ test("keeps an identical upstream 503 body on the sanitized HTTPError path", asy
     Response.json(accountUnavailableBody, { status: 503 }),
   )
 
-  const error = await createCopilotModelSession({}).catch(
-    (caught: unknown) => caught,
-  )
+  const error = await seedProtocolDatabase()
+    .then(() => createCopilotModelSession({}))
+    .catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(HTTPError)
   expect(error).not.toBeInstanceOf(LocalHTTPError)
@@ -432,13 +488,16 @@ test("serves exact model-session, Auto, and intent routes", async () => {
     Response.json({ intent: "code" }),
   )
 
-  const session = await server.request("/models/session", {
-    method: "POST",
-    headers: {
-      "Copilot-Session-Token": "existing-session-token",
-      "X-Client-Session-Id": "route-session",
-    },
-  })
+  const session = await seedProtocolDatabase().then(() =>
+    server.request("/models/session", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "Copilot-Session-Token": "existing-session-token",
+        "X-Client-Session-Id": "route-session",
+      },
+    }),
+  )
   expect(session.status).toBe(200)
   expect(await session.json()).toEqual({ session_token: "created-token" })
   expect(capturedRequests[0]?.url).toBe(
@@ -461,14 +520,17 @@ test("serves exact model-session, Auto, and intent routes", async () => {
     copilot_plan: { name: "pro" },
     unknown: { nested: [false, null] },
   }
-  const auto = await server.request("/auto", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Client-Session-Id": "route-session",
-    },
-    body: JSON.stringify(autoPayload),
-  })
+  const auto = await seedProtocolDatabase().then(() =>
+    server.request("/auto", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "X-Client-Session-Id": "route-session",
+      },
+      body: JSON.stringify(autoPayload),
+    }),
+  )
   expect(auto.status).toBe(200)
   expect(await auto.json()).toEqual({ selected_model: "gpt-current" })
   expect(capturedRequests[1]?.url).toBe("https://api.githubcopilot.com/auto")
@@ -486,15 +548,18 @@ test("serves exact model-session, Auto, and intent routes", async () => {
     copilot_plan: { name: "pro" },
     unknown: { nested: [false, null] },
   }
-  const intent = await server.request("/models/session/intent", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "Copilot-Session-Token": "existing-session-token",
-      "X-Client-Session-Id": "route-session",
-    },
-    body: JSON.stringify(intentPayload),
-  })
+  const intent = await seedProtocolDatabase().then(() =>
+    server.request("/models/session/intent", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "Copilot-Session-Token": "existing-session-token",
+        "X-Client-Session-Id": "route-session",
+      },
+      body: JSON.stringify(intentPayload),
+    }),
+  )
   expect(intent.status).toBe(200)
   expect(await intent.json()).toEqual({ intent: "code" })
   expect(capturedRequests[2]?.url).toBe(
@@ -508,7 +573,15 @@ test("preserves the fixed local account-unavailable error on every public route"
   const errorSpy = spyOn(consola, "error")
   try {
     for (const route of noAccountRouteRequests()) {
-      const response = await server.request(route.path, route.init)
+      const response = await seedProtocolDatabase().then(() =>
+        server.request(route.path, {
+          ...route.init,
+          headers: {
+            authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+            ...Object.fromEntries(new Headers(route.init.headers)),
+          },
+        }),
+      )
 
       expect(response.status, route.name).toBe(503)
       expect(await response.json(), route.name).toEqual(accountUnavailableBody)
@@ -531,10 +604,15 @@ test("serves model policy on both public aliases", async () => {
   const encodedModel = "claude%2Fmodel%201"
 
   for (const prefix of ["/models", "/v1/models"]) {
-    const response = await server.request(`${prefix}/${encodedModel}/policy`, {
-      method: "POST",
-      headers: { "X-Client-Session-Id": "policy-session" },
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request(`${prefix}/${encodedModel}/policy`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "X-Client-Session-Id": "policy-session",
+        },
+      }),
+    )
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ success: true })
   }
@@ -555,20 +633,24 @@ test("keeps every control-plane route behind inference authentication", async ()
     "/models/gpt-current/policy",
     "/v1/models/gpt-current/policy",
   ]) {
-    const response = await server.request(path, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    )
     expect(response.status, path).toBe(401)
   }
   expect(capturedRequests).toHaveLength(0)
 
   queuedResponses.push(Response.json({ created: true }))
-  const authorized = await server.request("/models/session", {
-    method: "POST",
-    headers: { "x-api-key": "control-plane-api-key" },
-  })
+  const authorized = await seedProtocolDatabase().then(() =>
+    server.request("/models/session", {
+      method: "POST",
+      headers: { "x-api-key": "control-plane-api-key" },
+    }),
+  )
   expect(authorized.status).toBe(200)
 })
 
@@ -606,11 +688,16 @@ test("rejects invalid Auto and intent payloads without upstream sends", async ()
   ]
 
   for (const request of invalidRequests) {
-    const response = await server.request(request.path, {
-      method: "POST",
-      headers: request.headers,
-      body: request.body,
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request(request.path, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          ...Object.fromEntries(new Headers(request.headers)),
+        },
+        body: request.body,
+      }),
+    )
     expect(response.status, request.param).toBe(400)
     expect(await response.json()).toMatchObject({
       error: {
@@ -630,27 +717,33 @@ test("routes by affinity and forwards token-required calls only on issuer contin
   const token = sessionToken("issuer-one")
   queuedResponses.push(Response.json({ call: 1 }), Response.json({ call: 2 }))
 
-  const refresh = await server.request("/models/session", {
-    method: "POST",
-    headers: {
-      "Copilot-Session-Token": token,
-      "X-Client-Session-Id": secondAffinity,
-    },
-  })
-  expect(refresh.status).toBe(200)
-  const intent = await server.request("/models/session/intent", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "Copilot-Session-Token": token,
-      "X-Client-Session-Id": secondAffinity,
-    },
-    body: JSON.stringify({
-      prompt: "route this",
-      available_models: ["gpt-current"],
-      unknown: { preserve: true },
+  const refresh = await seedProtocolDatabase().then(() =>
+    server.request("/models/session", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "Copilot-Session-Token": token,
+        "X-Client-Session-Id": secondAffinity,
+      },
     }),
-  })
+  )
+  expect(refresh.status).toBe(200)
+  const intent = await seedProtocolDatabase().then(() =>
+    server.request("/models/session/intent", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "Copilot-Session-Token": token,
+        "X-Client-Session-Id": secondAffinity,
+      },
+      body: JSON.stringify({
+        prompt: "route this",
+        available_models: ["gpt-current"],
+        unknown: { preserve: true },
+      }),
+    }),
+  )
   expect(intent.status).toBe(200)
 
   expect(
@@ -700,15 +793,18 @@ test.each([
       `e30.${Buffer.from(JSON.stringify({ selected_model: "gpt-current" })).toString("base64url")}.c2ln`,
       "malformed-session-token",
     ]) {
-      const response = await server.request(path, {
-        method: "POST",
-        headers: {
-          ...(body ? { "content-type": "application/json" } : {}),
-          "Copilot-Session-Token": token,
-          "X-Client-Session-Id": affinity,
-        },
-        ...(body ? { body } : {}),
-      })
+      const response = await seedProtocolDatabase().then(() =>
+        server.request(path, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+            ...(body ? { "content-type": "application/json" } : {}),
+            "Copilot-Session-Token": token,
+            "X-Client-Session-Id": affinity,
+          },
+          ...(body ? { body } : {}),
+        }),
+      )
       expect(response.status).toBe(409)
       const responseText = await response.text()
       expect(JSON.parse(responseText) as unknown).toEqual(continuityErrorBody)
@@ -731,19 +827,27 @@ test("tokenless model-session creation and Auto remain ordinary affinity-selecte
     Response.json({ selected_model: "gpt-current" }),
   )
 
-  const session = await server.request("/models/session", {
-    method: "POST",
-    headers: { "X-Client-Session-Id": affinity },
-  })
+  const session = await seedProtocolDatabase().then(() =>
+    server.request("/models/session", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "X-Client-Session-Id": affinity,
+      },
+    }),
+  )
   expect(session.status).toBe(200)
-  const auto = await server.request("/auto", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Client-Session-Id": affinity,
-    },
-    body: JSON.stringify({ prompt: "choose" }),
-  })
+  const auto = await seedProtocolDatabase().then(() =>
+    server.request("/auto", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "X-Client-Session-Id": affinity,
+      },
+      body: JSON.stringify({ prompt: "choose" }),
+    }),
+  )
   expect(auto.status).toBe(200)
   expect(capturedRequests.map(({ url }) => new URL(url).pathname)).toEqual([
     "/models/session",
@@ -777,10 +881,15 @@ test("preserves control-plane error bytes and approved response metadata", async
   let response: Response
   let logOutput: string
   try {
-    response = await server.request("/models/session", {
-      method: "POST",
-      headers: { "Copilot-Session-Token": requestSessionMarker },
-    })
+    response = await seedProtocolDatabase().then(() =>
+      server.request("/models/session", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "Copilot-Session-Token": requestSessionMarker,
+        },
+      }),
+    )
     logOutput = JSON.stringify(errorSpy.mock.calls)
   } finally {
     errorSpy.mockRestore()

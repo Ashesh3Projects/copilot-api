@@ -24,9 +24,9 @@ beforeEach(() => {
   setModelFallbackConfigForTest(validateModelFallbackConfig({}))
 })
 
-afterAll(() => {
+afterAll(async () => {
   setModelFallbackConfigForTest(null)
-  resetTestAdminSession()
+  await resetTestAdminSession()
 })
 
 test("fallback settings require dashboard authentication", async () => {

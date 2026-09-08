@@ -16,6 +16,9 @@ import {
   checkMessagesToChatTranslation,
   checkMessagesToResponsesTranslation,
 } from "../src/routes/messages/translation-fidelity"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 // Zod schema for a single message in the chat completion request.
 const messageSchema = z.object({

@@ -12,6 +12,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
 const calls: Array<{ path: string; body: Record<string, unknown> }> = []
@@ -158,11 +166,17 @@ function post(
   extra: Record<string, unknown> = {},
   headers: Record<string, string> = {},
 ) {
-  return server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify({ model: "source-model", input: "hello", ...extra }),
-  })
+  return seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify({ model: "source-model", input: "hello", ...extra }),
+    }),
+  )
 }
 
 function reasoningInput(signature: string) {

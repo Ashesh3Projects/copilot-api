@@ -1,4 +1,3 @@
-import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
@@ -42,33 +41,4 @@ export const PATHS = {
   ADMIN_SESSIONS_PATH,
 }
 
-/**
- * When true, GitHub tokens were sourced from environment variables.
- * In this mode we never read or write GitHub token files on disk.
- */
-let envOnlyTokens = false
-
-export function setEnvOnlyTokens(value: boolean): void {
-  envOnlyTokens = value
-}
-
-export function isEnvOnlyTokens(): boolean {
-  return envOnlyTokens
-}
-
-export async function ensurePaths(): Promise<void> {
-  await fs.mkdir(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-  await fs.chmod(PATHS.APP_DIR, 0o700)
-  if (!envOnlyTokens) {
-    await ensureFile(PATHS.GITHUB_TOKEN_PATH)
-  }
-}
-
-async function ensureFile(filePath: string): Promise<void> {
-  try {
-    await fs.access(filePath, fs.constants.W_OK)
-  } catch {
-    await fs.writeFile(filePath, "")
-    await fs.chmod(filePath, 0o600)
-  }
-}
+// Legacy read-only path names remain for explicit migration/test compatibility.

@@ -11,12 +11,19 @@ import {
   getSession,
 } from "../src/routes/code-sessions/session-store"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
 
 const VERIFIER = "v".repeat(64)
 let accessToken: string
 
+useProtocolDatabase()
+
 beforeEach(async () => {
   state.apiKeyAuth = "session-gateway"
+  await seedProtocolDatabase()
   const oauthStore = new OAuthStore()
   setOAuthStoreForTest(oauthStore)
   const code = await oauthStore.issueAuthorizationCode({

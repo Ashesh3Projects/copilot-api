@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterEach, beforeEach, expect, test } from "bun:test"
 
 import type { Model } from "~/services/copilot/get-models"
@@ -8,6 +10,13 @@ import { setModelRoutingOverridesForTest } from "~/lib/model-routing"
 import { state } from "~/lib/state"
 import { tokenPool } from "~/lib/token-pool"
 import { server } from "~/server"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
@@ -33,7 +42,7 @@ const model: Model = {
 const jwt = (sub: string) =>
   `e30.${Buffer.from(JSON.stringify({ sub, selected_model: model.id })).toString("base64url")}.c2ln`
 
-beforeEach(() => {
+beforeEach(async () => {
   for (const account of tokenPool.getAllAccounts())
     tokenPool.removeAccountForTest(account.id)
   requests.length = 0
@@ -69,6 +78,7 @@ beforeEach(() => {
       return Response.json({ object: "list", data: [model] })
     return Response.json({ success: true })
   }) as typeof fetch
+  await seedProtocolDatabase()
 })
 
 afterEach(() => {
@@ -84,6 +94,7 @@ test("OAuth session refresh and inference select the authenticated token subject
   const second = tokenPool.addAccount("gho_second", "individual", 902)
   await tokenPool.initializeAccount(first)
   await tokenPool.initializeAccount(second)
+  await seedProtocolDatabase()
   requests.length = 0
   const token = jwt("subject-second")
   const refresh = await routedControlPlaneFetch({
@@ -109,6 +120,7 @@ test("OAuth session refresh and inference select the authenticated token subject
 test("OAuth session refresh rejects a subject that does not belong to any account", async () => {
   const account = tokenPool.addAccount("gho_first", "individual", 901)
   await tokenPool.initializeAccount(account)
+  await seedProtocolDatabase()
   requests.length = 0
   const refresh = await routedControlPlaneFetch({
     path: "/models/session",
@@ -123,6 +135,7 @@ test("account rediscovery replaces or clears the authenticated session subject",
   await tokenPool.initializeAccount(account)
   account.githubToken = "gho_second"
   await tokenPool.reinitializeAccount(account)
+  await seedProtocolDatabase()
   requests.length = 0
   const previous = await routedControlPlaneFetch({
     path: "/models/session",
@@ -140,13 +153,17 @@ test("account rediscovery replaces or clears the authenticated session subject",
 
 test("model-session acquire preserves concrete hints and additive client options", async () => {
   state.isMultiToken = false
+  await seedProtocolDatabase()
   const payload = {
     auto_mode: { model_hints: ["oauth-model"] },
     fusion_mode: { policy: "balanced", contract_version: 1 },
   }
   const result = await server.request("/models/session", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify(payload),
   })
   expect(result.status).toBe(200)
@@ -155,10 +172,12 @@ test("model-session acquire preserves concrete hints and additive client options
 
 test("model-session refresh remains token-only even if a client includes acquisition options", async () => {
   state.isMultiToken = false
+  await seedProtocolDatabase()
   const result = await server.request("/models/session", {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
       "copilot-session-token": jwt("subject-first"),
     },
     body: JSON.stringify({ auto_mode: { model_hints: ["oauth-model"] } }),

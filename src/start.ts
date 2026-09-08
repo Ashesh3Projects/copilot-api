@@ -8,25 +8,29 @@ import invariant from "tiny-invariant"
 import { resolveApiKeyAuth } from "~/lib/api-key-auth-config"
 
 import packageJson from "../package.json" with { type: "json" }
-import { getStoredCredentials } from "./lib/accounts-store"
+import { getAccountsService } from "./lib/accounts-service"
 import { initializeAdminAuth } from "./lib/admin-auth"
 import { mergeConfigWithDefaults } from "./lib/config"
 import { resolveRequestCredential } from "./lib/credential-resolver"
-import {
-  type GitHubCredential,
-  parseGitHubCredential,
-  parseGitHubCredentials,
-} from "./lib/github-instance"
 import { ensureModelRoutingOverridesLoaded } from "./lib/model-routing"
 import { ensureModelSettingsLoaded } from "./lib/model-settings"
 import { generateVirtualModels } from "./lib/model-suffix"
-import { ensurePaths, setEnvOnlyTokens } from "./lib/paths"
 import { resolveProtectedCredential } from "./lib/protected-credential"
 import { initProxyFromEnv } from "./lib/proxy"
-import { initSentry, setupSentryShutdown } from "./lib/sentry"
+import { initSentry } from "./lib/sentry"
 import { generateEnvScript } from "./lib/shell"
+import { installShutdown } from "./lib/shutdown"
 import { state } from "./lib/state"
-import { setupCopilotToken, setupGitHubToken } from "./lib/token"
+import {
+  StorageUnavailableError,
+  StorageCommitUnknownError,
+  StorageSchemaError,
+} from "./lib/storage/errors"
+import {
+  initializeStorageRuntime,
+  peekStorageRuntime,
+} from "./lib/storage/runtime"
+import { createHistoryRuntime } from "./lib/telemetry-writer"
 import { tokenPool } from "./lib/token-pool"
 import { isDirectConnectEnabled } from "./routes/direct-connect/route"
 import {
@@ -120,116 +124,23 @@ async function promptClaudeCodeSetup(
   }
 }
 
-/**
- * Set up multi-token mode from GITHUB_TOKENS env var or stored accounts file.
- * Priority: env var > github_tokens.json
- * Returns true if multi-token mode was activated (2+ tokens).
- */
-async function initializeMultiToken(
-  options: RunServerOptions,
-): Promise<boolean> {
-  // Collect tokens: env var takes priority, then stored file
-  let credentials: Array<GitHubCredential> = []
-  const githubTokensEnv = process.env.GITHUB_TOKENS
-  if (githubTokensEnv) {
-    credentials = parseGitHubCredentials(githubTokensEnv)
-  }
-
-  if (credentials.length === 0) {
-    credentials = await getStoredCredentials()
-  } else {
-    // Env vars supplied tokens — never touch token files in this process
-    setEnvOnlyTokens(true)
-  }
-
-  // Need at least 2 tokens for multi-token mode
-  if (credentials.length < 2) return false
-
-  state.isMultiToken = true
-  consola.info(
-    `Multi-token mode: ${credentials.length} GitHub tokens configured`,
-  )
-
-  // Add all accounts
-  const accounts = credentials.map((credential, i) =>
-    tokenPool.addAccount(credential.token, {
-      accountType: options.accountType,
-      githubInstanceDomain: credential.instanceDomain,
-      id: i,
-    }),
-  )
-
-  // Initialize each account, log warnings on failure
-  for (const account of accounts) {
-    try {
-      await tokenPool.initializeAccount(account, options.showToken)
-    } catch (error) {
-      consola.warn(
-        `Failed to initialize account #${account.id}: ${error instanceof Error ? error.message : String(error)}`,
-      )
-      tokenPool.markUnhealthy(account)
-    }
-  }
-
-  // Check that at least one account is healthy
-  const healthyAccounts = accounts.filter((a) => a.healthy)
-  if (healthyAccounts.length === 0) {
-    consola.error(
-      "No healthy accounts available. All GitHub tokens failed to initialize.",
-    )
-    process.exit(1)
-  }
-
-  tokenPool.rebuildModelIndex()
-  state.models = tokenPool.getAllModels()
-
-  // Backwards compatibility: set state tokens to first healthy account
-  const firstHealthy = healthyAccounts[0]
-  state.copilotToken = firstHealthy.copilotToken
-  state.copilotApiBaseUrl = firstHealthy.copilotApiBaseUrl
-  state.githubToken = firstHealthy.githubToken
-  state.githubInstanceDomain = firstHealthy.githubInstanceDomain
-
-  // Cache VS Code version and pass to token pool
-  await cacheVSCodeVersion()
-  return true
-}
-
-/**
- * Initialize tokens: try multi-token mode first, fall back to single-token.
- */
+/** Load the durable registry; upstream health never blocks the dashboard. */
 async function initializeTokens(options: RunServerOptions): Promise<void> {
-  const multiTokenActive = await initializeMultiToken(options)
-  if (multiTokenActive) return
-
-  // Check if GITHUB_TOKENS has exactly 1 token — use it directly
-  const envCredentials =
-    process.env.GITHUB_TOKENS ?
-      parseGitHubCredentials(process.env.GITHUB_TOKENS)
-    : undefined
-  if (envCredentials && envCredentials.length === 1) {
-    const [credential] = envCredentials
-    state.githubToken = credential.token
-    state.githubInstanceDomain = credential.instanceDomain
-    setEnvOnlyTokens(true)
-    consola.info("Using GitHub token from GITHUB_TOKENS")
-  } else if (options.githubToken) {
-    const credential = parseGitHubCredential(options.githubToken)
-    state.githubToken = credential.token
-    state.githubInstanceDomain = credential.instanceDomain
-    setEnvOnlyTokens(true)
-    consola.info("Using provided GitHub token")
-  } else {
-    await setupGitHubToken()
-  }
-
-  await setupCopilotToken()
-  await cacheVSCodeVersion()
+  if (options.githubToken)
+    throw new Error(
+      "--github-token is no longer a runtime credential source. Add the account in the dashboard or import legacy configuration.",
+    )
+  await getAccountsService().refreshRuntime()
+  state.isMultiToken = tokenPool.getAllAccounts().length > 1
+  state.models = tokenPool.getAllModels()
+  state.githubToken = undefined
+  state.copilotToken = undefined
+  void cacheVSCodeVersion().catch(() =>
+    consola.warn("Could not refresh client version metadata"),
+  )
 }
-
 async function initializePersistentConfig(): Promise<void> {
-  await ensurePaths()
-  mergeConfigWithDefaults()
+  await mergeConfigWithDefaults()
   await ensureModelSettingsLoaded()
   await ensureModelRoutingOverridesLoaded()
 }
@@ -264,6 +175,37 @@ interface StartFetchServer {
 // Upgrade dispatch covers four independently secured WebSocket protocols.
 
 export async function handleStartFetch(
+  req: Request,
+  bunServer: StartFetchServer,
+): Promise<Response> {
+  try {
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const runtime = peekStorageRuntime()
+      if (runtime) await runtime.snapshot.refreshIfChanged()
+    }
+    return await dispatchStartFetch(req, bunServer)
+  } catch (error) {
+    if (
+      error instanceof StorageUnavailableError
+      || error instanceof StorageCommitUnknownError
+      || error instanceof StorageSchemaError
+    ) {
+      return Response.json(
+        {
+          error: {
+            code: "storage_unavailable",
+            message: "Database storage is temporarily unavailable.",
+            type: "server_error",
+          },
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      )
+    }
+    throw error
+  }
+}
+
+async function dispatchStartFetch(
   req: Request,
   bunServer: StartFetchServer,
 ): Promise<Response> {
@@ -461,6 +403,9 @@ const combinedWebSocket = {
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
+  const storageRuntime = await initializeStorageRuntime()
+  await mergeConfigWithDefaults()
+  await createHistoryRuntime(storageRuntime.storage)
   await initializeAdminAuth()
   initSentry()
 
@@ -505,12 +450,6 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     consola.info("Debug mode enabled - raw HTTP requests will be logged")
   }
 
-  // Detect env-supplied tokens up front so ensurePaths can skip creating
-  // the legacy github_token file when tokens are not file-backed.
-  const envHasTokens =
-    Boolean(process.env.GITHUB_TOKENS?.trim()) || Boolean(options.githubToken)
-  if (envHasTokens) setEnvOnlyTokens(true)
-
   await initializePersistentConfig()
 
   await initializeTokens(options)
@@ -529,7 +468,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   consola.box(`🌐 Operator Dashboard: ${serverUrl}/dashboard`)
 
-  Bun.serve({
+  const runningServer = Bun.serve({
     port: options.port,
     hostname: options.host,
     idleTimeout: 0,
@@ -540,7 +479,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   const host = options.host ?? "localhost"
   consola.info(`Listening on: http://${host}:${options.port}/`)
 
-  setupSentryShutdown()
+  installShutdown(() => {
+    void runningServer.stop(false)
+  })
 }
 
 function resolveStartupApiKeyAuth(

@@ -12,6 +12,10 @@ import { asAnthropicUnknownContentType } from "~/routes/messages/anthropic-types
 import { prepareMessagesCandidates } from "~/routes/messages/messages-candidates"
 import { prepareAnthropicMessagesRequest } from "~/services/copilot/messages-contract"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 let attachmentFetchCount = 0
 

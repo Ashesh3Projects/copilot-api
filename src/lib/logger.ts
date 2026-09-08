@@ -1,21 +1,15 @@
 import consola, { type ConsolaInstance } from "consola"
-import fs from "node:fs"
-import path from "node:path"
+import { randomUUID } from "node:crypto"
 import util from "node:util"
+
+import { peekHistoryRuntime } from "~/lib/telemetry-writer"
 
 import {
   readDescriptorSnapshotValue,
   snapshotDescriptorChain,
 } from "./descriptor-chain"
-import { PATHS } from "./paths"
 import { state } from "./state"
 
-const LOG_DIR = path.join(PATHS.APP_DIR, "logs")
-const FLUSH_INTERVAL_MS = 1000
-const BUFFER_FLUSH_BATCH_SIZE = 100
-
-const logStreams = new Map<string, fs.WriteStream>()
-const logBuffers = new Map<string, Array<string>>()
 const OMITTED_HANDLER_LOG_OBJECT = "[OBJECT OMITTED]"
 const SAFE_HANDLER_LOG_ERROR_NAMES = new Set([
   "AbortError",
@@ -102,12 +96,6 @@ const SAFE_HANDLER_LOG_MESSAGES = new Set([
 ])
 const HANDLER_LOG_DESCRIPTOR_KEYS = new Set(["name"])
 const HANDLER_LOG_DESCRIPTOR_DEPTH = 5
-
-const ensureLogDirectory = () => {
-  if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true })
-  }
-}
 
 export const sanitizeHandlerLogArguments = (args: Array<unknown>) =>
   args.map((arg, index) =>
@@ -251,89 +239,11 @@ const sanitizeName = (name: string) => {
   return normalized === "" ? "handler" : normalized
 }
 
-const getLogStream = (filePath: string): fs.WriteStream => {
-  let stream = logStreams.get(filePath)
-  if (!stream || stream.destroyed) {
-    stream = fs.createWriteStream(filePath, { flags: "a" })
-    logStreams.set(filePath, stream)
-
-    stream.on("error", (error: unknown) => {
-      console.warn("Log stream error", error)
-      logStreams.delete(filePath)
-    })
-  }
-  return stream
-}
-
-const flushBuffer = (filePath: string) => {
-  const buffer = logBuffers.get(filePath)
-  if (!buffer || buffer.length === 0) {
-    return
-  }
-
-  const stream = getLogStream(filePath)
-  const content = buffer.join("\n") + "\n"
-  stream.write(content, (error) => {
-    if (error) {
-      console.warn("Failed to write handler log", error)
-    }
-  })
-
-  logBuffers.set(filePath, [])
-}
-
-const flushAllBuffers = () => {
-  for (const filePath of logBuffers.keys()) {
-    flushBuffer(filePath)
-  }
-}
-
-const appendLine = (filePath: string, line: string) => {
-  let buffer = logBuffers.get(filePath)
-  if (!buffer) {
-    buffer = []
-    logBuffers.set(filePath, buffer)
-  }
-
-  buffer.push(line)
-
-  if (buffer.length >= BUFFER_FLUSH_BATCH_SIZE) {
-    flushBuffer(filePath)
-  }
-}
-
-setInterval(flushAllBuffers, FLUSH_INTERVAL_MS).unref()
-
-const cleanup = () => {
-  flushAllBuffers()
-  for (const stream of logStreams.values()) {
-    stream.end()
-  }
-  logStreams.clear()
-  logBuffers.clear()
-}
-
-process.on("exit", cleanup)
-process.on("SIGINT", () => {
-  cleanup()
-  process.exit(0)
-})
-process.on("SIGTERM", () => {
-  cleanup()
-  process.exit(0)
-})
-
 export const createHandlerLogger = (name: string): ConsolaInstance => {
-  ensureLogDirectory()
-
   const sanitizedName = sanitizeName(name)
-  const instance = consola.withTag(name)
-
+  const instance = consola.withTag(sanitizedName)
   if (state.verbose) instance.level = 5
-  instance.setReporters([])
-
-  instance.addReporter(createHandlerLogReporter({ name, sanitizedName }))
-
+  instance.setReporters([createHandlerLogReporter(sanitizedName)])
   return instance
 }
 
@@ -351,10 +261,7 @@ export function formatHandlerLogLine(options: {
   }`
 }
 
-function createHandlerLogReporter(options: {
-  name: string
-  sanitizedName: string
-}) {
+function createHandlerLogReporter(name: string) {
   return {
     log(logObj: {
       args: Array<unknown>
@@ -362,16 +269,24 @@ function createHandlerLogReporter(options: {
       tag?: string
       type: string
     }) {
-      ensureLogDirectory()
-      const dateKey = logObj.date.toLocaleDateString("sv-SE")
-      const filePath = path.join(
-        LOG_DIR,
-        `${options.sanitizedName}-${dateKey}.log`,
-      )
-      appendLine(
-        filePath,
-        formatHandlerLogLine({ ...logObj, name: options.name }),
-      )
+      const line = formatHandlerLogLine({ ...logObj, name, tag: name })
+      const output =
+        (
+          logObj.type === "error"
+          || logObj.type === "fatal"
+          || logObj.type === "warn"
+        ) ?
+          process.stderr
+        : process.stdout
+      output.write(`${line}\n`)
+      const runtime = peekHistoryRuntime()
+      runtime?.writer.enqueue({
+        id: randomUUID(),
+        kind: "activity",
+        generation: runtime.generations.activity,
+        recordedAt: logObj.date.getTime(),
+        payload: { type: logObj.type, handler: name, message: line },
+      })
     },
   }
 }

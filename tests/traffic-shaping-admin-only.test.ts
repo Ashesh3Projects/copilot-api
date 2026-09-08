@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterEach, beforeEach, expect, test } from "bun:test"
 
 import {
@@ -16,17 +18,24 @@ import {
   resetTestAdminSession,
   type TestAdminSession,
 } from "./helpers/admin-session"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const GATEWAY_KEY = "test-dashboard-gateway-key-with-enough-entropy"
 
-beforeEach(() => {
+beforeEach(async () => {
   state.apiKeyAuth = GATEWAY_KEY
   setReplacementsForTest([])
   setModelRedirectsForTest([])
+  await seedProtocolDatabase({ gatewayKeys: [GATEWAY_KEY] })
 })
 
-afterEach(() => {
-  resetTestAdminSession()
+afterEach(async () => {
+  await resetTestAdminSession()
   setReplacementsForTest([])
   setModelRedirectsForTest([])
 })

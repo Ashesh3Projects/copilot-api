@@ -13,15 +13,22 @@ import {
 } from "../src/lib/oauth-store"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
 
 const GATEWAY_KEY = "compat-test-gateway-key"
 const CLIENT_ID = "compat-test-client"
 const VERIFIER = "v".repeat(64)
 let oauthStore: OAuthStore
 
-beforeEach(() => {
+useProtocolDatabase()
+
+beforeEach(async () => {
   setIpAllowlistForTest([])
   state.apiKeyAuth = GATEWAY_KEY
+  await seedProtocolDatabase()
   resetIpSecurityForTest()
   oauthStore = new OAuthStore()
   setOAuthStoreForTest(oauthStore)

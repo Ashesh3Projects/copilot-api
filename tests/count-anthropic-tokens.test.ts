@@ -11,6 +11,13 @@ import {
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
 import { countAnthropicTokens } from "../src/services/copilot/count-anthropic-tokens"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -43,7 +50,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   capturedBody = undefined
   capturedHeaders = undefined
@@ -54,6 +61,7 @@ beforeEach(() => {
   state.accountType = "individual"
   state.copilotToken = "copilot-token"
   state.isMultiToken = false
+  await seedProtocolDatabase()
 })
 
 test("posts the exact native count-tokens body with request context", async () => {
@@ -264,7 +272,7 @@ test("throws the upstream HTTP error instead of fabricating one token", async ()
   expect(error).toHaveProperty("response.status", 400)
 })
 
-test("preserves count-tokens failure identity and exact route bytes", async () => {
+test("preserves count-tokens failure metadata and exact route bytes", async () => {
   const body = new TextEncoder().encode("count failed\r\n  ")
   const createUpstream = () =>
     new Response(body.slice(), {
@@ -282,8 +290,16 @@ test("preserves count-tokens failure identity and exact route bytes", async () =
     (caught: unknown) => caught,
   )
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const upstreamFailure = (error as HTTPError).response
+  expect(upstreamFailure.status).toBe(upstream.status)
+  expect(upstreamFailure.statusText).toBe(upstream.statusText)
+  expect(Array.from(upstreamFailure.headers)).toEqual(
+    Array.from(upstream.headers),
+  )
+  expect(upstreamFailure.bodyUsed).toBe(false)
+  expect(
+    Array.from(new Uint8Array(await upstreamFailure.arrayBuffer())),
+  ).toEqual(Array.from(body))
 
   state.models = {
     object: "list",
@@ -309,11 +325,16 @@ test("preserves count-tokens failure identity and exact route bytes", async () =
     ],
   }
   queuedResponse = createUpstream()
-  const response = await server.request("/v1/messages/count_tokens", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
   expect(response.status).toBe(409)
   expect(response.headers.get("content-type")).toBe("text/plain")
   expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual(

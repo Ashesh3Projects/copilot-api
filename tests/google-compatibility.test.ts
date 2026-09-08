@@ -9,6 +9,12 @@ import { setConfigForTest } from "../src/lib/config"
 import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { state } from "../src/lib/state"
 import { googleAIRoutes } from "../src/routes/google-ai/route"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -79,11 +85,13 @@ async function request(
   body: unknown,
   action = "generateContent",
 ): Promise<Response> {
-  return await app.request(`/v1beta/models/google-test-chat:${action}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  })
+  return await seedProtocolDatabase().then(() =>
+    app.request(`/v1beta/models/google-test-chat:${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  )
 }
 
 const contents = [{ role: "user", parts: [{ text: "Use this schema" }] }]
@@ -350,14 +358,13 @@ test("Google custom stream stops on client abort while draining final usage", as
     }),
     { headers: { "content-type": "text/event-stream" } },
   )
-  const responsePromise = app.request(
-    "/v1beta/models/google-test-chat:streamGenerateContent",
-    {
+  const responsePromise = seedProtocolDatabase().then(() =>
+    app.request("/v1beta/models/google-test-chat:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json" },
       signal: abort.signal,
       body: JSON.stringify({ contents }),
-    },
+    }),
   )
   await new Promise((resolve) => setTimeout(resolve, 20))
   abort.abort()

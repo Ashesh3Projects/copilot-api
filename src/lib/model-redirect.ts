@@ -1,9 +1,14 @@
 import consola from "consola"
-import fs from "node:fs/promises"
 
 import type { ReasoningEffort } from "~/lib/model-suffix"
 
-import { PATHS } from "./paths"
+import {
+  getLoadedSetting,
+  readSetting,
+  updateSetting,
+} from "~/lib/storage/domain-settings"
+import { StorageSchemaError } from "~/lib/storage/errors"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export type ModelRedirectEffortFilter = "all" | "default" | ReasoningEffort
 export type ModelRedirectVerbosity = "low" | "medium" | "high"
@@ -53,9 +58,7 @@ export interface ModelRedirectRuleWithConflicts extends ModelRedirectRule {
   conflicts: Array<ModelRedirectConflict>
 }
 
-let redirects: Array<ModelRedirectRule> = []
-let isLoaded = false
-let skipPersistForTest = false
+let testRedirects: Array<ModelRedirectRule> | undefined
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return (
@@ -171,46 +174,87 @@ function withConflicts(
   })
 }
 
-export async function loadModelRedirects(): Promise<void> {
-  skipPersistForTest = false
+export function validateStoredModelRedirects(
+  value: unknown,
+): Array<ModelRedirectRule> {
+  if (value === undefined) return []
+  if (!Array.isArray(value))
+    throw new StorageSchemaError("Invalid model redirect rules")
+  return value.map((item) => {
+    const rule = normalizeRule(item)
+    if (!rule) throw new StorageSchemaError("Invalid model redirect rule")
+    const raw = item as Record<string, unknown>
+    const fields: Record<string, (field: unknown) => boolean> = {
+      name: (field) => typeof field === "string",
+      enabled: (field) => typeof field === "boolean",
+      sourceEffort: (field) =>
+        field === "all" || field === "default" || isReasoningEffort(field),
+      targetEffort: isReasoningEffort,
+      targetVerbosity: (field) => normalizeTargetVerbosity(field) !== undefined,
+    }
+    for (const [key, validate] of Object.entries(fields)) {
+      if (Object.hasOwn(raw, key) && !validate(raw[key]))
+        throw new StorageSchemaError("Invalid model redirect field")
+    }
+    return rule
+  })
+}
 
-  try {
-    const data = await fs.readFile(PATHS.MODEL_REDIRECTS_CONFIG_PATH)
-    redirects = normalizeRules(JSON.parse(data.toString()) as unknown)
-    isLoaded = true
-    consola.debug(`Loaded ${redirects.length} model redirect rules`)
-  } catch {
-    redirects = []
-    isLoaded = true
+function currentRedirects(): Array<ModelRedirectRule> {
+  return structuredClone(
+    testRedirects
+      ?? validateStoredModelRedirects(getLoadedSetting("model_redirects")),
+  )
+}
+
+function redirectJson(rules: Array<ModelRedirectRule>) {
+  return normalizeSettingsJson(
+    rules.map((rule) =>
+      Object.fromEntries(
+        Object.entries(rule).filter(([, value]) => value !== undefined),
+      ),
+    ),
+  )
+}
+
+async function mutateRedirects<T>(
+  update: (rules: Array<ModelRedirectRule>) => T,
+): Promise<T> {
+  if (testRedirects) {
+    const next = structuredClone(testRedirects)
+    const result = update(next)
+    testRedirects = next
+    return structuredClone(result)
   }
+  let result: T | undefined
+  await updateSetting("model_redirects", (current) => {
+    const next = validateStoredModelRedirects(current)
+    result = update(next)
+    return redirectJson(next)
+  })
+  return structuredClone(result as T)
+}
+
+export async function loadModelRedirects(): Promise<void> {
+  validateStoredModelRedirects(await readSetting("model_redirects"))
+  testRedirects = undefined
 }
 
 export async function saveModelRedirects(): Promise<void> {
-  if (skipPersistForTest) return
-
-  try {
-    await fs.mkdir(PATHS.APP_DIR, { recursive: true })
-    await fs.writeFile(
-      PATHS.MODEL_REDIRECTS_CONFIG_PATH,
-      JSON.stringify(redirects, null, 2),
-      "utf8",
-    )
-    consola.debug(`Saved ${redirects.length} model redirect rules`)
-  } catch (error) {
-    consola.error("Failed to save model redirect rules:", error)
-    throw error
-  }
+  if (testRedirects) return
+  await updateSetting("model_redirects", (current) =>
+    redirectJson(validateStoredModelRedirects(current)),
+  )
 }
 
 export async function ensureLoaded(): Promise<void> {
-  if (!isLoaded) await loadModelRedirects()
+  await Promise.resolve(currentRedirects())
 }
 
 export async function getAllModelRedirects(): Promise<
   Array<ModelRedirectRuleWithConflicts>
 > {
-  await ensureLoaded()
-  return withConflicts([...redirects])
+  return await Promise.resolve(withConflicts(currentRedirects()))
 }
 
 export async function addModelRedirect(
@@ -223,7 +267,6 @@ export async function addModelRedirect(
     targetVerbosity?: ModelRedirectVerbosity
   },
 ): Promise<ModelRedirectRule> {
-  await ensureLoaded()
   const rule: ModelRedirectRule = {
     id: `redirect-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
     name: options?.name,
@@ -234,20 +277,22 @@ export async function addModelRedirect(
     targetVerbosity: normalizeTargetVerbosity(options?.targetVerbosity),
     enabled: true,
   }
-  redirects.push(rule)
-  await saveModelRedirects()
+  await mutateRedirects((redirects) => {
+    redirects.push(rule)
+  })
   consola.info(`Added model redirect: "${sourceModel}" -> "${targetModel}"`)
   return { ...rule }
 }
 
 export async function removeModelRedirect(id: string): Promise<boolean> {
-  await ensureLoaded()
-  const before = redirects.length
-  redirects = redirects.filter((r) => r.id !== id)
-  if (redirects.length === before) return false
-  await saveModelRedirects()
-  consola.info(`Removed model redirect: ${id}`)
-  return true
+  return mutateRedirects((redirects) => {
+    const before = redirects.length
+    const next = redirects.filter((r) => r.id !== id)
+    redirects.splice(0, redirects.length, ...next)
+    if (redirects.length === before) return false
+    consola.info(`Removed model redirect: ${id}`)
+    return true
+  })
 }
 
 export async function updateModelRedirect(
@@ -262,64 +307,67 @@ export async function updateModelRedirect(
     enabled?: boolean
   },
 ): Promise<ModelRedirectRule | null> {
-  await ensureLoaded()
-  const rule = redirects.find((r) => r.id === id)
-  if (!rule) return null
+  return mutateRedirects((redirects) => {
+    const rule = redirects.find((r) => r.id === id)
+    if (!rule) return null
 
-  if (updates.name !== undefined) rule.name = updates.name
-  if (updates.sourceModel !== undefined) rule.sourceModel = updates.sourceModel
-  if (updates.sourceEffort !== undefined) {
-    rule.sourceEffort = normalizeSourceEffort(updates.sourceEffort)
-  }
-  if (updates.targetModel !== undefined) rule.targetModel = updates.targetModel
-  if (updates.targetEffort !== undefined) {
-    rule.targetEffort = normalizeTargetEffort(updates.targetEffort)
-  }
-  if (updates.targetVerbosity !== undefined) {
-    rule.targetVerbosity = normalizeTargetVerbosity(updates.targetVerbosity)
-  }
-  if (updates.enabled !== undefined) rule.enabled = updates.enabled
+    if (updates.name !== undefined) rule.name = updates.name
+    if (updates.sourceModel !== undefined)
+      rule.sourceModel = updates.sourceModel
+    if (updates.sourceEffort !== undefined) {
+      rule.sourceEffort = normalizeSourceEffort(updates.sourceEffort)
+    }
+    if (updates.targetModel !== undefined)
+      rule.targetModel = updates.targetModel
+    if (updates.targetEffort !== undefined) {
+      rule.targetEffort = normalizeTargetEffort(updates.targetEffort)
+    }
+    if (updates.targetVerbosity !== undefined) {
+      rule.targetVerbosity = normalizeTargetVerbosity(updates.targetVerbosity)
+    }
+    if (updates.enabled !== undefined) rule.enabled = updates.enabled
 
-  await saveModelRedirects()
-  consola.info(`Updated model redirect: ${rule.name || rule.id}`)
-  return { ...rule }
+    consola.info(`Updated model redirect: ${rule.name || rule.id}`)
+    return { ...rule }
+  })
 }
 
 export async function toggleModelRedirect(
   id: string,
 ): Promise<ModelRedirectRule | null> {
-  await ensureLoaded()
-  const rule = redirects.find((r) => r.id === id)
-  if (!rule) return null
-  rule.enabled = !rule.enabled
-  await saveModelRedirects()
-  return { ...rule }
+  return mutateRedirects((redirects) => {
+    const rule = redirects.find((r) => r.id === id)
+    if (!rule) return null
+    rule.enabled = !rule.enabled
+    return { ...rule }
+  })
 }
 
 export async function moveModelRedirect(
   id: string,
   direction: "up" | "down",
 ): Promise<ModelRedirectRule | null> {
-  await ensureLoaded()
-  const index = redirects.findIndex((r) => r.id === id)
-  if (index === -1) return null
-  const current = redirects[index]
+  return mutateRedirects((redirects) => {
+    const index = redirects.findIndex((r) => r.id === id)
+    if (index === -1) return null
+    const current = redirects[index]
 
-  const nextIndex = direction === "up" ? index - 1 : index + 1
-  if (nextIndex < 0 || nextIndex >= redirects.length) {
+    const nextIndex = direction === "up" ? index - 1 : index + 1
+    if (nextIndex < 0 || nextIndex >= redirects.length) {
+      return { ...current }
+    }
+
+    const next = redirects[nextIndex]
+    redirects[index] = next
+    redirects[nextIndex] = current
     return { ...current }
-  }
-
-  const next = redirects[nextIndex]
-  redirects[index] = next
-  redirects[nextIndex] = current
-  await saveModelRedirects()
-  return { ...current }
+  })
 }
 
 export async function clearModelRedirects(): Promise<void> {
-  redirects = []
-  await saveModelRedirects()
+  await mutateRedirects((redirects) => {
+    redirects.splice(0)
+  })
 }
 
 export interface ModelRedirectResult {
@@ -374,6 +422,7 @@ function findMatchingRedirectRule(
   effort: ReasoningEffort | undefined,
   startIndex = 0,
 ): MatchedRedirectRule | undefined {
+  const redirects = currentRedirects()
   for (let index = startIndex; index < redirects.length; index += 1) {
     const rule = redirects[index]
     if (
@@ -548,7 +597,5 @@ export async function applyModelRedirect(
 }
 
 export function setModelRedirectsForTest(rules: Array<unknown>): void {
-  redirects = normalizeRules(rules)
-  isLoaded = true
-  skipPersistForTest = true
+  testRedirects = normalizeRules(rules)
 }

@@ -7,10 +7,6 @@ import { Card } from "@astryxdesign/core/Card"
 import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog"
 import { FormLayout } from "@astryxdesign/core/FormLayout"
 import { IconButton } from "@astryxdesign/core/IconButton"
-import {
-  SegmentedControl,
-  SegmentedControlItem,
-} from "@astryxdesign/core/SegmentedControl"
 import { Selector } from "@astryxdesign/core/Selector"
 import { Skeleton } from "@astryxdesign/core/Skeleton"
 import { HStack, VStack } from "@astryxdesign/core/Stack"
@@ -36,13 +32,12 @@ import {
 } from "../components/common"
 import { Page } from "../components/Page"
 import { PencilIcon, PlugIcon, PlusIcon, Trash2Icon } from "../icons"
-import { ApiError, del, get, post } from "../lib/api"
+import { ApiError, api, get } from "../lib/api"
+import { providerSecretPatch } from "../lib/provider-form"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
 
 type ProviderRow = CustomProvider & Record<string, unknown>
-
-type AuthMode = "key" | "env"
 
 interface HeaderRow {
   rowId: string
@@ -64,9 +59,10 @@ interface ProviderFormState {
   id: string
   name: string
   baseUrl: string
-  authMode: AuthMode
   apiKey: string
-  apiKeyEnv: string
+  enabled: boolean
+  clearApiKey: boolean
+  clearHeaders: boolean
   headers: Array<HeaderRow>
   passReasoningEffort: boolean
   models: Array<ModelFormRow>
@@ -100,9 +96,10 @@ function emptyForm(): ProviderFormState {
     id: "",
     name: "",
     baseUrl: "",
-    authMode: "key",
     apiKey: "",
-    apiKeyEnv: "",
+    enabled: true,
+    clearApiKey: false,
+    clearHeaders: false,
     headers: [],
     passReasoningEffort: false,
     models: [emptyModelRow()],
@@ -126,9 +123,10 @@ function formFromProvider(provider: CustomProvider): ProviderFormState {
     id: provider.id,
     name: provider.name,
     baseUrl: provider.baseUrl,
-    authMode: provider.apiKeyEnv ? "env" : "key",
     apiKey: "",
-    apiKeyEnv: provider.apiKeyEnv ?? "",
+    enabled: provider.enabled,
+    clearApiKey: false,
+    clearHeaders: false,
     headers: provider.headerNames.map((key) => ({
       rowId: makeRowId(),
       key,
@@ -142,8 +140,11 @@ function formFromProvider(provider: CustomProvider): ProviderFormState {
   }
 }
 
-function loadProviders(): Promise<Array<CustomProvider>> {
-  return get<Array<CustomProvider>>("/dashboard/api/custom-providers")
+function loadProviders(): Promise<{
+  providers: Array<CustomProvider>
+  revision: number
+}> {
+  return get("/dashboard/api/custom-providers?withRevision=1")
 }
 
 function errorMessage(caught: unknown, fallback: string): string {
@@ -151,7 +152,6 @@ function errorMessage(caught: unknown, fallback: string): string {
 }
 
 function authIndicator(provider: CustomProvider) {
-  if (provider.apiKeyEnv) return <Badge variant="info" label="Env" />
   if (provider.apiKeyConfigured)
     return <Badge variant="neutral" label="Stored" />
   return <Badge variant="error" label="Missing" />
@@ -175,22 +175,26 @@ function modelBadges(models: Array<CustomProviderModel>) {
 }
 
 export default function CustomProvidersScreen() {
-  const { data, error, loading, reload } = useAsyncData(loadProviders, [])
+  const { data: page, error, loading, reload } = useAsyncData(loadProviders, [])
+  const data = page?.providers
   const toast = useToast()
 
   const [isFormOpen, setIsFormOpen] = useState(false)
   const [form, setForm] = useState<ProviderFormState>(emptyForm)
+  const [formRevision, setFormRevision] = useState<number>()
   const [editingId, setEditingId] = useState<string | null>(null)
   const [isSaving, setIsSaving] = useState(false)
 
   function openCreate() {
     setForm(emptyForm())
+    setFormRevision(page?.revision)
     setEditingId(null)
     setIsFormOpen(true)
   }
 
   function openEdit(provider: CustomProvider) {
     setForm(formFromProvider(provider))
+    setFormRevision(page?.revision)
     setEditingId(provider.id)
     setIsFormOpen(true)
   }
@@ -244,12 +248,15 @@ export default function CustomProvidersScreen() {
 
   async function handleDelete(id: string) {
     try {
-      await del(`/dashboard/api/custom-providers/${id}`)
+      await api("DELETE", `/dashboard/api/custom-providers/${id}`, undefined, {
+        expectedRevision: page?.revision,
+      })
       toast.success("Provider deleted")
       if (editingId === id) closeForm()
       reload()
     } catch (caught) {
       toast.error(errorMessage(caught, "Failed to delete provider"))
+      reload()
     }
   }
 
@@ -264,20 +271,6 @@ export default function CustomProvidersScreen() {
     }
     if (!form.baseUrl.trim()) {
       toast.error("Base URL is required")
-      return
-    }
-    if (
-      form.authMode === "key"
-      && !form.apiKey.trim()
-      && (!editingId
-        || !data?.find((provider) => provider.id === editingId)
-          ?.apiKeyConfigured)
-    ) {
-      toast.error("API key is required")
-      return
-    }
-    if (form.authMode === "env" && !form.apiKeyEnv.trim()) {
-      toast.error("API key env var name is required")
       return
     }
     if (form.models.length === 0) {
@@ -317,13 +310,9 @@ export default function CustomProvidersScreen() {
       })
     }
 
-    const headers = Object.fromEntries(
-      form.headers
-        .filter((row) => row.key.trim())
-        .map((row) => [row.key.trim(), row.value]),
-    )
-
     const payload: Record<string, unknown> = {
+      ...providerSecretPatch(form),
+      enabled: form.enabled,
       id: form.id.trim(),
       name: form.name.trim(),
       type: "openai-compatible",
@@ -331,18 +320,19 @@ export default function CustomProvidersScreen() {
       passReasoningEffort: form.passReasoningEffort,
       models,
     }
-    if (form.authMode === "key") payload.apiKey = form.apiKey.trim()
-    if (form.authMode === "env") payload.apiKeyEnv = form.apiKeyEnv.trim()
-    if (Object.keys(headers).length > 0) payload.headers = headers
 
     setIsSaving(true)
     try {
-      await post("/dashboard/api/custom-providers", payload)
+      await api("POST", "/dashboard/api/custom-providers", payload, {
+        expectedRevision: formRevision,
+      })
       toast.success(editingId ? "Provider updated" : "Provider created")
       closeForm()
       reload()
     } catch (caught) {
       toast.error(errorMessage(caught, "Failed to save provider"))
+      if (caught instanceof ApiError && caught.status === 409) closeForm()
+      reload()
     } finally {
       setIsSaving(false)
     }
@@ -356,6 +346,9 @@ export default function CustomProvidersScreen() {
       renderCell: (item) => (
         <VStack gap={0.5}>
           <Text weight="medium">{item.name}</Text>
+          {!item.enabled ?
+            <Badge variant="warning" label="Disabled" />
+          : null}
           <MonoText>{item.id}</MonoText>
         </VStack>
       ),
@@ -495,39 +488,39 @@ export default function CustomProvidersScreen() {
             isRequired
           />
 
+          <Switch
+            label="Enabled for new requests"
+            value={form.enabled}
+            onChange={(value) => setForm((f) => ({ ...f, enabled: value }))}
+          />
           <Card variant="muted">
             <VStack gap={3}>
               <Heading level={4}>Authentication</Heading>
-              <SegmentedControl
-                label="API key source"
-                value={form.authMode}
-                onChange={(value) =>
-                  setForm((f) => ({ ...f, authMode: value as AuthMode }))
+              <TextInput
+                type="password"
+                label="API key"
+                isDisabled={form.clearApiKey}
+                value={form.apiKey}
+                onChange={(value) => setForm((f) => ({ ...f, apiKey: value }))}
+                placeholder={
+                  editingId ?
+                    "Leave blank to keep the stored key"
+                  : "Provider API key"
                 }
-              >
-                <SegmentedControlItem value="key" label="API key" />
-                <SegmentedControlItem value="env" label="From env var" />
-              </SegmentedControl>
-              {form.authMode === "key" ?
-                <TextInput
-                  type="password"
-                  label="API key"
-                  value={form.apiKey}
+              />
+              {editingId ?
+                <Switch
+                  label="Clear stored API key"
+                  value={form.clearApiKey}
                   onChange={(value) =>
-                    setForm((f) => ({ ...f, apiKey: value }))
+                    setForm((f) => ({ ...f, clearApiKey: value }))
                   }
-                  isRequired
                 />
-              : <TextInput
-                  label="Env var name"
-                  value={form.apiKeyEnv}
-                  onChange={(value) =>
-                    setForm((f) => ({ ...f, apiKeyEnv: value }))
-                  }
-                  placeholder="MY_PROVIDER_API_KEY"
-                  isRequired
-                />
-              }
+              : null}
+              <Text color="secondary">
+                The key is stored in your configured database and is never
+                returned in account listings.
+              </Text>
             </VStack>
           </Card>
 
@@ -543,6 +536,19 @@ export default function CustomProvidersScreen() {
                   onClick={addHeaderRow}
                 />
               </HStack>
+              {editingId ?
+                <Switch
+                  label="Clear all stored headers"
+                  value={form.clearHeaders}
+                  onChange={(value) =>
+                    setForm((f) => ({ ...f, clearHeaders: value }))
+                  }
+                />
+              : null}
+              <Text color="secondary">
+                Blank values keep existing secrets. Clear all headers to remove
+                stored values before adding replacements.
+              </Text>
               {form.headers.length === 0 ?
                 <Text type="supporting" color="secondary">
                   No custom headers configured.
@@ -561,6 +567,8 @@ export default function CustomProvidersScreen() {
                   />
                   <TextInput
                     label="Header value"
+                    type="password"
+                    isDisabled={form.clearHeaders}
                     isLabelHidden
                     value={row.value}
                     onChange={(value) => updateHeaderRow(row.rowId, { value })}

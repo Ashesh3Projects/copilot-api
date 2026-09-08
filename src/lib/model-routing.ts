@@ -1,7 +1,11 @@
-import consola from "consola"
-import fs from "node:fs/promises"
-
-import { PATHS } from "~/lib/paths"
+import {
+  getLoadedSetting,
+  readSetting,
+  updateSetting,
+} from "~/lib/storage/domain-settings"
+import { StorageSchemaError } from "~/lib/storage/errors"
+import { getStorageRuntime } from "~/lib/storage/runtime"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export interface ModelRoutingOverride {
   modelId: string
@@ -11,12 +15,12 @@ export interface ModelRoutingOverride {
 
 type ModelRoutingConfig = Partial<Record<string, Record<string, boolean>>>
 
-let routingConfig: ModelRoutingConfig = {}
-let isLoaded = false
+let testConfig: ModelRoutingConfig | undefined
 
-function normalizeConfig(value: unknown): ModelRoutingConfig {
+export function validateStoredModelRouting(value: unknown): ModelRoutingConfig {
+  if (value === undefined) return {}
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return {}
+    throw new StorageSchemaError("Invalid model routing configuration")
   }
 
   const normalized: ModelRoutingConfig = {}
@@ -26,12 +30,13 @@ function normalizeConfig(value: unknown): ModelRoutingConfig {
       || accountMap === null
       || Array.isArray(accountMap)
     ) {
-      continue
+      throw new StorageSchemaError("Invalid model routing account map")
     }
 
     const typedAccountMap = accountMap as Record<string, unknown>
     for (const [accountId, enabled] of Object.entries(typedAccountMap)) {
-      if (typeof enabled !== "boolean") continue
+      if (typeof enabled !== "boolean")
+        throw new StorageSchemaError("Invalid model routing override")
       const normalizedAccountMap = normalized[modelId] ?? {}
       normalizedAccountMap[accountId] = enabled
       normalized[modelId] = normalizedAccountMap
@@ -41,49 +46,53 @@ function normalizeConfig(value: unknown): ModelRoutingConfig {
   return normalized
 }
 
+function currentConfig(): ModelRoutingConfig {
+  return structuredClone(
+    testConfig ?? validateStoredModelRouting(getLoadedSetting("model_routing")),
+  )
+}
+
 export async function loadModelRoutingOverrides(): Promise<void> {
-  try {
-    const data = await fs.readFile(PATHS.MODEL_ROUTING_CONFIG_PATH)
-    routingConfig = normalizeConfig(JSON.parse(data.toString()) as unknown)
-    consola.debug(
-      `Loaded model routing overrides for ${Object.keys(routingConfig).length} models`,
-    )
-  } catch {
-    routingConfig = {}
-  }
-  isLoaded = true
+  validateStoredModelRouting(await readSetting("model_routing"))
+  testConfig = undefined
 }
 
 export async function saveModelRoutingOverrides(): Promise<void> {
-  try {
-    await fs.writeFile(
-      PATHS.MODEL_ROUTING_CONFIG_PATH,
-      JSON.stringify(routingConfig, null, 2),
-      "utf8",
-    )
-    consola.debug("Saved model routing overrides")
-  } catch (error) {
-    consola.error("Failed to save model routing overrides:", error)
-    throw error
-  }
+  if (testConfig) return
+  await updateSetting("model_routing", (current) =>
+    normalizeSettingsJson(validateStoredModelRouting(current)),
+  )
 }
 
 export async function ensureModelRoutingOverridesLoaded(): Promise<void> {
-  if (!isLoaded) await loadModelRoutingOverrides()
+  await Promise.resolve(currentConfig())
 }
 
 export function isModelEnabledForAccount(
   modelId: string,
   accountId: number,
 ): boolean {
-  return routingConfig[modelId]?.[String(accountId)] ?? true
+  return currentConfig()[modelId]?.[String(accountId)] ?? true
+}
+
+/** Shared eligibility must never be rebuilt from an admitted request's older policy. */
+export function getLiveModelRoutingPolicy(): (
+  modelId: string,
+  accountId: number,
+) => boolean {
+  const config =
+    testConfig
+    ?? validateStoredModelRouting(
+      getStorageRuntime().snapshot.get().documents.get("model_routing")?.value,
+    )
+  return (modelId, accountId) => config[modelId]?.[String(accountId)] ?? true
 }
 
 export function hasModelRoutingOverride(
   modelId: string,
   accountId: number,
 ): boolean {
-  return routingConfig[modelId]?.[String(accountId)] !== undefined
+  return currentConfig()[modelId]?.[String(accountId)] !== undefined
 }
 
 export async function setModelRoutingOverride(
@@ -91,29 +100,38 @@ export async function setModelRoutingOverride(
   accountId: number,
   enabled: boolean,
 ): Promise<ModelRoutingOverride> {
-  await ensureModelRoutingOverridesLoaded()
-  const accountMap = routingConfig[modelId] ?? {}
-  accountMap[String(accountId)] = enabled
-  routingConfig[modelId] = accountMap
-  await saveModelRoutingOverrides()
+  const update = (routingConfig: ModelRoutingConfig) => {
+    const accountMap = routingConfig[modelId] ?? {}
+    accountMap[String(accountId)] = enabled
+    Object.defineProperty(routingConfig, modelId, {
+      value: accountMap,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    })
+    return routingConfig
+  }
+  if (testConfig) testConfig = update(currentConfig())
+  else
+    await updateSetting("model_routing", (current) =>
+      normalizeSettingsJson(update(validateStoredModelRouting(current))),
+    )
   return { modelId, accountId, enabled }
 }
 
 export async function clearModelRoutingOverrides(): Promise<void> {
-  routingConfig = {}
-  await saveModelRoutingOverrides()
+  if (testConfig) testConfig = {}
+  else await updateSetting("model_routing", () => ({}))
 }
 
 export function setModelRoutingOverridesForTest(
   config: ModelRoutingConfig,
 ): void {
-  routingConfig = config
-  isLoaded = true
+  testConfig = structuredClone(config)
 }
 
 export function resetModelRoutingOverridesForTest(): void {
-  routingConfig = {}
-  isLoaded = false
+  testConfig = undefined
 }
 
 export async function getAllModelRoutingOverrides(): Promise<
@@ -122,7 +140,7 @@ export async function getAllModelRoutingOverrides(): Promise<
   await ensureModelRoutingOverridesLoaded()
   const overrides: Array<ModelRoutingOverride> = []
 
-  for (const [modelId, accountMap] of Object.entries(routingConfig)) {
+  for (const [modelId, accountMap] of Object.entries(currentConfig())) {
     if (!accountMap) continue
 
     for (const [accountId, enabled] of Object.entries(accountMap)) {

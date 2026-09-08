@@ -1,3 +1,5 @@
+import "./data-dir"
+
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
 
@@ -8,13 +10,20 @@ import {
   setModelRedirectsForTest,
 } from "~/lib/model-redirect"
 import { state } from "~/lib/state"
+import { peekHistoryRuntime } from "~/lib/telemetry-writer"
 import {
   type ResponsesWebSocketData,
   responsesWebSocket,
 } from "~/routes/responses/websocket"
 import { handleStartFetch } from "~/start"
 
-import { initializeTestState, TEST_TIMEOUT } from "./setup"
+import {
+  useIntegrationFixture,
+  initializeTestState,
+  registerGatewayCredential,
+  removeGatewayCredential,
+  TEST_TIMEOUT,
+} from "./setup"
 
 const LIVE_TIMEOUT = TEST_TIMEOUT * 3
 const MAX_LIVE_MODEL_CANDIDATES = 3
@@ -32,14 +41,28 @@ interface WebSocketFrame {
   error?: { code?: string; param?: string }
 }
 
+let previousModelRedirects: Awaited<ReturnType<typeof getAllModelRedirects>> =
+  []
 let gatewayKey = ""
 let localServer:
   | ReturnType<typeof Bun.serve<ResponsesWebSocketData>>
   | undefined
-let previousGatewayKey: string | undefined
+
+afterAll(async () => {
+  try {
+    await localServer?.stop(true)
+  } finally {
+    if (peekHistoryRuntime()) await clearLlmDebugLogs()
+    if (gatewayKey) await removeGatewayCredential(gatewayKey)
+    setIpAllowlistForTest([])
+    setModelRedirectsForTest(previousModelRedirects)
+  }
+}, LIVE_TIMEOUT)
+
+useIntegrationFixture()
 
 await initializeTestState()
-const previousModelRedirects = await getAllModelRedirects()
+previousModelRedirects = await getAllModelRedirects()
 const liveModels = state.models?.data ?? []
 const nativeResponsesModels = liveModels.filter(
   (model) =>
@@ -65,14 +88,13 @@ const responsesModels = [
   ...firstModelByProvider(orderedChatFallbackModels),
 ].slice(0, MAX_LIVE_MODEL_CANDIDATES)
 
-beforeAll(() => {
+beforeAll(async () => {
   setIpAllowlistForTest([])
-  previousGatewayKey = state.apiKeyAuth
   setModelRedirectsForTest([])
   if (responsesModels.length === 0) return
 
   gatewayKey = randomBytes(32).toString("base64url")
-  state.apiKeyAuth = gatewayKey
+  await registerGatewayCredential(gatewayKey)
   localServer = Bun.serve<ResponsesWebSocketData>({
     hostname: "127.0.0.1",
     port: 0,
@@ -85,21 +107,10 @@ beforeEach(() => {
   setIpAllowlistForTest([])
 })
 
-afterAll(async () => {
-  try {
-    await localServer?.stop(true)
-  } finally {
-    clearLlmDebugLogs()
-    state.apiKeyAuth = previousGatewayKey
-    setIpAllowlistForTest([])
-    setModelRedirectsForTest(previousModelRedirects)
-  }
-}, LIVE_TIMEOUT)
-
 test.skipIf(nativeResponsesCandidates.length === 0)(
   "completes a native Responses WebSocket turn",
   async () => {
-    clearLlmDebugLogs()
+    await clearLlmDebugLogs()
     if (!localServer?.port) {
       throw new Error("Responses WebSocket endpoint unavailable")
     }
@@ -131,7 +142,7 @@ test.skipIf(nativeResponsesCandidates.length === 0)(
 test.skipIf(responsesModels.length === 0)(
   "continues only current-connection responses and keeps stale-ID errors recoverable",
   async () => {
-    clearLlmDebugLogs()
+    await clearLlmDebugLogs()
     if (!localServer?.port) {
       throw new Error("Responses WebSocket endpoint unavailable")
     }
@@ -292,8 +303,8 @@ async function expectCompletedUpstreamPath(
   modelId: string,
   expectedPath: string,
 ): Promise<void> {
-  const entries = await waitFor(() => {
-    const matching = listLlmDebugLogs().entries.filter(
+  const entries = await waitFor(async () => {
+    const matching = (await listLlmDebugLogs()).entries.filter(
       (entry) => entry.model === modelId,
     )
     if (
@@ -380,12 +391,12 @@ function firstModelByProvider<T extends { vendor?: string }>(
 }
 
 async function waitFor<T>(
-  read: () => T | undefined,
+  read: () => T | undefined | Promise<T | undefined>,
   timeoutMs = 15_000,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const value = read()
+    const value = await read()
     if (value !== undefined) return value
     await new Promise((resolve) => setTimeout(resolve, 25))
   }

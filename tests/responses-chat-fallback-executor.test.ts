@@ -10,6 +10,10 @@ import { LocalHTTPError } from "~/lib/error"
 import { resolvePreparedResponsesWebSearchCalls } from "~/routes/responses/chat-fallback-completion"
 import { handleWithChatCompletions } from "~/routes/responses/handler"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 function completion(callId?: string): ChatCompletionResponse {
   return completionWithCalls(callId ? [callId] : [])
 }

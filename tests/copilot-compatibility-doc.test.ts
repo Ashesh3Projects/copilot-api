@@ -4,9 +4,7 @@ import { expect, spyOn, test } from "bun:test"
 import consola from "consola"
 import { unzipSync } from "fflate"
 import { Hono } from "hono"
-import fs, { readFile } from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
+import { readFile } from "node:fs/promises"
 
 import {
   ATTACHMENT_URL_CONTRACT,
@@ -40,6 +38,18 @@ import { copilotControlPlaneRoutes } from "~/routes/copilot-control-plane/route"
 import { forwardMessagesError } from "~/routes/messages/error"
 import { server } from "~/server"
 import { COPILOT_API_VERSION } from "~/services/copilot/copilot-contract"
+
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+import {
+  settingsFixture,
+  withTransferStorage,
+} from "./helpers/transfer-storage"
+
+useProtocolDatabase()
 
 const documentPath = new URL(
   "../docs/copilot-api-compatibility.md",
@@ -240,17 +250,6 @@ function staticModelIdentifiers(value: string): Array<string> {
   ]
 }
 
-async function withTempDirectory<T>(
-  callback: (directory: string) => Promise<T>,
-): Promise<T> {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "compat-doc-"))
-  try {
-    return await callback(directory)
-  } finally {
-    await fs.rm(directory, { recursive: true, force: true })
-  }
-}
-
 function failingNativeStream(path: string, privateMarker: string): Response {
   const encoder = new TextEncoder()
   let timeout: ReturnType<typeof setTimeout> | undefined
@@ -345,24 +344,34 @@ async function probeThrownNativeStreamFailures(privateMarker: string): Promise<{
   }) as typeof fetch
 
   try {
-    const chat = await server.request("/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "model-placeholder",
-        messages: [{ role: "user", content: "hello" }],
-        stream: true,
+    const chat = await seedProtocolDatabase().then(() =>
+      server.request("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "model-placeholder",
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        }),
       }),
-    })
-    const responses = await server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "model-placeholder",
-        input: "hello",
-        stream: true,
+    )
+    const responses = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "model-placeholder",
+          input: "hello",
+          stream: true,
+        }),
       }),
-    })
+    )
     expect(chat.status).toBe(200)
     expect(responses.status).toBe(200)
     return {
@@ -400,7 +409,7 @@ async function deriveCompatibilityMatrix(): Promise<{
   ).toHaveLength(1)
   expect(nativeFailures.responsesBody).not.toContain(runtimeFailureMarker)
 
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   const requestSecretMarker = "synthetic-request-header-secret-marker"
   const token = jwt({
     marker: requestSecretMarker,
@@ -415,10 +424,10 @@ async function deriveCompatibilityMatrix(): Promise<{
       url: "https://example.test/responses",
     })
     expect(
-      getLlmDebugLog(debugId)?.request.headers["Copilot-Session-Token"],
-    ).toBe(token)
+      (await getLlmDebugLog(debugId))?.request.headers["Copilot-Session-Token"],
+    ).toBe("[REDACTED]")
   } finally {
-    clearLlmDebugLogs()
+    await clearLlmDebugLogs()
   }
 
   expect(
@@ -446,12 +455,9 @@ async function deriveCompatibilityMatrix(): Promise<{
     breadcrumb.mockRestore()
   }
 
-  await withTempDirectory(async (directory) => {
-    await fs.writeFile(
-      path.join(directory, "config.json"),
-      JSON.stringify({ "Copilot-Session-Token": token }),
-    )
-    const archive = await createConfigExportZip({ appDir: directory })
+  await withTransferStorage(async (storage) => {
+    await settingsFixture(storage, { "Copilot-Session-Token": token })
+    const archive = await createConfigExportZip({ storage })
     const config = new TextDecoder().decode(
       unzipSync(archive.zip)["config.json"],
     )

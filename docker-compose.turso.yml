@@ -1,0 +1,21 @@
+# Optional remote deployment: both Turso variables are required in this example.
+# The default docker-compose.yml needs neither and persists local SQLite.
+services:
+  copilot-api:
+    build: .
+    container_name: copilot-api
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:4141:4141"
+    environment:
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?Set both Turso variables for this remote example}
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?Set both Turso variables for this remote example}
+      COPILOT_HOST: 0.0.0.0
+      COPILOT_ADMIN_ORIGIN: ${COPILOT_ADMIN_ORIGIN:-}
+      COPILOT_TRUSTED_PROXY_CIDRS: ${COPILOT_TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4141/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

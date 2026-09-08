@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { Hono } from "hono"
-import fs from "node:fs/promises"
+
+import { StorageUnavailableError } from "~/lib/storage/errors"
+import { getStorageRuntime } from "~/lib/storage/runtime"
 
 import { apiKeyGuard } from "../src/lib/api-key-guard"
 import {
@@ -34,9 +36,9 @@ beforeEach(async () => {
   admin = await createTestAdminSession()
 })
 
-afterEach(() => {
+afterEach(async () => {
   resetIpSecurityForTest()
-  resetTestAdminSession()
+  await resetTestAdminSession()
 })
 
 test("dashboard reports the safely extracted current client IP", async () => {
@@ -223,17 +225,18 @@ test("dashboard removal keeps volatile trust revoked when durable loading fails"
   ).toBe(200)
 
   resetIpAllowlistForTest()
-  const readFile = spyOn(fs, "readFile").mockRejectedValue(
-    Object.assign(new Error("denied"), { code: "EACCES" }),
-  )
+  const transaction = spyOn(
+    getStorageRuntime().storage,
+    "transaction",
+  ).mockRejectedValue(new StorageUnavailableError())
   try {
     const remove = await server.request(
       `/dashboard/api/ip-allowlist/${encodeURIComponent(ip)}`,
       { method: "DELETE", headers: adminHeaders(admin) },
     )
-    expect(remove.status).toBe(500)
+    expect(remove.status).toBe(503)
   } finally {
-    readFile.mockRestore()
+    transaction.mockRestore()
   }
 
   setIpAllowlistForTest([])

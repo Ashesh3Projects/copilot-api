@@ -1,9 +1,7 @@
-import { createHash, timingSafeEqual } from "node:crypto"
+import { createCredentialsRepository } from "~/lib/storage/credentials-repository"
+import { getStorageRuntime } from "~/lib/storage/runtime"
 
-import { getConfig } from "./config"
 import { getOAuthStore } from "./oauth-store"
-import { state } from "./state"
-import { trustedJwtDigestStore } from "./trusted-jwt-digests"
 
 export type CredentialKind =
   | "gateway"
@@ -47,116 +45,19 @@ const OAUTH_SCOPES = new Set([
   "user:file_upload",
   "org:create_api_key",
 ])
-const SHA256_HEX_PATTERN = /^[a-f\d]{64}$/i
-
-function digest(value: string): Buffer {
-  // SHA-256 is intentional for random, high-entropy bearer credential lookup.
-  // This is not a human-password verifier; the operator supplies only the
-  // digest and the raw credential remains client-side.
-  return createHash("sha256").update(value, "utf8").digest()
+function credentialsRepository() {
+  return createCredentialsRepository(getStorageRuntime().storage)
 }
 
-function secretEquals(left: string, right: string): boolean {
-  return timingSafeEqual(digest(left), digest(right))
-}
-
-function configuredInferenceCredentialDigests(): Array<Buffer> {
-  const configured = process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
-  if (!configured) return []
-
-  return [
-    ...new Set(
-      configured
-        .split(",")
-        .map((candidate) => candidate.trim().toLowerCase())
-        .filter((candidate) => SHA256_HEX_PATTERN.test(candidate)),
-    ),
-  ].map((candidate) => Buffer.from(candidate, "hex"))
-}
-
-function isEnvironmentInferenceCredentialDigest(value: string): boolean {
-  const normalized = value.trim()
-  if (!SHA256_HEX_PATTERN.test(normalized)) return false
-  const candidate = Buffer.from(normalized, "hex")
-  return configuredInferenceCredentialDigests().some((configuredDigest) =>
-    timingSafeEqual(candidate, configuredDigest),
-  )
-}
-
-function isInferenceCredentialDigest(value: string): boolean {
+export async function isConfiguredInferenceCredential(
+  rawCredential: string,
+): Promise<boolean> {
+  const repository = credentialsRepository()
+  const normalized = rawCredential.trim()
   return (
-    isEnvironmentInferenceCredentialDigest(value)
-    || trustedJwtDigestStore.containsDigestLiteral(value)
+    (await repository.isDigestLiteral(normalized))
+    || (await repository.inference(normalized)) !== undefined
   )
-}
-
-function resolveEnvironmentInferenceCredential(
-  rawCredential: string,
-  requiredScopes: ReadonlyArray<string>,
-): ResolvedCredential | null | undefined {
-  const normalizedCredential = rawCredential.trim()
-  if (!normalizedCredential) return undefined
-  const credentialDigest = digest(normalizedCredential)
-  const matchedDigest = configuredInferenceCredentialDigests().find(
-    (configuredDigest) => timingSafeEqual(credentialDigest, configuredDigest),
-  )
-  if (!matchedDigest) return undefined
-
-  const credential: ResolvedCredential = {
-    principalId: `inference-env:${matchedDigest.toString("hex").slice(0, 16)}`,
-    kind: "inference-client",
-    scopes: new Set(["user:inference"]),
-  }
-  return credentialHasScopes(credential, requiredScopes) ? credential : null
-}
-
-function resolveConfiguredInferenceCredential(
-  rawCredential: string,
-  requiredScopes: ReadonlyArray<string>,
-): ResolvedCredential | null | undefined {
-  const managedEntry =
-    trustedJwtDigestStore.findEnabledCredential(rawCredential)
-  if (managedEntry) {
-    const credential: ResolvedCredential = {
-      principalId: `inference-managed:${managedEntry.id}`,
-      kind: "inference-client",
-      scopes: new Set(["user:inference"]),
-    }
-    return credentialHasScopes(credential, requiredScopes) ? credential : null
-  }
-
-  if (trustedJwtDigestStore.matchesCredentialDigest(rawCredential)) return null
-
-  const environmentCredential = resolveEnvironmentInferenceCredential(
-    rawCredential,
-    requiredScopes,
-  )
-  if (environmentCredential !== undefined) return environmentCredential
-
-  return undefined
-}
-
-export function isConfiguredInferenceCredential(
-  rawCredential: string,
-): boolean {
-  return (
-    isInferenceCredentialDigest(rawCredential)
-    || resolveEnvironmentInferenceCredential(rawCredential, []) !== undefined
-    || trustedJwtDigestStore.matchesCredentialDigest(rawCredential)
-  )
-}
-
-function configuredGatewayKeys(): Array<string> {
-  const keys = state.apiKeyAuth ? [state.apiKeyAuth] : getConfig().auth?.apiKeys
-  if (!Array.isArray(keys)) return []
-  return [
-    ...new Set(
-      keys
-        .filter((key) => typeof key === "string")
-        .map((key) => key.trim())
-        .filter(Boolean),
-    ),
-  ]
 }
 
 function effectiveOAuthScopes(scopes: ReadonlyArray<string>): Set<string> {
@@ -243,17 +144,22 @@ export async function resolveCredential(
   requiredScopes: ReadonlyArray<string> = [],
 ): Promise<ResolvedCredential | null> {
   if (!rawCredential) return null
-  if (isInferenceCredentialDigest(rawCredential)) return null
+  if (await credentialsRepository().isDigestLiteral(rawCredential)) return null
 
-  const configuredInferenceCredential = resolveConfiguredInferenceCredential(
-    rawCredential,
-    requiredScopes,
+  const configured = await credentialsRepository().inference(
+    rawCredential.trim(),
   )
-  if (configuredInferenceCredential !== undefined) {
-    return configuredInferenceCredential
+  if (configured !== undefined) {
+    if (!configured) return null
+    const credential: ResolvedCredential = {
+      kind: "inference-client",
+      principalId: configured.principalId,
+      scopes: new Set(configured.scopes),
+    }
+    return credentialHasScopes(credential, requiredScopes) ? credential : null
   }
 
-  const gatewayCredential = resolveGatewayCredential(
+  const gatewayCredential = await resolveGatewayCredential(
     rawCredential,
     requiredScopes,
   )
@@ -288,23 +194,21 @@ export async function resolveCredential(
   return null
 }
 
-export function resolveGatewayCredential(
+export async function resolveGatewayCredential(
   rawCredential: string,
   requiredScopes: ReadonlyArray<string> = [],
-): ResolvedCredential | null {
+): Promise<ResolvedCredential | null> {
   const normalizedCredential = rawCredential.trim()
   if (!normalizedCredential) return null
-  if (isConfiguredInferenceCredential(normalizedCredential)) return null
-  for (const gatewayKey of configuredGatewayKeys()) {
-    if (!secretEquals(normalizedCredential, gatewayKey)) continue
-    const credential: ResolvedCredential = {
-      principalId: `gateway:${digest(gatewayKey).toString("hex").slice(0, 16)}`,
-      kind: "gateway",
-      scopes: new Set(["*"]),
-    }
-    return credentialHasScopes(credential, requiredScopes) ? credential : null
+  if (await isConfiguredInferenceCredential(normalizedCredential)) return null
+  const match = await credentialsRepository().gateway(normalizedCredential)
+  if (!match) return null
+  const credential: ResolvedCredential = {
+    ...match,
+    kind: "gateway",
+    scopes: new Set(["*"]),
   }
-  return null
+  return credentialHasScopes(credential, requiredScopes) ? credential : null
 }
 
 export async function resolveRequestCredential(
@@ -346,7 +250,7 @@ export async function resolveRequestCredentialKind(
     const rawCredential = extractRequestCredential(request)
     if (
       rawCredential !== null
-      && isConfiguredInferenceCredential(rawCredential)
+      && (await isConfiguredInferenceCredential(rawCredential))
     ) {
       return null
     }

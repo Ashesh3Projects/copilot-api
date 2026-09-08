@@ -43,6 +43,10 @@ import { hasVisionContent } from "~/services/copilot/copilot-client"
 import { normalizeChatAttachments } from "~/services/copilot/create-chat-completions"
 import { normalizeResponsesAttachments } from "~/services/copilot/create-responses"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const PDF_B64 = Buffer.from("%PDF-1.4 fake pdf").toString("base64")
 const PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="

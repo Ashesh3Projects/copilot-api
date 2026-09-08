@@ -1,9 +1,12 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
 import { state } from "~/lib/state"
 
 import { runMessagesToolErrorFlow } from "./messages-tool-error-flow"
 import {
+  useIntegrationFixture,
   initializeTestState,
   postJSON,
   collectSSEEvents,
@@ -192,6 +195,8 @@ const GOOGLE_TOOLS = [
     ],
   },
 ]
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

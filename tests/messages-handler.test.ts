@@ -8,6 +8,13 @@ import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { setModelSettingsForTest } from "../src/lib/model-settings"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let lastUpstreamPayload: ChatCompletionsPayload | undefined
@@ -294,7 +301,71 @@ beforeEach(() => {
   state.githubToken = "github-token"
   state.isMultiToken = false
   state.manualApprove = false
-  state.models = undefined
+  state.models = {
+    object: "list",
+    data: [
+      {
+        id: "gpt-4o",
+        name: "gpt-4o",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+      {
+        id: "claude-target-1m",
+        name: "claude-target-1m",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+      {
+        id: "claude-opus-4.7-1m-internal",
+        name: "claude-opus-4.7-1m-internal",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+      {
+        id: "claude-implicit-medium",
+        name: "claude-implicit-medium",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+    ],
+  }
   setModelRedirectsForTest([])
   setModelSettingsForTest([])
 })
@@ -352,11 +423,16 @@ test.each([
 ] as const)(
   "rejects public Messages $name before upstream dispatch",
   async ({ body, code, message, param }) => {
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body,
+      }),
+    )
 
     expect(response.status).toBe(400)
     expect(await response.json()).toEqual({
@@ -407,16 +483,21 @@ test.each([
       id: "claude-opus-4.6",
       name: "Claude Opus 4.6",
     })
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-opus-4.6",
-        messages: [{ role: "user", content: "x" }],
-        max_tokens: 1,
-        ...extra,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4.6",
+          messages: [{ role: "user", content: "x" }],
+          max_tokens: 1,
+          ...extra,
+        }),
       }),
-    })
+    )
 
     if (_name === "primitive message entry") {
       expect(response.status).toBe(400)
@@ -436,15 +517,20 @@ test("preserves a forward-compatible native content record", async () => {
     future_payload: { enabled: true },
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      messages: [{ role: "user", content: [futureBlock] }],
-      max_tokens: 1,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        messages: [{ role: "user", content: [futureBlock] }],
+        max_tokens: 1,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload).toHaveProperty(
@@ -468,20 +554,25 @@ test("preserves system and future roles plus unknown native tool and top-level f
     future_tool_field: { enabled: true },
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      system: [futureSystemBlock],
-      messages: [
-        { role: "system", content: "bootstrap" },
-        { role: "future-role", content: [futureBlock] },
-      ],
-      tools: [futureTool],
-      future_native_field: { enabled: true },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        system: [futureSystemBlock],
+        messages: [
+          { role: "system", content: "bootstrap" },
+          { role: "future-role", content: [futureBlock] },
+        ],
+        tools: [futureTool],
+        future_native_field: { enabled: true },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -503,16 +594,21 @@ test("preserves unnamed future native tool records on the messages route", async
     config: { enabled: true, nested: { mode: "opaque" } },
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      messages: [{ role: "user", content: "hello" }],
-      max_tokens: 1,
-      tools: [futureTool],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 1,
+        tools: [futureTool],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -552,16 +648,21 @@ test.each([
   async (_label, futureTool) => {
     state.models = structuredClone(nativeMessagesModels)
 
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-opus-4.8",
-        messages: [{ role: "user", content: "hello" }],
-        max_tokens: 1,
-        tools: [futureTool],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4.8",
+          messages: [{ role: "user", content: "hello" }],
+          max_tokens: 1,
+          tools: [futureTool],
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -574,29 +675,32 @@ test.each([
 test("drops malformed optional controls and invalid optional Anthropic headers", async () => {
   state.models = structuredClone(nativeMessagesModels)
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "PRIVATE_BAD_BETA value",
-      "anthropic-version": "PRIVATE_BAD_VERSION\u007f",
-      "x-model-provider-preference": "PRIVATE_BAD_PROVIDER\u007f",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      messages: [{ role: "user", content: "hello" }],
-      metadata: "private",
-      tool_choice: null,
-      cache_control: "ephemeral",
-      thinking: true,
-      output_config: "high",
-      system: ["not-a-block"],
-      stop_sequences: ["good", 3],
-      top_p: "0.8",
-      stream: "yes",
-      fallback_credit_token: 42,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "PRIVATE_BAD_BETA value",
+        "anthropic-version": "PRIVATE_BAD_VERSION\u007f",
+        "x-model-provider-preference": "PRIVATE_BAD_PROVIDER\u007f",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        messages: [{ role: "user", content: "hello" }],
+        metadata: "private",
+        tool_choice: null,
+        cache_control: "ephemeral",
+        thinking: true,
+        output_config: "high",
+        system: ["not-a-block"],
+        stop_sequences: ["good", 3],
+        top_p: "0.8",
+        stream: "yes",
+        fallback_credit_token: 42,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload).toEqual({
@@ -612,14 +716,19 @@ test("drops malformed optional controls and invalid optional Anthropic headers",
 test("fills a missing native max_tokens from model metadata at transport time", async () => {
   state.models = structuredClone(nativeMessagesModels)
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload).toMatchObject({
@@ -632,21 +741,26 @@ test("fills a missing native max_tokens from model metadata at transport time", 
 test("strips Claude diagnostics before native Messages dispatch", async () => {
   state.models = structuredClone(nativeMessagesModels)
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hello" }],
-      thinking: { type: "adaptive" },
-      context_management: {
-        edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
       },
-      output_config: { effort: "xhigh" },
-      diagnostics: { previous_message_id: null },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "adaptive" },
+        context_management: {
+          edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+        },
+        output_config: { effort: "xhigh" },
+        diagnostics: { previous_message_id: null },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -661,14 +775,19 @@ test("strips Claude diagnostics before native Messages dispatch", async () => {
 })
 
 test("allows chat fallback requests without max_tokens", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "hello" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload).toMatchObject({
@@ -679,11 +798,16 @@ test("allows chat fallback requests without max_tokens", async () => {
 })
 
 test("rejects malformed public Messages JSON before upstream dispatch", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: '{"model":',
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: '{"model":',
+    }),
+  )
 
   expect(response.status).toBe(400)
   expect(await response.json()).toEqual({
@@ -704,18 +828,21 @@ test("returns the exact upstream body for a non-stream Messages failure", async 
     { status: 400, statusText: "messages-status-private-marker" },
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-request-id": "req-messages-safe",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "x-request-id": "req-messages-safe",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
   const body = await response.text()
 
   expect(response.status).toBe(400)
@@ -728,19 +855,22 @@ test("returns the exact upstream body for a non-stream Messages failure", async 
 })
 
 test("removes top_p when thinking is enabled on the chat completions path", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
-      top_p: 0.2,
-      thinking: { type: "enabled" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+        top_p: 0.2,
+        thinking: { type: "enabled" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.temperature).toBe(1)
@@ -759,15 +889,20 @@ test("prepared Chat fallback applies replacements before selection exactly once"
     },
   ])
   try {
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: "PRIVATE_PREPARED_CHAT" }],
-        max_tokens: 32,
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "PRIVATE_PREPARED_CHAT" }],
+          max_tokens: 32,
+        }),
       }),
-    })
+    )
 
     expect(response.status).toBe(200)
     expect(JSON.stringify(lastUpstreamPayload)).not.toContain(
@@ -785,45 +920,50 @@ test("routes PDF documents to native /v1/messages and preserves thinking blocks"
   state.models = nativeMessagesModels
   const pdfB64 = Buffer.from("%PDF-1.4 regression test").toString("base64")
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      thinking: { type: "enabled" },
-      messages: [
-        { role: "user", content: "Hi, I have a document." },
-        {
-          role: "assistant",
-          content: [
-            // Foreign (OpenAI-format) signature from a prior /chat/completions
-            // turn — invalid on the native Anthropic endpoint.
-            {
-              type: "thinking",
-              thinking: "hmm",
-              signature: "b2FpX2ZvcmVpZ24=",
-            },
-            { type: "text", text: "Sure, share it." },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Summarize this." },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfB64,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        thinking: { type: "enabled" },
+        messages: [
+          { role: "user", content: "Hi, I have a document." },
+          {
+            role: "assistant",
+            content: [
+              // Foreign (OpenAI-format) signature from a prior /chat/completions
+              // turn — invalid on the native Anthropic endpoint.
+              {
+                type: "thinking",
+                thinking: "hmm",
+                signature: "b2FpX2ZvcmVpZ24=",
               },
-            },
-          ],
-        },
-      ],
+              { type: "text", text: "Sure, share it." },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Summarize this." },
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfB64,
+                },
+              },
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   // Routed to the native Anthropic endpoint, not /chat/completions
@@ -845,36 +985,39 @@ test("forwards canonical beta, anthropic version, and provider preference on nat
     "base64",
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta":
-        " advanced-tool-use-2025-11-20, fallback-credit-2026-07-01, advanced-tool-use-2025-11-20 ",
-      "anthropic-version": "2023-06-01",
-      "x-model-provider-preference": "anthropic",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Read this document." },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfB64,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta":
+          " advanced-tool-use-2025-11-20, fallback-credit-2026-07-01, advanced-tool-use-2025-11-20 ",
+        "anthropic-version": "2023-06-01",
+        "x-model-provider-preference": "anthropic",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Read this document." },
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfB64,
+                },
               },
-            },
-          ],
-        },
-      ],
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -890,20 +1033,23 @@ test("forwards canonical beta, anthropic version, and provider preference on nat
 test("forwards native Messages headers when a dual-endpoint model selects native", async () => {
   state.models = nativeMessagesModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "advanced-tool-use-2025-11-20",
-      "anthropic-version": "2024-01-01",
-      "x-model-provider-preference": "anthropic",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "Use the native branch." }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "advanced-tool-use-2025-11-20",
+        "anthropic-version": "2024-01-01",
+        "x-model-provider-preference": "anthropic",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Use the native branch." }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -919,33 +1065,39 @@ test("forwards native Messages headers when a dual-endpoint model selects native
 test("forwards only matching model-scoped session tokens on Messages inference", async () => {
   state.models = nativeMessagesModels
   const matchingToken = sessionToken({ selected_model: "claude-opus-4.8" })
-  await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": matchingToken,
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hello" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": matchingToken,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(matchingToken)
 
   const binaryToken = binarySessionToken({ selected_model: "claude-opus-4.8" })
-  await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": binaryToken,
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "binary opaque segments" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": binaryToken,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "binary opaque segments" }],
+      }),
     }),
-  })
+  )
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(binaryToken)
 
   for (const token of [
@@ -953,18 +1105,21 @@ test("forwards only matching model-scoped session tokens on Messages inference",
     "malformed-token",
     ...invalidSessionTokens("claude-opus-4.8"),
   ]) {
-    const response = await server.request("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "copilot-session-token": token,
-      },
-      body: JSON.stringify({
-        model: "claude-opus-4.8",
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hello" }],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          "copilot-session-token": token,
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4.8",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(200)
     expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
     expect(lastUpstreamHeaders?.get("authorization")).toBe(
@@ -988,36 +1143,42 @@ test("forwards only matching model-scoped session tokens on Messages inference",
     selected_model: "claude-opus-4.7",
     available_models: ["claude-opus-4.8", "claude-opus-4.7"],
   })
-  await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": redirectedToken,
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hello" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": redirectedToken,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
   expect(lastUpstreamPayload?.model).toBe("claude-opus-4.7")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
 
   setModelRedirectsForTest([])
   state.models = nativeMessagesModels
   const aliasToken = sessionToken({ selected_model: "claude-opus-4.8" })
-  await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4-8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "ordinary alias" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "ordinary alias" }],
+      }),
     }),
-  })
+  )
   expect(lastUpstreamPayload?.model).toBe("claude-opus-4.8")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBe(aliasToken)
 
@@ -1038,18 +1199,21 @@ test("forwards only matching model-scoped session tokens on Messages inference",
   const rawAliasModel = structuredClone(nativeMessagesModels.data[0])
   rawAliasModel.id = "claude-opus-4-8"
   state.models = { object: "list", data: [rawAliasModel] }
-  await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "copilot-session-token": aliasToken,
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4-8",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "configured alias redirect" }],
+  await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "copilot-session-token": aliasToken,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "configured alias redirect" }],
+      }),
     }),
-  })
+  )
   expect(lastUpstreamPayload?.model).toBe("claude-opus-4-8")
   expect(lastUpstreamHeaders?.get("copilot-session-token")).toBeNull()
 })
@@ -1057,20 +1221,23 @@ test("forwards only matching model-scoped session tokens on Messages inference",
 test("does not forward native Messages headers to a Responses branch", async () => {
   state.models = responsesOnlyMessagesModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "anthropic-beta": "advanced-tool-use-2025-11-20",
-      "anthropic-version": "2024-01-01",
-      "x-model-provider-preference": "anthropic",
-    },
-    body: JSON.stringify({
-      model: "gpt-responses-only",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "Use the Responses branch." }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta": "advanced-tool-use-2025-11-20",
+        "anthropic-version": "2024-01-01",
+        "x-model-provider-preference": "anthropic",
+      },
+      body: JSON.stringify({
+        model: "gpt-responses-only",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Use the Responses branch." }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/responses")
@@ -1092,16 +1259,21 @@ test("applies redirect verbosity to a Messages request routed through Responses"
     },
   ])
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-responses-only",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "Explain this." }],
-      output_config: { format: { type: "json_object" } },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-responses-only",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Explain this." }],
+        output_config: { format: { type: "json_object" } },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/responses")
@@ -1116,26 +1288,31 @@ test("applies redirect verbosity to a Messages request routed through Responses"
 test("routes forward-compatible Messages through Responses when native delivery is unavailable", async () => {
   state.models = responsesOnlyMessagesModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-responses-only",
-      max_tokens: 64,
-      messages: [
-        {
-          role: "future-role",
-          content: [
-            {
-              type: "future_native_block_20270101",
-              future_payload: { enabled: true },
-            },
-            { type: "image", source: null },
-          ],
-        },
-      ],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-responses-only",
+        max_tokens: 64,
+        messages: [
+          {
+            role: "future-role",
+            content: [
+              {
+                type: "future_native_block_20270101",
+                future_payload: { enabled: true },
+              },
+              { type: "image", source: null },
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/responses")
@@ -1147,65 +1324,70 @@ test("preserves ToolSearch tool references on the native messages route", async 
     "base64",
   )
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      tools: [
-        {
-          name: "Bash",
-          description: "Run a shell command",
-          input_schema: { type: "object", properties: {} },
-          defer_loading: true,
-        },
-        {
-          name: "ToolSearch",
-          description: "Load deferred tools",
-          input_schema: {
-            type: "object",
-            properties: { query: { type: "string" } },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        tools: [
+          {
+            name: "Bash",
+            description: "Run a shell command",
+            input_schema: { type: "object", properties: {} },
+            defer_loading: true,
           },
-        },
-        {
-          name: "DeferredToolPlaceholder",
-          description: "Keep deferred tool loading active",
-          input_schema: { type: "object", properties: {} },
-          defer_loading: true,
-        },
-      ],
-      messages: [
-        { role: "user", content: "Load Bash before reading the document." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "toolu_search",
-              name: "ToolSearch",
-              input: { query: "select:Bash" },
+          {
+            name: "ToolSearch",
+            description: "Load deferred tools",
+            input_schema: {
+              type: "object",
+              properties: { query: { type: "string" } },
             },
-          ],
-        },
-        toolReferenceTurn,
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Summarize this." },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfB64,
+          },
+          {
+            name: "DeferredToolPlaceholder",
+            description: "Keep deferred tool loading active",
+            input_schema: { type: "object", properties: {} },
+            defer_loading: true,
+          },
+        ],
+        messages: [
+          { role: "user", content: "Load Bash before reading the document." },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_search",
+                name: "ToolSearch",
+                input: { query: "select:Bash" },
               },
-            },
-          ],
-        },
-      ],
+            ],
+          },
+          toolReferenceTurn,
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Summarize this." },
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfB64,
+                },
+              },
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -1237,54 +1419,64 @@ test("preserves ToolSearch tool references on the native messages route", async 
 test("routes ToolSearch references to native messages without a PDF", async () => {
   state.models = nativeMessagesModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64,
-      messages: [toolReferenceTurn],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [toolReferenceTurn],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
 })
 
 test("continues merging sibling text into ordinary tool results", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      max_tokens: 32,
-      messages: [
-        { role: "user", content: "Run the parser." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "toolu_parser",
-              name: "parse",
-              input: {},
-            },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "toolu_parser",
-              content: "parsed",
-            },
-            { type: "text", text: "Use that result." },
-          ],
-        },
-      ],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 32,
+        messages: [
+          { role: "user", content: "Run the parser." },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_parser",
+                name: "parse",
+                input: {},
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_parser",
+                content: "parsed",
+              },
+              { type: "text", text: "Use that result." },
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   const messages = lastUpstreamPayload?.messages ?? []
@@ -1312,31 +1504,36 @@ test("forwards native thinking budgets above the advertised model limit", async 
   state.models = nativeMessagesModels
   const pdfB64 = Buffer.from("%PDF-1.4 regression test").toString("base64")
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64000,
-      thinking: { type: "enabled", budget_tokens: 63999 },
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Summarize this." },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfB64,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64000,
+        thinking: { type: "enabled", budget_tokens: 63999 },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Summarize this." },
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfB64,
+                },
               },
-            },
-          ],
-        },
-      ],
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -1353,31 +1550,36 @@ test("forwards native thinking budgets below the advertised model minimum", asyn
   state.models = nativeMessagesModels
   const pdfB64 = Buffer.from("%PDF-1.4 regression test").toString("base64")
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      max_tokens: 64000,
-      thinking: { type: "enabled", budget_tokens: 1 },
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Summarize this." },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfB64,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64000,
+        thinking: { type: "enabled", budget_tokens: 1 },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Summarize this." },
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfB64,
+                },
               },
-            },
-          ],
-        },
-      ],
+            ],
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamUrl).toContain("/v1/messages")
@@ -1391,19 +1593,22 @@ test("forwards native thinking budgets below the advertised model minimum", asyn
 })
 
 test("maps output_config.effort onto chat completions reasoning_effort", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
-      thinking: { type: "enabled" },
-      output_config: { effort: "max" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+        thinking: { type: "enabled" },
+        output_config: { effort: "max" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1413,19 +1618,22 @@ test("maps output_config.effort onto chat completions reasoning_effort", async (
 })
 
 test("maps literal xhigh output_config.effort onto chat completions reasoning_effort", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
-      thinking: { type: "enabled" },
-      output_config: { effort: "xhigh" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+        thinking: { type: "enabled" },
+        output_config: { effort: "xhigh" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1437,18 +1645,21 @@ test("maps literal xhigh output_config.effort onto chat completions reasoning_ef
 test("passes max reasoning through when upstream metadata advertises max", async () => {
   state.models = upstreamMaxReasoningModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4.6:max",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
-      thinking: { type: "enabled" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4.6:max",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+        thinking: { type: "enabled" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-sonnet-4.6")
@@ -1459,18 +1670,21 @@ test("passes max reasoning through when upstream metadata advertises max", async
 })
 
 test("defaults chat completions reasoning_effort to medium when thinking is enabled", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
-      thinking: { type: "enabled" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+        thinking: { type: "enabled" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1482,18 +1696,21 @@ test("defaults chat completions reasoning_effort to medium when thinking is enab
 test("forwards chat completions thinking budgets above the advertised model limit", async () => {
   state.models = upstreamThinkingBudgetModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4.6",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 64000,
-      thinking: { type: "enabled", budget_tokens: 63999 },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4.6",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 64000,
+        thinking: { type: "enabled", budget_tokens: 63999 },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1505,18 +1722,21 @@ test("forwards chat completions thinking budgets above the advertised model limi
 test("forwards chat completions thinking budgets below the advertised model minimum", async () => {
   state.models = upstreamThinkingBudgetModels
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4.6",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 64000,
-      thinking: { type: "enabled", budget_tokens: 1 },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4.6",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 64000,
+        thinking: { type: "enabled", budget_tokens: 1 },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1526,18 +1746,21 @@ test("forwards chat completions thinking budgets below the advertised model mini
 })
 
 test("forwards chat completions thinking budgets when upstream limits are unknown", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 64000,
-      thinking: { type: "enabled", budget_tokens: 63999 },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 64000,
+        thinking: { type: "enabled", budget_tokens: 63999 },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(
@@ -1558,17 +1781,20 @@ test("redirects unsupported Anthropic high-effort model suffixes before upstream
     },
   ])
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-source-1m:high",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-source-1m:high",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-target-1m")
@@ -1603,24 +1829,27 @@ test("rewrites final assistant message after model redirects when prefill is uns
     },
   ])
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.8",
-      messages: [
-        { role: "user", content: "Help me investigate an error." },
-        {
-          role: "assistant",
-          content:
-            "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded - calling them directly will fail with InputValidationError.",
-        },
-      ],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        messages: [
+          { role: "user", content: "Help me investigate an error." },
+          {
+            role: "assistant",
+            content:
+              "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded - calling them directly will fail with InputValidationError.",
+          },
+        ],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-opus-4.7-1m-internal")
@@ -1668,16 +1897,19 @@ test("applies final self-redirect effort on direct chat completions requests", a
     },
   ])
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4.7:low",
-      messages: [{ role: "user", content: "Think carefully." }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7:low",
+        messages: [{ role: "user", content: "Think carefully." }],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-opus-4.7-1m-internal")
@@ -1697,19 +1929,22 @@ test("does not send custom reasoning effort for implicit-default models", async 
     },
   ])
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-implicit-medium:high",
-      messages: [{ role: "user", content: "Think carefully." }],
-      max_tokens: 32,
-      thinking: { type: "adaptive" },
-      output_config: { effort: "high" },
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-implicit-medium:high",
+        messages: [{ role: "user", content: "Think carefully." }],
+        max_tokens: 32,
+        thinking: { type: "adaptive" },
+        output_config: { effort: "high" },
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-implicit-medium")
@@ -1735,17 +1970,20 @@ test("strips custom reasoning effort for direct implicit-default chat completion
     },
   ])
 
-  const response = await server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-implicit-medium:high",
-      messages: [{ role: "user", content: "Think carefully." }],
-      reasoning_effort: "high",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-implicit-medium:high",
+        messages: [{ role: "user", content: "Think carefully." }],
+        reasoning_effort: "high",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPayload?.model).toBe("claude-implicit-medium")

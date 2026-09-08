@@ -3,9 +3,14 @@ import consola from "consola"
 
 import {
   ADMIN_PASSWORD_MIN_LENGTH,
-  resetAdminAuth,
+  issueAdminSetupCode,
+  resetAdminPassword,
   validateAdminPasswordHash,
 } from "~/lib/admin-auth"
+import {
+  closeStorageRuntime,
+  initializeStorageRuntime,
+} from "~/lib/storage/runtime"
 
 export const admin = defineCommand({
   meta: {
@@ -16,7 +21,12 @@ export const admin = defineCommand({
     "hash-password": {
       type: "boolean",
       description:
-        "Prompt for and hash a password as Argon2id for COPILOT_ADMIN_PASSWORD_HASH",
+        "Prompt for and hash a password as Argon2id for explicit legacy import",
+    },
+    "setup-code": {
+      type: "boolean",
+      description:
+        "Issue a one-use, 15-minute setup code for an unconfigured database",
     },
     reset: {
       type: "boolean",
@@ -49,24 +59,39 @@ export const admin = defineCommand({
       process.stdout.write(`${validateAdminPasswordHash(hash)}\n`)
       return
     }
-    if (!args.reset) {
+    if (!args.reset && !args["setup-code"]) {
       consola.info(
-        "Use --reset to reset administrator authentication or --hash-password to generate an environment verifier.",
+        "Use --setup-code for initial setup or --reset to replace the administrator password.",
       )
       return
     }
-    const confirmed = await consola.prompt(
-      "Reset the admin password and revoke all dashboard sessions?",
-      { type: "confirm", initial: false },
-    )
-    if (!confirmed) {
-      consola.info("Cancelled.")
-      return
+    if (args.reset && args["setup-code"])
+      throw new Error("Use either --setup-code or --reset")
+    await initializeStorageRuntime()
+    try {
+      if (args["setup-code"]) {
+        const { code, expiresAt } = await issueAdminSetupCode()
+        process.stdout.write(`${code}\n`)
+        consola.info(
+          `Setup code expires at ${new Date(expiresAt).toISOString()}`,
+        )
+        return
+      }
+      if (!process.stdin.isTTY)
+        throw new Error("--reset requires an interactive terminal")
+      const password = await readHiddenPassword("New administrator password: ")
+      const confirmation = await readHiddenPassword(
+        "Confirm administrator password: ",
+      )
+      if (password !== confirmation)
+        throw new Error("Administrator passwords do not match")
+      await resetAdminPassword(password)
+      consola.success(
+        "Administrator password replaced and all dashboard sessions revoked.",
+      )
+    } finally {
+      await closeStorageRuntime()
     }
-    await resetAdminAuth()
-    consola.success(
-      "Administrator authentication reset. Use the dashboard to set it up again.",
-    )
   },
 })
 

@@ -15,6 +15,10 @@ import {
 } from "~/lib/model-fallback-config"
 import { copilotResponseHeadersStorage } from "~/lib/request-session"
 
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const config = {
   enabled: true,
   conversationAffinity: true,

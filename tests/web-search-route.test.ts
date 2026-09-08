@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 
 import type { ModelsResponse } from "../src/services/copilot/get-models"
@@ -7,6 +9,12 @@ import { setModelSettingsForTest } from "../src/lib/model-settings"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
 import { resetWebSearchSessionsForTest } from "../src/services/copilot/mcp-web-search"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const upstreamRequests: Array<Record<string, unknown>> = []
@@ -39,7 +47,10 @@ const models: ModelsResponse = {
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
   })
 }
 
@@ -177,7 +188,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   upstreamRequests.length = 0
   mcpHeaders.length = 0
@@ -191,12 +202,16 @@ beforeEach(() => {
   state.models = models
   setModelRedirectsForTest([])
   setModelSettingsForTest([])
+  await seedProtocolDatabase()
 })
 
 test("Claude web search completes through Copilot MCP without leaking a tool call", async () => {
   const response = await server.request("/v1/messages", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4.6",
       max_tokens: 512,
@@ -269,7 +284,10 @@ test("Chat web-search follow-up retains the rewritten no-prefill history", async
 
   const response = await server.request("/v1/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4.6",
       messages: [
@@ -309,7 +327,10 @@ test("Chat web-search follow-up retains the rewritten no-prefill history", async
 test("Chat web-search follow-up carries one fetched attachment forward", async () => {
   const response = await server.request("/v1/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4.6",
       messages: [
@@ -354,7 +375,10 @@ test("Chat web-search follow-up carries one fetched attachment forward", async (
 test("Chat web-search follow-up injects the generated JSON instruction once", async () => {
   const response = await server.request("/v1/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer protocol-fixture-gateway-key",
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4.6",
       messages: [{ role: "user", content: "Search and return JSON." }],

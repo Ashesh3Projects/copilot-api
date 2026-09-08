@@ -1,213 +1,83 @@
 import { expect, test } from "bun:test"
-import fs from "node:fs/promises"
-import os from "node:os"
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 
-const repositoryRoot = path.join(import.meta.dir, "..")
+const root = path.resolve(
+  import.meta.dir,
+  "../.superpowers/test-data/accounts-store",
+)
+const repositoryRoot = path.resolve(import.meta.dir, "..")
 
-type StoreOperation = { kind: "add-enterprise" } | { kind: "load" }
-
-interface StoreRunResult {
-  result: {
-    accounts: unknown
-    credentials: unknown
-  }
-  stderr: string
-}
-
-const childSource = String.raw`
-const operation = JSON.parse(process.env.ACCOUNTS_STORE_OPERATION)
+async function runStore() {
+  await mkdir(root, { recursive: true })
+  const directory = await mkdtemp(path.join(root, "store-"))
+  await writeFile(path.join(directory, "github_token"), "legacy-secret")
+  await writeFile(
+    path.join(directory, "github_tokens.json"),
+    JSON.stringify([{ token: "file-secret" }]),
+  )
+  const source = String.raw`
+const { initializeStorageRuntime, closeStorageRuntime } = await import("./src/lib/storage/runtime.ts")
+const { storage } = await initializeStorageRuntime()
 const store = await import("./src/lib/accounts-store.ts")
-
-if (operation.kind === "add-enterprise") {
-  await store.addAccount(
-    "enterprise-token",
-    "work",
-    "HTTPS://MSFT.GHE.COM/",
-  )
-}
-
-const result = {
-  accounts: await store.loadAccounts(),
-  credentials: await store.getStoredCredentials(),
-}
-process.stdout.write(JSON.stringify(result))
+const before = await store.loadAccounts()
+await storage.transaction(async session => {
+  await session.execute({sql:"INSERT INTO capi_accounts (id,domain,upstream_user_id,login,label,created_at,updated_at) VALUES (42,'msft.ghe.com','123','fixture','Work',0,0)",args:[]})
+  await session.execute({sql:"INSERT INTO capi_account_credentials (account_id,oauth_value,updated_at) VALUES (42,'database-secret',0)",args:[]})
+})
+const after = await store.loadAccounts()
+const credentials = await store.getStoredCredentials()
+await closeStorageRuntime()
+await initializeStorageRuntime()
+const restarted = await store.loadAccounts()
+await closeStorageRuntime()
+process.stdout.write(JSON.stringify({before,after,credentials,restarted}))
 `
-
-async function withStoreDirectory<T>(
-  callback: (directory: string) => Promise<T>,
-): Promise<T> {
-  const directory = await fs.mkdtemp(
-    path.join(os.tmpdir(), "copilot-api-accounts-store-"),
-  )
-  try {
-    await fs.writeFile(path.join(directory, "github_token"), "")
-    return await callback(directory)
-  } finally {
-    await fs.rm(directory, { force: true, recursive: true })
-  }
-}
-
-async function runStore(
-  directory: string,
-  operation: StoreOperation = { kind: "load" },
-): Promise<StoreRunResult> {
-  const child = Bun.spawn([process.execPath, "-e", childSource], {
+  const child = Bun.spawn([process.execPath, "-e", source], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
-      ACCOUNTS_STORE_OPERATION: JSON.stringify(operation),
       DATA_DIR: directory,
+      GH_TOKEN: "env-secret",
+      GITHUB_TOKENS: "env-secret2",
+      TURSO_DATABASE_URL: "",
+      TURSO_AUTH_TOKEN: "",
     },
-    stderr: "pipe",
     stdout: "pipe",
+    stderr: "pipe",
   })
-  const [exitCode, stderr, stdout] = await Promise.all([
+  const [exit, stdout, stderr] = await Promise.all([
     child.exited,
-    new Response(child.stderr).text(),
     new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
   ])
-  if (exitCode !== 0) {
-    throw new Error(`Accounts-store subprocess failed:\n${stderr}`)
-  }
-  return {
-    result: JSON.parse(stdout) as StoreRunResult["result"],
-    stderr,
+  if (exit !== 0) throw new Error(`Account-store subprocess failed: ${stderr}`)
+  return JSON.parse(stdout) as {
+    before: unknown
+    after: Array<{
+      id: number
+      token: string
+      instanceDomain: string
+      label: string
+    }>
+    credentials: unknown
+    restarted: unknown
   }
 }
 
-test("loads pre-instance account rows as GitHub.com credentials", async () => {
-  await withStoreDirectory(async (directory) => {
-    await fs.writeFile(
-      path.join(directory, "github_tokens.json"),
-      JSON.stringify([{ token: " public-token ", label: " personal " }]),
-    )
-
-    const { result } = await runStore(directory)
-    expect(result.accounts).toEqual([
-      { token: "public-token", label: "personal" },
-    ])
-    expect(result.credentials).toEqual([
-      { instanceDomain: "github.com", token: "public-token" },
-    ])
-  })
-})
-
-test("migrates the legacy single-token file as a GitHub.com account", async () => {
-  await withStoreDirectory(async (directory) => {
-    await fs.writeFile(path.join(directory, "github_token"), " legacy-token \n")
-
-    const { result } = await runStore(directory)
-    expect(result.credentials).toEqual([
-      { instanceDomain: "github.com", token: "legacy-token" },
-    ])
-    expect(
-      JSON.parse(
-        (
-          await fs.readFile(path.join(directory, "github_tokens.json"))
-        ).toString("utf8"),
-      ),
-    ).toEqual([{ token: "legacy-token" }])
-  })
-})
-
-test("normalizes and persists an enterprise account domain", async () => {
-  await withStoreDirectory(async (directory) => {
-    const { result } = await runStore(directory, { kind: "add-enterprise" })
-
-    const expected = [
-      {
-        instanceDomain: "msft.ghe.com",
-        label: "work",
-        token: "enterprise-token",
-      },
-    ]
-    expect(result.accounts).toEqual(expected)
-    expect(
-      JSON.parse(
-        (
-          await fs.readFile(path.join(directory, "github_tokens.json"))
-        ).toString("utf8"),
-      ),
-    ).toEqual(expected)
-  })
-})
-
-test("writes the accounts store atomically with private permissions", async () => {
-  await withStoreDirectory(async (directory) => {
-    const accountsPath = path.join(directory, "github_tokens.json")
-    await fs.writeFile(accountsPath, "[]\n", { mode: 0o666 })
-
-    await runStore(directory, { kind: "add-enterprise" })
-
-    const temporaryFiles = (await fs.readdir(directory)).filter((entry) =>
-      entry.startsWith("github_tokens.json."),
-    )
-    expect(temporaryFiles).toEqual([])
-    if (process.platform !== "win32") {
-      expect((await fs.stat(accountsPath)).mode & 0o777).toBe(0o600)
-    }
-  })
-})
-
-test("reports malformed JSON and safely falls back to legacy storage", async () => {
-  await withStoreDirectory(async (directory) => {
-    await fs.writeFile(path.join(directory, "github_tokens.json"), "{not-json")
-    await fs.writeFile(path.join(directory, "github_token"), "legacy-fallback")
-
-    const { result, stderr } = await runStore(directory)
-    expect(result.credentials).toEqual([
-      { instanceDomain: "github.com", token: "legacy-fallback" },
-    ])
-    expect(stderr).toContain(
-      "Invalid github_tokens.json: expected valid JSON; checking legacy token storage",
-    )
-  })
-})
-
-test("skips malformed rows without leaking token values or crashing", async () => {
-  await withStoreDirectory(async (directory) => {
-    const privateMarker = "private-malformed-token-marker"
-    await fs.writeFile(
-      path.join(directory, "github_tokens.json"),
-      JSON.stringify([
-        null,
-        { token: "" },
-        { token: privateMarker, instanceDomain: "github.example.com" },
-        { token: "valid-public-token", label: 42 },
-        { token: "valid-enterprise-token", instanceDomain: "github.ghe.com" },
-        { token: "valid-public-token" },
-      ]),
-    )
-
-    const { result, stderr } = await runStore(directory)
-    expect(result.credentials).toEqual([
-      {
-        instanceDomain: "github.ghe.com",
-        token: "valid-enterprise-token",
-      },
-      { instanceDomain: "github.com", token: "valid-public-token" },
-    ])
-    expect(stderr).toContain("account #1")
-    expect(stderr).toContain("account #4")
-    expect(stderr).not.toContain(privateMarker)
-  })
-})
-
-test("reports a non-array document and safely falls back to legacy storage", async () => {
-  await withStoreDirectory(async (directory) => {
-    await fs.writeFile(
-      path.join(directory, "github_tokens.json"),
-      JSON.stringify({ token: "bad" }),
-    )
-    await fs.writeFile(path.join(directory, "github_token"), "legacy-fallback")
-
-    const { result, stderr } = await runStore(directory)
-    expect(result.credentials).toEqual([
-      { instanceDomain: "github.com", token: "legacy-fallback" },
-    ])
-    expect(stderr).toContain(
-      "Invalid github_tokens.json: expected an array; checking legacy token storage",
-    )
-  })
+test("account store ignores legacy files/environment and reloads durable IDs and credentials", async () => {
+  const result = await runStore()
+  expect(result.before).toEqual([])
+  expect(result.after).toEqual([
+    {
+      id: 42,
+      token: "database-secret",
+      instanceDomain: "msft.ghe.com",
+      label: "Work",
+    },
+  ])
+  expect(result.credentials).toEqual([
+    { instanceDomain: "msft.ghe.com", token: "database-secret" },
+  ])
+  expect(result.restarted).toEqual(result.after)
 })

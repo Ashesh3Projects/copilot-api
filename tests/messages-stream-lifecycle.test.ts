@@ -21,6 +21,13 @@ import { setSsePreflushDeadlineForTest } from "../src/lib/sse-lifecycle"
 import { state } from "../src/lib/state"
 import { emitAnthropicStreamError } from "../src/routes/messages/stream-translation"
 import { server } from "../src/server"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let delayedStreamController:
@@ -437,7 +444,10 @@ async function waitForUpstreamAbort(): Promise<boolean> {
 function createMessagesRequest(): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify({
       model: "gpt-4o",
       messages: [{ role: "user", content: "Write a very long plan." }],
@@ -450,7 +460,10 @@ function createMessagesRequest(): RequestInit {
 function createNativeMessagesRequest(): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify({
       model: "claude-opus-4.8",
       messages: [
@@ -495,7 +508,26 @@ beforeEach(() => {
   state.githubToken = "github-token"
   state.isMultiToken = false
   state.manualApprove = false
-  state.models = undefined
+  state.models = {
+    object: "list",
+    data: [
+      {
+        id: "gpt-4o",
+        name: "gpt-4o",
+        object: "model",
+        version: "1",
+        supported_endpoints: ["/chat/completions"],
+        capabilities: {
+          family: "gpt",
+          limits: {},
+          object: "model_capabilities",
+          supports: {},
+          tokenizer: "cl100k_base",
+          type: "chat",
+        },
+      },
+    ],
+  }
   setModelRedirectsForTest([])
   setModelSettingsForTest([])
 })
@@ -507,6 +539,8 @@ afterEach(() => {
 
 test("commits a keepalive before the upstream first SSE event", async () => {
   setSsePreflushDeadlineForTest(20)
+  // Fixture persistence is setup, not part of the SSE preflush deadline.
+  await seedProtocolDatabase()
   const responsePromise = Promise.resolve(
     server.request("/v1/messages", createMessagesRequest()),
   )
@@ -529,7 +563,9 @@ test("commits a keepalive before the upstream first SSE event", async () => {
 
 test("aborts the pending upstream request when the downstream stream is cancelled", async () => {
   setSsePreflushDeadlineForTest(20)
-  const response = await server.request("/v1/messages", createMessagesRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createMessagesRequest()),
+  )
   const reader = requireBody(response).getReader()
 
   await reader.read()
@@ -540,7 +576,9 @@ test("aborts the pending upstream request when the downstream stream is cancelle
 
 test("keeps the Anthropic event order unchanged when the first event is immediate", async () => {
   streamMode = "immediate"
-  const response = await server.request("/v1/messages", createMessagesRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createMessagesRequest()),
+  )
   const body = await response.text()
 
   expect(body).not.toContain(": keepalive")
@@ -558,7 +596,9 @@ test("keeps the Anthropic event order unchanged when the first event is immediat
 
 test("closes Chat text and emits one error on EOF without finish", async () => {
   streamMode = "chat-eof"
-  const response = await server.request("/v1/messages", createMessagesRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createMessagesRequest()),
+  )
   const body = await response.text()
   expect(
     Array.from(body.matchAll(/^event: (.+)$/gm), (match) => match[1]),
@@ -574,7 +614,9 @@ test("closes Chat text and emits one error on EOF without finish", async () => {
 test("skips a malformed Chat delta before one Messages terminal", async () => {
   streamMode = "chat-malformed-recover"
   const body = await (
-    await server.request("/v1/messages", createMessagesRequest())
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createMessagesRequest()),
+    )
   ).text()
 
   expect(body).toContain("recovered")
@@ -586,7 +628,9 @@ test("skips a malformed Chat delta before one Messages terminal", async () => {
 test("treats Chat error null as a normal Messages chunk", async () => {
   streamMode = "chat-error-null"
   const body = await (
-    await server.request("/v1/messages", createMessagesRequest())
+    await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createMessagesRequest()),
+    )
   ).text()
 
   expect(body).toContain("recovered")
@@ -596,7 +640,9 @@ test("treats Chat error null as a normal Messages chunk", async () => {
 
 test("preserves one Chat received error and ignores later malformed data", async () => {
   streamMode = "chat-received-error"
-  const response = await server.request("/v1/messages", createMessagesRequest())
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createMessagesRequest()),
+  )
   const body = await response.text()
   expect(
     Array.from(body.matchAll(/^event: (.+)$/gm), (match) => match[1]),
@@ -619,9 +665,8 @@ test.each([
   async (mode, message) => {
     streamMode = mode
     state.models = nativeMessagesModels
-    const response = await server.request(
-      "/v1/messages",
-      createNativeMessagesRequest(),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createNativeMessagesRequest()),
     )
     const body = await response.text()
     const payloads = Array.from(
@@ -645,9 +690,8 @@ test.each([
 test("closes a native open block before the successful message_stop", async () => {
   streamMode = "native-open-success"
   state.models = nativeMessagesModels
-  const response = await server.request(
-    "/v1/messages",
-    createNativeMessagesRequest(),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createNativeMessagesRequest()),
   )
   const body = await response.text()
   expect(
@@ -677,9 +721,8 @@ test.each([
     nativeLateErrorStatus = status
     state.models = nativeMessagesModels
 
-    const response = await server.request(
-      "/v1/messages",
-      createNativeMessagesRequest(),
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/messages", createNativeMessagesRequest()),
     )
     const body = await response.text()
     const events = Array.from(
@@ -834,9 +877,8 @@ test("commits a keepalive while native Anthropic waits for upstream headers", as
   setSsePreflushDeadlineForTest(20)
   streamMode = "stall-fetch"
   state.models = nativeMessagesModels
-  const response = await server.request(
-    "/v1/messages",
-    createNativeMessagesRequest(),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createNativeMessagesRequest()),
   )
   const reader = requireBody(response).getReader()
   const first = await reader.read()
@@ -852,9 +894,8 @@ test("forwards native Messages metadata verbatim except for the requested model"
   streamMode = "native-metadata"
   state.models = nativeMessagesModels
 
-  const response = await server.request(
-    "/v1/messages",
-    createNativeMessagesRequest(),
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", createNativeMessagesRequest()),
   )
   const body = await response.text()
   const payloads = Array.from(

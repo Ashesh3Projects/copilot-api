@@ -53,6 +53,10 @@ import {
   Trash2Icon,
 } from "../icons"
 import { ApiError, del, get } from "../lib/api"
+import {
+  canEditReplayCapture,
+  captureOmissionMessage,
+} from "../lib/capture-state"
 import { formatDuration } from "../lib/duration-format"
 import { parseJsonBody } from "../lib/json-tree"
 import { requestPayloadView } from "../lib/llm-debug-detail-view"
@@ -69,6 +73,7 @@ const POLL_INTERVAL_MS = 10_000
 interface LlmDebugListResponse {
   count: number
   entries: Array<LlmDebugEntry>
+  cursor: string | null
   generatedAt: string
 }
 
@@ -76,8 +81,11 @@ type DebugRow = LlmDebugEntry & Record<string, unknown>
 
 type StatusFilter = "all" | LlmDebugEntry["status"]
 
-function loadEntries(): Promise<LlmDebugListResponse> {
-  return get<LlmDebugListResponse>("/dashboard/api/llm-debug")
+function loadEntries(cursor?: string): Promise<LlmDebugListResponse> {
+  return get<LlmDebugListResponse>(
+    "/dashboard/api/llm-debug?limit=100"
+      + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""),
+  )
 }
 
 function loadDetail(id: string): Promise<LlmDebugDetail> {
@@ -104,7 +112,7 @@ function statusDotVariant(
 ): StatusDotProps["variant"] {
   if (status === "complete") return "success"
   if (status === "error") return "error"
-  if (status === "aborted") return "warning"
+  if (status === "aborted" || status === "interrupted") return "warning"
   return "accent"
 }
 
@@ -112,23 +120,17 @@ function statusTextStyle(
   status: LlmDebugEntry["status"],
 ): React.CSSProperties | undefined {
   if (status === "error") return { color: "var(--color-error)" }
-  if (status === "aborted") return { color: "var(--color-warning)" }
+  if (status === "aborted" || status === "interrupted")
+    return { color: "var(--color-warning)" }
   return undefined
 }
 
 function missingResponseText(status: LlmDebugEntry["status"]): string {
   if (status === "pending") return "Awaiting response…"
-  if (status === "aborted") {
+  if (status === "aborted" || status === "interrupted") {
     return "The request was aborted before the response completed."
   }
   return "No response was received."
-}
-
-function canReplay(request: LlmDebugDetail["request"]): boolean {
-  return (
-    request.method.toUpperCase() === "POST"
-    && (request.path === "/chat/completions" || request.path === "/responses")
-  )
 }
 
 export default function LlmDebugScreen() {
@@ -138,12 +140,19 @@ export default function LlmDebugScreen() {
 }
 
 function LlmDebugListView() {
+  const [cursor, setCursor] = useState<string>()
   const { data, error, loading, reload, reloadSilently } = useAsyncData(
-    loadEntries,
-    [],
+    () => loadEntries(cursor),
+    [cursor],
   )
 
-  usePolling(() => reloadSilently(), POLL_INTERVAL_MS, [])
+  usePolling(
+    () => {
+      if (!cursor) reloadSilently()
+    },
+    POLL_INTERVAL_MS,
+    [cursor],
+  )
 
   const [query, setQuery] = useState("")
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
@@ -305,7 +314,7 @@ function LlmDebugListView() {
         entries.length > 0 ?
           <HStack gap={2}>
             <Button
-              label="Export"
+              label="Export this page"
               variant="secondary"
               icon={<DownloadIcon />}
               isLoading={isExporting}
@@ -342,6 +351,23 @@ function LlmDebugListView() {
         </VStack>
       : null}
 
+      <HStack gap={2}>
+        <Button
+          label="Latest"
+          variant="secondary"
+          onClick={() => {
+            setCursor(undefined)
+            reload()
+          }}
+        />
+        {data?.cursor ?
+          <Button
+            label="Older captures"
+            variant="secondary"
+            onClick={() => setCursor(data.cursor ?? undefined)}
+          />
+        : null}
+      </HStack>
       {data && entries.length === 0 ?
         <EmptyState
           icon={<BugIcon />}
@@ -371,6 +397,7 @@ function LlmDebugListView() {
               <SegmentedControlItem value="all" label="All" />
               <SegmentedControlItem value="error" label="Errors" />
               <SegmentedControlItem value="aborted" label="Aborted" />
+              <SegmentedControlItem value="interrupted" label="Interrupted" />
               <SegmentedControlItem value="pending" label="Pending" />
               <SegmentedControlItem value="complete" label="Complete" />
             </SegmentedControl>
@@ -541,7 +568,14 @@ function LlmDebugDetailView({ id }: { id: string }) {
     toast.success("Copied")
   }
 
-  const showReplay = data ? canReplay(data.request) : false
+  const showReplay = data ? canEditReplayCapture(data) : false
+  const captureWarning =
+    data ?
+      (captureOmissionMessage(data.request, data.status)
+      ?? (data.response ?
+        captureOmissionMessage(data.response, data.status)
+      : undefined))
+    : undefined
   const notFound = error instanceof ApiError && error.status === 404
 
   return (
@@ -560,13 +594,13 @@ function LlmDebugDetailView({ id }: { id: string }) {
             onClick={() => copy(globalThis.location.href)}
           />
           <Button
-            label="Replay"
+            label={data?.replayable ? "Replay" : "Edit and replay"}
             variant="primary"
             icon={<PlayIcon />}
             isDisabled={!showReplay}
             tooltip={
               data && !showReplay ?
-                "Only POST /chat/completions and /responses can be replayed"
+                "Replay supports POST /chat/completions and /responses captures"
               : undefined
             }
             onClick={() => navigate("llm-replay", id)}
@@ -612,6 +646,13 @@ function LlmDebugDetailView({ id }: { id: string }) {
         />
       : null}
 
+      {captureWarning ?
+        <Banner
+          status="warning"
+          title="Capture incomplete"
+          description={captureWarning}
+        />
+      : null}
       {data ?
         <VStack gap={4}>
           {data.error ?

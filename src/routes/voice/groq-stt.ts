@@ -1,4 +1,5 @@
 import { getConfig } from "~/lib/config"
+import { getGroqApiKey } from "~/lib/custom-providers"
 
 export interface TranscriptionResult {
   text: string
@@ -21,10 +22,10 @@ export async function transcribe(
   options: TranscribeOptions = {},
 ): Promise<TranscriptionResult> {
   const config = getConfig()
-  const apiKey = config.groqApiKey ?? process.env.GROQ_API_KEY
+  const apiKey = getGroqApiKey()
 
   if (!apiKey) {
-    throw new Error("GROQ_API_KEY is not configured")
+    throw new Error("Groq API key is not configured")
   }
 
   const model = config.groqModel ?? "whisper-large-v3-turbo"

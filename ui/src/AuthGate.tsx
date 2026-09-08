@@ -22,6 +22,7 @@ type GateStatus = "checking" | "authed" | "login" | "setup"
 export function AuthGate({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<GateStatus>("checking")
   const [gatewayKey, setGatewayKey] = useState("")
+  const [setupCode, setSetupCode] = useState("")
   const [password, setPassword] = useState("")
   const [confirmation, setConfirmation] = useState("")
   const [isConnecting, setIsConnecting] = useState(false)
@@ -42,9 +43,6 @@ export function AuthGate({ children }: { children: ReactNode }) {
           )
           if (!cancelled) {
             setStatus(authStatus.configured ? "login" : "setup")
-            if (!authStatus.gatewayConfigured) {
-              setError("A gateway key must be configured before admin setup.")
-            }
           }
         } catch {
           if (!cancelled) {
@@ -70,9 +68,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
       await api(
         "POST",
         status === "setup" ? "/dashboard/auth/setup" : "/dashboard/auth/login",
-        { gatewayKey, password },
+        { gatewayKey, password, ...(status === "setup" ? { setupCode } : {}) },
       )
       setGatewayKey("")
+      setSetupCode("")
       setPassword("")
       setConfirmation("")
       setStatus("authed")
@@ -112,6 +111,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
             <Banner status="error" title={error} />
           : null}
 
+          {status === "setup" ?
+            <VStack gap={2}>
+              <Text color="secondary">
+                Run copilot-api admin --setup-code on the server, then enter the
+                one-use code. Choose a gateway key for your API clients.
+              </Text>
+              <TextInput
+                type="password"
+                label="Setup code"
+                value={setupCode}
+                onChange={setSetupCode}
+                placeholder="One-use setup code"
+              />
+            </VStack>
+          : null}
+
           <TextInput
             type="password"
             label="Gateway key"
@@ -120,6 +135,32 @@ export function AuthGate({ children }: { children: ReactNode }) {
             placeholder="Enter the gateway key"
             hasAutoFocus
           />
+          {status === "setup" ?
+            <>
+              <Button
+                label="Generate a random gateway key"
+                variant="secondary"
+                onClick={() =>
+                  setGatewayKey(
+                    crypto.randomUUID().replaceAll("-", "")
+                      + crypto.randomUUID().replaceAll("-", ""),
+                  )
+                }
+              />
+              <Text color="secondary">
+                Save this key in your password manager before completing setup.
+                Use a long random API secret, not a memorable password. Imported
+                existing keys stay compatible.
+              </Text>
+              {gatewayKey ?
+                <TextInput
+                  label="Gateway key to save"
+                  value={gatewayKey}
+                  onChange={() => {}}
+                />
+              : null}
+            </>
+          : null}
           <TextInput
             type="password"
             label={status === "setup" ? "New admin password" : "Admin password"}
@@ -146,7 +187,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
             isDisabled={
               gatewayKey.trim().length === 0
               || password.length === 0
-              || (status === "setup" && confirmation.length === 0)
+              || (status === "setup"
+                && (confirmation.length === 0 || setupCode.trim().length === 0))
             }
             onClick={() => void handleConnect()}
           />

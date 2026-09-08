@@ -1,7 +1,10 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 
 import {
   authenticateAdminRequest,
+  issueAdminSetupCode,
   setAdminAuthTestMode,
   setupAdminAuth,
 } from "../src/lib/admin-auth"
@@ -38,6 +41,9 @@ import {
   voiceWebSocket,
 } from "../src/routes/voice/route"
 import { server } from "../src/server"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalGatewayKey = state.apiKeyAuth
 const originalDirectConnect = process.env.COPILOT_API_ENABLE_DIRECT_CONNECT
@@ -63,6 +69,7 @@ beforeEach(async () => {
   const setup = await setupAdminAuth(
     "gateway-secret",
     "correct horse battery staple",
+    (await issueAdminSetupCode()).code,
   )
   if ("error" in setup) throw new Error(setup.error)
   adminCookie = `__Host-copilot_admin=${setup.session.token}; __Host-copilot_admin_csrf=${setup.session.csrfToken}`

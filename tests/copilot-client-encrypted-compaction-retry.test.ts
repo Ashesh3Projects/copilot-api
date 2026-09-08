@@ -15,12 +15,15 @@ import {
   listLlmDebugLogs,
 } from "../src/lib/llm-debug-log"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
 import { copilotFetch } from "../src/services/copilot/copilot-client"
 import { createRetryBudget } from "../src/services/copilot/transport-retry"
+import { useProtocolDatabase } from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const queuedResults: Array<Response> = []
@@ -96,11 +99,11 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   queuedResults.length = 0
   capturedRequests.length = 0
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetRoutingTelemetryForTest()
   state.accountType = "individual"
   state.githubToken = "github-token"
@@ -179,13 +182,17 @@ test("retries encrypted compaction verification failures within the shared send 
     ])
 
     await new Promise((resolve) => setTimeout(resolve, 0))
-    const debugEntries = listLlmDebugLogs().entries
+    const debugEntries = (await listLlmDebugLogs()).entries
     expect(debugEntries).toHaveLength(2)
     expect(debugEntries.map(({ responseStatus }) => responseStatus)).toEqual([
       400, 400,
     ])
     expect(
-      debugEntries.map(({ id }) => getLlmDebugLog(id)?.request.body),
+      await Promise.all(
+        debugEntries.map(
+          async ({ id }) => (await getLlmDebugLog(id))?.request.body,
+        ),
+      ),
     ).toEqual([requestBody, requestBody])
   } finally {
     warnSpy.mockRestore()

@@ -1,7 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import fs from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
 
 import {
   getLoadedModelFallbackConfig,
@@ -11,7 +8,9 @@ import {
   setModelFallbackConfigForTest,
   validateModelFallbackConfig,
 } from "~/lib/model-fallback-config"
-import { PATHS } from "~/lib/paths"
+import { initializeStorageRuntime } from "~/lib/storage/runtime"
+
+import { createRuntimeStorage } from "./helpers/runtime-storage"
 
 afterEach(() => setModelFallbackConfigForTest(null))
 
@@ -92,46 +91,39 @@ describe("model fallback configuration", () => {
     expect((await getModelFallbackConfig()).enabled).toBe(true)
   })
 
-  // PATHS is restored in finally; Bun runs these filesystem fixtures serially.
-  /* eslint-disable require-atomic-updates */
   test("persists configuration atomically and retains the last good state after a storage failure", async () => {
-    const directory = await fs.mkdtemp(
-      path.join(os.tmpdir(), "model-fallback-config-"),
-    )
-    const originalDir = PATHS.APP_DIR
-    const originalPath = PATHS.MODEL_FALLBACKS_CONFIG_PATH
+    const fixture = await createRuntimeStorage()
     try {
-      PATHS.APP_DIR = directory
-      PATHS.MODEL_FALLBACKS_CONFIG_PATH = path.join(
-        directory,
-        "model_fallbacks.json",
-      )
+      await initializeStorageRuntime(fixture)
       setModelFallbackConfigForTest(null)
       expect((await getModelFallbackConfig()).enabled).toBe(false)
       await Promise.all([
         setModelFallbackConfig({ enabled: false, rules: [rule] }),
         setModelFallbackConfig({ enabled: true, rules: [rule] }),
       ])
-      const persisted = JSON.parse(
-        (await fs.readFile(PATHS.MODEL_FALLBACKS_CONFIG_PATH)).toString(),
-      ) as unknown
-      expect(validateModelFallbackConfig(persisted).enabled).toBe(true)
       setModelFallbackConfigForTest(null)
       expect((await getModelFallbackConfig()).rules).toEqual([rule])
-      PATHS.MODEL_FALLBACKS_CONFIG_PATH = directory
-      const rejected = await setModelFallbackConfig({ enabled: false }).then(
-        () => false,
-        () => true,
-      )
-      expect(rejected).toBe(true)
+      fixture.failCommits()
+      expect(
+        await setModelFallbackConfig({ enabled: false }).then(
+          () => false,
+          () => true,
+        ),
+      ).toBe(true)
       expect(getLoadedModelFallbackConfig().enabled).toBe(true)
-      expect(await fs.readdir(directory)).toEqual(["model_fallbacks.json"])
+      const persisted = await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT value_json FROM capi_settings WHERE namespace = ?",
+          args: ["model_fallbacks"],
+        }),
+      )
+      expect(
+        validateModelFallbackConfig(
+          JSON.parse(String(persisted[0]?.value_json)),
+        ).enabled,
+      ).toBe(true)
     } finally {
-      PATHS.APP_DIR = originalDir
-      PATHS.MODEL_FALLBACKS_CONFIG_PATH = originalPath
-      setModelFallbackConfigForTest(null)
-      await fs.rm(directory, { recursive: true, force: true })
+      await fixture.close()
     }
   })
-  /* eslint-enable require-atomic-updates */
 })

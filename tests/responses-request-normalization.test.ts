@@ -18,6 +18,13 @@ import {
   prepareResponsesRequest,
 } from "~/services/copilot/responses-contract"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 let lastRequestBody: Record<string, unknown> | undefined
 
@@ -77,11 +84,13 @@ test("sends a finalized tolerant native Responses body without preparing again",
     implicitDefault: false,
   })
 
-  await createResponses(finalized.body, {
-    vision: false,
-    initiator: "user",
-    prepared: true,
-  })
+  await seedProtocolDatabase().then(() =>
+    createResponses(finalized.body, {
+      vision: false,
+      initiator: "user",
+      prepared: true,
+    }),
+  )
 
   expect(lastRequestBody).toEqual(finalized.body)
   expect(lastRequestBody).toMatchObject({
@@ -103,15 +112,17 @@ test("sends a finalized tolerant native Responses body without preparing again",
 })
 
 test("omits sampling parameters for GPT-5.6 reasoning requests", async () => {
-  await createResponses(
-    {
-      model: "gpt-5.6-sol",
-      input: "Hello",
-      reasoning: { effort: "max" },
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.6-sol",
+        input: "Hello",
+        reasoning: { effort: "max" },
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody).not.toHaveProperty("temperature")
@@ -119,15 +130,17 @@ test("omits sampling parameters for GPT-5.6 reasoning requests", async () => {
 })
 
 test("keeps sampling parameters for GPT-5.6 with reasoning disabled", async () => {
-  await createResponses(
-    {
-      model: "gpt-5.6-sol",
-      input: "Hello",
-      reasoning: { effort: "none" },
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.6-sol",
+        input: "Hello",
+        reasoning: { effort: "none" },
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody?.temperature).toBe(0.3)
@@ -144,15 +157,17 @@ test("keeps GPT-5.6 sampling for explicit none on implicit-default models", asyn
     },
   ])
 
-  await createResponses(
-    {
-      model: "gpt-5.6-implicit-medium",
-      input: "Hello",
-      reasoning: { effort: "none" },
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.6-implicit-medium",
+        input: "Hello",
+        reasoning: { effort: "none" },
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody?.reasoning).toEqual({ effort: "none" })
@@ -169,14 +184,16 @@ test("keeps GPT-5.6 sampling when the configured final default is none", async (
     },
   ])
 
-  await createResponses(
-    {
-      model: "gpt-5.6-default-none",
-      input: "Hello",
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.6-default-none",
+        input: "Hello",
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody?.reasoning).toEqual({
@@ -196,15 +213,17 @@ test("preserves integer effort for implicit-default Responses models", async () 
     },
   ])
 
-  await createResponses(
-    {
-      model: "gpt-5.6-implicit-medium",
-      input: "Hello",
-      reasoning: { effort: 2048 },
-      temperature: 0.3,
-      top_p: 0.8,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-5.6-implicit-medium",
+        input: "Hello",
+        reasoning: { effort: 2048 },
+        temperature: 0.3,
+        top_p: 0.8,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody?.reasoning).toEqual({ effort: 2048, summary: "auto" })
@@ -213,15 +232,17 @@ test("preserves integer effort for implicit-default Responses models", async () 
 })
 
 test("omits Responses tool controls when no tools are available", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Hello",
-      tools: null,
-      tool_choice: "auto",
-      parallel_tool_calls: true,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Hello",
+        tools: null,
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody).not.toHaveProperty("tools")
@@ -230,22 +251,24 @@ test("omits Responses tool controls when no tools are available", async () => {
 })
 
 test("forwards Responses tool controls when a real tool is available", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Hello",
-      tools: [
-        {
-          type: "function",
-          name: "lookup",
-          parameters: {},
-          strict: false,
-        },
-      ],
-      tool_choice: "required",
-      parallel_tool_calls: true,
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Hello",
+        tools: [
+          {
+            type: "function",
+            name: "lookup",
+            parameters: {},
+            strict: false,
+          },
+        ],
+        tool_choice: "required",
+        parallel_tool_calls: true,
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody?.tools).toEqual([
@@ -275,13 +298,15 @@ test.each(["changing", "throwing"])(
 
     let caught: unknown
     try {
-      await createResponses(
-        {
-          model: "gpt-4o",
-          input: "Hello",
-          tools: [tool as Record<string, unknown>],
-        },
-        { vision: false, initiator: "user" },
+      await seedProtocolDatabase().then(() =>
+        createResponses(
+          {
+            model: "gpt-4o",
+            input: "Hello",
+            tools: [tool as Record<string, unknown>],
+          },
+          { vision: false, initiator: "user" },
+        ),
       )
     } catch (error) {
       caught = error
@@ -298,17 +323,19 @@ test.each(["changing", "throwing"])(
 )
 
 test("forwards reviewed Responses fields from the prepared request", async () => {
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: "Hello",
-      context_management: [{ type: "truncate" }],
-      prompt_cache_options: { mode: "explicit", ttl: "30m" },
-      prompt_cache_retention: "in_memory",
-      truncation: "auto",
-      user: "user-1",
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: "Hello",
+        context_management: [{ type: "truncate" }],
+        prompt_cache_options: { mode: "explicit", ttl: "30m" },
+        prompt_cache_retention: "in_memory",
+        truncation: "auto",
+        user: "user-1",
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(lastRequestBody).toMatchObject({
@@ -332,25 +359,27 @@ test("preserves explicit Responses prompt caching controls exactly", async () =>
     metadata: { prefix: "stable", version: 2 },
   }
 
-  await createResponses(
-    {
-      model: "gpt-4o",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "stable prefix",
-              prompt_cache_breakpoint: promptCacheBreakpoint,
-            },
-          ],
-        },
-      ],
-      prompt_cache_options: promptCacheOptions,
-      prompt_cache_retention: "in_memory",
-    },
-    { vision: false, initiator: "user" },
+  await seedProtocolDatabase().then(() =>
+    createResponses(
+      {
+        model: "gpt-4o",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "stable prefix",
+                prompt_cache_breakpoint: promptCacheBreakpoint,
+              },
+            ],
+          },
+        ],
+        prompt_cache_options: promptCacheOptions,
+        prompt_cache_retention: "in_memory",
+      },
+      { vision: false, initiator: "user" },
+    ),
   )
 
   expect(JSON.stringify(lastRequestBody?.prompt_cache_options)).toBe(
@@ -377,9 +406,11 @@ test("does not pass upstream Responses objects to ordinary logs", async () => {
   try {
     let thrown: unknown
     try {
-      await createResponses(
-        { model: "gpt-4o", input: "Hello" },
-        { vision: false, initiator: "user" },
+      await seedProtocolDatabase().then(() =>
+        createResponses(
+          { model: "gpt-4o", input: "Hello" },
+          { vision: false, initiator: "user" },
+        ),
       )
     } catch (error) {
       thrown = error

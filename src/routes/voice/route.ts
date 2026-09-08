@@ -2,11 +2,14 @@ import consola from "consola"
 
 import { resolveRequestCredential } from "~/lib/credential-resolver"
 import { resolveProtectedCredential } from "~/lib/protected-credential"
+import { withRequestSnapshot } from "~/lib/storage/request-snapshot"
+import { admitWebSocketTurn } from "~/lib/storage/websocket-admission"
 
 import { transcribe } from "./groq-stt"
 import { pcmToWav } from "./pcm-to-wav"
 
 export interface VoiceSession {
+  authenticationRequest?: Request
   pcmChunks: Array<Uint8Array>
   totalBytes: number
   language: string
@@ -17,8 +20,11 @@ export interface VoiceSession {
 
 export type VoiceUpgradeResult = "upgraded" | "auth_failed" | "no_match"
 
-function createSession(language: string): VoiceSession {
+function createSession(language: string, request: Request): VoiceSession {
   return {
+    authenticationRequest: new Request(request.url, {
+      headers: request.headers,
+    }),
     pcmChunks: [],
     totalBytes: 0,
     language,
@@ -55,6 +61,7 @@ function releaseSession(session: VoiceSession): void {
   if (session.released) return
   session.released = true
   session.transcriptionAbort?.abort()
+  session.authenticationRequest = undefined
   clearAudio(session)
 }
 
@@ -65,6 +72,30 @@ function closeAndRelease(
 ): void {
   releaseSession(session)
   ws.close(close.code, close.reason)
+}
+
+function rejectTranscriptionAdmission(
+  session: VoiceSession,
+  ws: {
+    send(data: string): void
+    close(code?: number, reason?: string): void
+  },
+  status: "unavailable" | "unauthorized",
+): void {
+  const unavailable = status === "unavailable"
+  ws.send(
+    JSON.stringify({
+      type: "TranscriptError",
+      description:
+        unavailable ?
+          "Database storage is temporarily unavailable."
+        : "Authentication failed",
+    }),
+  )
+  closeAndRelease(ws, session, {
+    code: unavailable ? 1011 : 1008,
+    reason: unavailable ? "Storage unavailable" : "Authentication failed",
+  })
 }
 
 async function finalizeAudio(
@@ -90,9 +121,25 @@ async function finalizeAudio(
   try {
     const wav = pcmToWav(pcm)
     session.transcriptionAbort = new AbortController()
-    const result = await transcribe(wav, session.language, {
-      signal: session.transcriptionAbort.signal,
-    })
+    const admission =
+      session.authenticationRequest ?
+        await admitWebSocketTurn(session.authenticationRequest, [
+          "voice:transcribe",
+        ])
+      : undefined
+    if (isSessionReleased(session)) return
+    if (admission && admission.status !== "authorized") {
+      rejectTranscriptionAdmission(session, ws, admission.status)
+      return
+    }
+    const execute = () =>
+      transcribe(wav, session.language, {
+        signal: session.transcriptionAbort?.signal,
+      })
+    const result =
+      admission ?
+        await withRequestSnapshot(admission.snapshot, execute)
+      : await execute()
     if (isSessionReleased(session)) return
     if (result.text) {
       ws.send(JSON.stringify({ type: "TranscriptText", data: result.text }))
@@ -186,7 +233,7 @@ export async function tryUpgradeVoiceWebSocket(
     return "auth_failed"
   }
 
-  const session = createSession(url.searchParams.get("language") ?? "en")
+  const session = createSession(url.searchParams.get("language") ?? "en", req)
   const upgraded = server.upgrade(req, {
     data: { type: "voice" as const, session },
   })

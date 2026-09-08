@@ -9,6 +9,14 @@ import { setModelRedirectsForTest } from "~/lib/model-redirect"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const previous = { ...state }
 const originalFetch = globalThis.fetch
 const calls: Array<{ path: string; body: Record<string, unknown> }> = []
@@ -142,20 +150,23 @@ test.each(["/responses", "/chat/completions", "/v1/messages", "custom"])(
   async (endpoint) => {
     configureCompactTarget(endpoint)
     const request = () =>
-      server.request("/v1/responses/compact", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "thread-id": "compact-thread",
-        },
-        body: JSON.stringify({
-          model: "compact-source",
-          input: [
-            { type: "reasoning", id: "old-signature", summary: [] },
-            { role: "user", content: "history" },
-          ],
+      seedProtocolDatabase().then(() =>
+        server.request("/v1/responses/compact", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+            "content-type": "application/json",
+            "thread-id": "compact-thread",
+          },
+          body: JSON.stringify({
+            model: "compact-source",
+            input: [
+              { type: "reasoning", id: "old-signature", summary: [] },
+              { role: "user", content: "history" },
+            ],
+          }),
         }),
-      })
+      )
     const first = await request()
     expect(first.status).toBe(200)
     const body = (await first.json()) as {
@@ -205,14 +216,19 @@ test.each(["/responses", "/chat/completions", "/v1/messages", "custom"])(
       }
       return Response.json(result)
     }) as typeof fetch
-    const response = await server.request("/v1/responses/compact", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "compact-source",
-        input: [{ role: "user", content: "Keep the full conversation." }],
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses/compact", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "compact-source",
+          input: [{ role: "user", content: "Keep the full conversation." }],
+        }),
       }),
-    })
+    )
     expect(response.status).toBe(502)
     const result = (await response.json()) as {
       error: { code: string }
@@ -229,23 +245,28 @@ test.each(["/responses", "/chat/completions", "/v1/messages", "custom"])(
 
 test("normal Responses fallback routes the next compaction directly to the remembered model", async () => {
   const headers = {
+    authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
     "content-type": "application/json",
     "thread-id": "shared-inference-compaction",
   }
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ model: "compact-source", input: "first" }),
-  })
-  expect(response.status).toBe(200)
-  const compact = await server.request("/v1/responses/compact", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: "compact-source",
-      input: [{ role: "user", content: "history" }],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "compact-source", input: "first" }),
     }),
-  })
+  )
+  expect(response.status).toBe(200)
+  const compact = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses/compact", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "compact-source",
+        input: [{ role: "user", content: "history" }],
+      }),
+    }),
+  )
   expect(compact.status).toBe(200)
   expect(calls.map((entry) => entry.body.model)).toEqual([
     "compact-source",
@@ -265,25 +286,30 @@ test("compaction resolves the same source alias used by ordinary Responses fallb
     },
   ])
   const headers = {
+    authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
     "content-type": "application/json",
     "thread-id": "aliased-thread",
   }
   expect(
     (
-      await server.request("/v1/responses", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: "compact-alias", input: "first" }),
-      })
+      await seedProtocolDatabase().then(() =>
+        server.request("/v1/responses", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: "compact-alias", input: "first" }),
+        }),
+      )
     ).status,
   ).toBe(200)
   expect(
     (
-      await server.request("/v1/responses/compact", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: "compact-alias", input: [] }),
-      })
+      await seedProtocolDatabase().then(() =>
+        server.request("/v1/responses/compact", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: "compact-alias", input: [] }),
+        }),
+      )
     ).status,
   ).toBe(200)
   expect(calls.map((entry) => entry.body.model)).toEqual([

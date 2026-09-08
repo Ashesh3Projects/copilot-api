@@ -13,6 +13,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
 const calls: Array<{ host: string; model: string }> = []
@@ -54,17 +62,20 @@ function configure(edges: Array<[string, string]>): void {
 }
 
 function post(sourceModel: string, threadId?: string) {
-  return server.request("/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(threadId ? { "thread-id": threadId } : {}),
-    },
-    body: JSON.stringify({
-      model: sourceModel,
-      messages: [{ role: "user", content: "hello" }],
+  return seedProtocolDatabase().then(() =>
+    server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        ...(threadId ? { "thread-id": threadId } : {}),
+      },
+      body: JSON.stringify({
+        model: sourceModel,
+        messages: [{ role: "user", content: "hello" }],
+      }),
     }),
-  })
+  )
 }
 
 beforeEach(() => {

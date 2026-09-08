@@ -1,12 +1,23 @@
 import consola from "consola"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
+import type { Account } from "~/lib/token-pool"
+
+import {
+  getLeasedAccount,
+  leaseAccount,
+  unavailableAccount,
+  withAccountLeaseScope,
+} from "~/lib/account-lease-context"
 import { getLastUsedAccountId } from "~/lib/account-router"
+import { getAccountsService } from "~/lib/accounts-service"
 import {
   getClientSessionId,
   setLastUsedRoutedAccountId,
 } from "~/lib/request-session"
 import { state } from "~/lib/state"
+import { getRequestSnapshot } from "~/lib/storage/request-snapshot"
+import { peekStorageRuntime } from "~/lib/storage/runtime"
 import { tokenPool } from "~/lib/token-pool"
 import { copilotBaseUrl } from "~/services/copilot/copilot-client"
 import { createCopilotTransportInit } from "~/services/copilot/transport-options"
@@ -75,50 +86,63 @@ export interface WebSearchToolOptions {
   userLocation?: Record<string, unknown>
 }
 
+function previousMcpAccount(databaseAccounts: boolean): Account | undefined {
+  const routedAccountId = getLastUsedAccountId()
+  if (routedAccountId === undefined) return undefined
+  const account =
+    getLeasedAccount(routedAccountId)
+    ?? tokenPool.getAllAccounts().find((item) => item.id === routedAccountId)
+  if (databaseAccounts && !account) throw unavailableAccount()
+  return account
+}
+
+function selectMcpAccount(
+  options: WebSearchExecutionOptions,
+): Account | undefined {
+  const account =
+    options.modelId ?
+      tokenPool.getAccountForModelBySession(
+        options.modelId,
+        options.sessionId ?? getClientSessionId(),
+      )
+    : undefined
+  if (!account && options.modelId && tokenPool.hasKnownModel(options.modelId)) {
+    throw new Error(
+      `No enabled account is available for model "${options.modelId}"`,
+    )
+  }
+  return account ?? tokenPool.getFirstHealthyAccount()
+}
+
 const getMcpCredentials = (
   options: WebSearchExecutionOptions,
 ): McpCredentials => {
-  const routedAccountId = getLastUsedAccountId()
-  let routedAccount =
-    routedAccountId === undefined ? undefined : (
-      tokenPool
-        .getAllAccounts()
-        .find((account) => account.id === routedAccountId)
-    )
-
-  if (!routedAccount && state.isMultiToken) {
-    routedAccount =
-      options.modelId ?
-        tokenPool.getAccountForModelBySession(
-          options.modelId,
-          options.sessionId ?? getClientSessionId(),
-        )
-      : undefined
-
-    if (
-      !routedAccount
-      && options.modelId
-      && tokenPool.hasKnownModel(options.modelId)
-    ) {
-      throw new Error(
-        `No enabled account is available for model "${options.modelId}"`,
-      )
-    }
-    routedAccount ??= tokenPool.getFirstHealthyAccount()
-    if (routedAccount) setLastUsedRoutedAccountId(routedAccount.id)
+  const databaseAccounts = peekStorageRuntime() !== undefined
+  let account = previousMcpAccount(databaseAccounts)
+  if (!account && (state.isMultiToken || databaseAccounts))
+    account = selectMcpAccount(options)
+  if (databaseAccounts) {
+    if (!account) throw unavailableAccount()
+    account = leaseAccount(account)
   }
-
-  const githubToken = routedAccount?.githubToken ?? state.githubToken
+  if (account) setLastUsedRoutedAccountId(account.id)
+  const githubToken = account?.githubToken ?? state.githubToken
   if (!githubToken) {
     throw new Error("GitHub token is not set. Cannot call MCP endpoint.")
   }
 
   return {
     githubToken,
-    baseUrl:
-      routedAccount ? tokenPool.getBaseUrl(routedAccount) : copilotBaseUrl(),
-    cacheKey: routedAccount ? `account:${routedAccount.id}` : "default",
+    baseUrl: account ? tokenPool.getBaseUrl(account) : copilotBaseUrl(),
+    cacheKey: account ? mcpCredentialCacheKey(account) : "default",
   }
+}
+
+function mcpCredentialCacheKey(account: Account): string {
+  const credential = createHash("sha256")
+    .update(JSON.stringify([account.githubInstanceDomain, account.githubToken]))
+    .digest("hex")
+  return `account:${account.id}:${account.credentialRevision ?? 0}:${credential}`
 }
 
 const getSessionState = (cacheKey: string): McpSessionState => {
@@ -289,6 +313,18 @@ export const executeWebSearch = async (
   query: string,
   signal?: AbortSignal,
   options: WebSearchExecutionOptions = {},
+): Promise<string> => {
+  if (peekStorageRuntime() && !getRequestSnapshot())
+    await getAccountsService().refreshRuntime()
+  return withAccountLeaseScope(signal, () =>
+    executeWebSearchTurn(query, signal, options),
+  )
+}
+
+const executeWebSearchTurn = async (
+  query: string,
+  signal: AbortSignal | undefined,
+  options: WebSearchExecutionOptions,
 ): Promise<string> => {
   try {
     signal?.throwIfAborted()

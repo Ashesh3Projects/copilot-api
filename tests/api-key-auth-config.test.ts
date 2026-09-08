@@ -62,14 +62,9 @@ test("Docker Compose preserves automatic secret-management integration", async (
     copilotApi.environment,
     "services.copilot-api.environment",
   )
-  const envFile = requireStringArray(
-    copilotApi.env_file,
-    "services.copilot-api.env_file",
-  )
-
-  expect(environment).toContain("OP_TOKEN=${OP_TOKEN}")
-  expect(environment).toContain("OP_ENV_ID=${OP_ENV_ID}")
-  expect(envFile).toContain(".env")
+  expect(copilotApi.env_file).toEqual([{ path: ".env", required: false }])
+  expect(environment).toContain("OP_TOKEN=${OP_TOKEN:-}")
+  expect(environment).toContain("OP_ENV_ID=${OP_ENV_ID:-}")
 })
 
 test("deployment defaults remain portable and omit obsolete setup guidance", async () => {
@@ -99,9 +94,9 @@ test("deployment defaults remain portable and omit obsolete setup guidance", asy
   expect(compose).not.toContain("setup.md")
   expect(compose).toContain("COPILOT_ADMIN_ORIGIN=${COPILOT_ADMIN_ORIGIN:-}")
   expect(schema).not.toContain("COPILOT_PORT")
-  expect(schema).toContain("uniform, no-store 401 response")
-  expect(schema).toContain("COPILOT_ADMIN_PASSWORD_HASH")
-  expect(generatedEnvTypes).toContain("COPILOT_ADMIN_PASSWORD_HASH?: string")
+  expect(schema).toContain("TURSO_DATABASE_URL")
+  expect(schema).not.toContain("COPILOT_ADMIN_PASSWORD_HASH=")
+  expect(generatedEnvTypes).toContain("TURSO_AUTH_TOKEN?: string")
   expect(readme).not.toContain("recent password reauthentication")
   expect(security).toContain("2026 public-exposure remediation")
   expect(nginxReadme).toContain("Upgrade: websocket")
@@ -118,10 +113,8 @@ test("deployment defaults remain portable and omit obsolete setup guidance", asy
   expect(updater).toContain('if [ "${health:-none}" != "healthy" ]')
   expect(startSource).not.toContain("ericc-ch.github.io")
   expect(startSource).toContain("Operator Dashboard")
-  expect(windowsLauncher).toContain(
-    "bun run dev start --host 127.0.0.1 --api-key-auth",
-  )
-  expect(windowsLauncher).toContain("if not defined COPILOT_API_KEY_AUTH")
+  expect(windowsLauncher).toContain("bun run dev start --host 127.0.0.1")
+  expect(windowsLauncher).not.toContain("if not defined COPILOT_API_KEY_AUTH")
   expect(windowsLauncher).not.toContain("ericc-ch.github.io")
 })
 
@@ -145,24 +138,11 @@ test("leaves API key authentication disabled when the CLI flag is omitted", () =
   expect(resolveApiKeyAuth(undefined, "environment-secret")).toBeUndefined()
 })
 
-test("prefers an explicit CLI secret over the environment", () => {
-  expect(resolveApiKeyAuth("cli-secret", "environment-secret")).toBe(
-    "cli-secret",
-  )
-})
-
-test("uses the environment secret for valueless CLI flags", () => {
-  expect(resolveApiKeyAuth("", "environment-secret")).toBe("environment-secret")
-  expect(resolveApiKeyAuth("true", "environment-secret")).toBe(
-    "environment-secret",
-  )
-})
-
-test("rejects a valueless CLI flag when the environment secret is missing", () => {
-  expect(() => resolveApiKeyAuth("", undefined)).toThrow(
-    /^--api-key-auth requires a value or COPILOT_API_KEY_AUTH environment variable$/,
-  )
-  expect(() => resolveApiKeyAuth("true", undefined)).toThrow(
-    /^--api-key-auth requires a value or COPILOT_API_KEY_AUTH environment variable$/,
-  )
-})
+test.each(["cli-secret", "", "true"])(
+  "rejects deprecated CLI auth source %s",
+  (value) => {
+    expect(() => resolveApiKeyAuth(value, "environment-secret")).toThrow(
+      "no longer configures",
+    )
+  },
+)

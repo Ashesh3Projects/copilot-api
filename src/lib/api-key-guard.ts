@@ -17,7 +17,6 @@ import {
   trustAuthenticatedIp,
 } from "./ip-blocker"
 import { sanitizeRequestDiagnosticReference } from "./request-diagnostics"
-import { state } from "./state"
 import { isAllowedTransparentProxyRequest } from "./transparent-proxy"
 
 const verifiedTransparentRequests = new WeakSet<Request>()
@@ -30,7 +29,7 @@ export function isVerifiedTransparentProxyRequest(request: Request): boolean {
  * API key guard middleware. Invalid credentials receive a small, bounded and
  * uniform authentication response.
  *
- * Only active when state.apiKeyAuth is set (via --api-key-auth CLI flag).
+ * Credential authority always comes from the initialized database.
  */
 export async function apiKeyGuard(
   c: Context,
@@ -47,11 +46,6 @@ async function guardOrdinaryRequest(
   c: Context,
   next: Next,
 ): Promise<Response | undefined> {
-  if (!state.apiKeyAuth) {
-    await next()
-    return
-  }
-
   const clientIp = extractClientIp(c)
   const diagnosticPath = sanitizeRequestDiagnosticReference(
     c.req.method,
@@ -130,7 +124,7 @@ async function guardTransparentProxyRequest(
   let authorized = false
   if (gatewayHeaderPresent) {
     authorized =
-      resolveGatewayCredential(rawGatewayCredential, ["user:inference"])
+      (await resolveGatewayCredential(rawGatewayCredential, ["user:inference"]))
       !== null
     if (authorized && clientIp !== null) await trustAuthenticatedIp(clientIp)
   } else if (clientIp !== null) {

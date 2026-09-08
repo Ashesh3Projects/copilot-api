@@ -24,10 +24,12 @@ import {
   RelTime,
   TogglePill,
 } from "../components/common"
+import { DatabaseBackup } from "../components/DatabaseBackup"
 import { Page } from "../components/Page"
 import { ResponsivePair } from "../components/ResponsivePair"
+import { StoredCredentials } from "../components/StoredCredentials"
 import { DownloadIcon, PlusIcon, Trash2Icon } from "../icons"
-import { ApiError, del, get, patch, post } from "../lib/api"
+import { ApiError, del, get, patch, post, put } from "../lib/api"
 import { useToast } from "../lib/toast"
 import {
   IpAddressRequiredError,
@@ -74,6 +76,31 @@ export default function SettingsScreen() {
   const [newJwtLabel, setNewJwtLabel] = useState("")
   const [newJwtDigest, setNewJwtDigest] = useState("")
   const [isAddingJwtDigest, setIsAddingJwtDigest] = useState(false)
+  const [currentPassword, setCurrentPassword] = useState("")
+  const [newPassword, setNewPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
+  const [changingPassword, setChangingPassword] = useState(false)
+
+  const changePassword = async () => {
+    if (newPassword !== confirmPassword) {
+      toast.error("Passwords do not match.")
+      return
+    }
+    setChangingPassword(true)
+    try {
+      await put("/dashboard/auth/password", { currentPassword, newPassword })
+      setCurrentPassword("")
+      setNewPassword("")
+      setConfirmPassword("")
+      toast.success(
+        "Password changed. Other administrator sessions were signed out.",
+      )
+    } catch (caught) {
+      toast.error(errorMessage(caught, "Could not change the password"))
+    } finally {
+      setChangingPassword(false)
+    }
+  }
 
   const cleanupValue = cleanupDraft ?? data?.settings.codexCleanupModel ?? ""
 
@@ -374,6 +401,47 @@ export default function SettingsScreen() {
 
       {data ?
         <VStack gap={4}>
+          <StoredCredentials />
+          <DatabaseBackup />
+          <Card>
+            <VStack gap={3}>
+              <Heading level={3}>Administrator password</Heading>
+              <Text color="secondary">
+                Changing your password signs out other administrator sessions.
+                API client credentials stay active.
+              </Text>
+              <TextInput
+                type="password"
+                label="Current password"
+                value={currentPassword}
+                onChange={setCurrentPassword}
+              />
+              <TextInput
+                type="password"
+                label="New password"
+                value={newPassword}
+                onChange={setNewPassword}
+              />
+              <TextInput
+                type="password"
+                label="Confirm new password"
+                value={confirmPassword}
+                onChange={setConfirmPassword}
+              />
+              <Button
+                label="Change password"
+                variant="secondary"
+                isLoading={changingPassword}
+                isDisabled={
+                  changingPassword
+                  || !currentPassword
+                  || newPassword.length < 4
+                  || newPassword !== confirmPassword
+                }
+                onClick={() => void changePassword()}
+              />
+            </VStack>
+          </Card>
           <ResponsivePair minWidth={470}>
             <Card>
               <VStack gap={4}>
@@ -400,7 +468,7 @@ export default function SettingsScreen() {
                   <MetadataListItem label="Groq Enabled">
                     {boolBadge(data.settings.groqEnabled)}
                   </MetadataListItem>
-                  <MetadataListItem label="Data Directory">
+                  <MetadataListItem label="Database">
                     <MonoText>{data.settings.dataDir}</MonoText>
                   </MetadataListItem>
                   <MetadataListItem label="Debug Mode">

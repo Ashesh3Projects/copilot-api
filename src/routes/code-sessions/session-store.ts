@@ -1,3 +1,5 @@
+import { randomInt } from "node:crypto"
+
 import { revokeSessionCapabilities } from "~/lib/bridge-capabilities"
 
 import type {
@@ -18,7 +20,7 @@ function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
   let result = ""
   for (let i = 0; i < 24; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)]
+    result += chars[randomInt(chars.length)]
   }
   return `cse_${result}`
 }

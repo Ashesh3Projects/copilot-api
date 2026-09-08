@@ -18,6 +18,11 @@ import {
   createTestAdminSession,
   resetTestAdminSession,
 } from "./helpers/admin-session"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
 
 const originalFetch = globalThis.fetch
 const originalState = { ...state }
@@ -35,9 +40,11 @@ const provider: CustomProviderConfig = {
 }
 let embedding: Array<number> | string = [1, 2, 3, 4]
 
-beforeEach(() => {
+useProtocolDatabase()
+
+beforeEach(async () => {
   requests.length = 0
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   embedding = [1, 2, 3, 4]
   setConfigForTest({
     auth: { apiKeys: [] },
@@ -85,9 +92,9 @@ beforeEach(() => {
   }) as typeof fetch
 })
 
-afterEach(() => {
+afterEach(async () => {
   globalThis.fetch = originalFetch
-  resetTestAdminSession()
+  await resetTestAdminSession()
   Object.assign(state, originalState)
   setConfigForTest(null)
 })
@@ -97,7 +104,7 @@ const post = (
   body: unknown,
   headers: Record<string, string> = {},
 ) =>
-  server.request(path, {
+  protocolRequest(path, {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
@@ -146,13 +153,13 @@ test("dashboard replays a provider log to the same provider with fresh credentia
     messages: [{ role: "user", content: "private prompt" }],
   }
   expect((await post("/v1/chat/completions", body)).status).toBe(200)
-  const log = listLlmDebugLogs().entries[0]
+  const log = (await listLlmDebugLogs()).entries[0]
   expect(log).toBeDefined()
   setConfigForTest({
     auth: { apiKeys: [] },
     customProviders: [{ ...provider, apiKey: "rotated-key" }],
   })
-  const admin = await createTestAdminSession()
+  const admin = await createTestAdminSession({ reuseStorage: true })
   requests.length = 0
   const replay = await post(
     `/dashboard/api/llm-debug/${log.id}/replay`,
@@ -171,9 +178,9 @@ test("removed custom providers cannot redirect a replay to Copilot", async () =>
     messages: [{ role: "user", content: "private prompt" }],
   }
   await post("/v1/chat/completions", body)
-  const log = listLlmDebugLogs().entries[0]
+  const log = (await listLlmDebugLogs()).entries[0]
   setConfigForTest({ auth: { apiKeys: [] }, customProviders: [] })
-  const admin = await createTestAdminSession()
+  const admin = await createTestAdminSession({ reuseStorage: true })
   requests.length = 0
   const replay = await post(
     `/dashboard/api/llm-debug/${log.id}/replay`,
@@ -190,12 +197,12 @@ test("changing a provider URL does not retarget a captured replay", async () => 
     messages: [{ role: "user", content: "private prompt" }],
   }
   await post("/v1/chat/completions", body)
-  const log = listLlmDebugLogs().entries[0]
+  const log = (await listLlmDebugLogs()).entries[0]
   setConfigForTest({
     auth: { apiKeys: [] },
     customProviders: [{ ...provider, baseUrl: "https://other.example/v1" }],
   })
-  const admin = await createTestAdminSession()
+  const admin = await createTestAdminSession({ reuseStorage: true })
   requests.length = 0
   const replay = await post(
     `/dashboard/api/llm-debug/${log.id}/replay`,
@@ -227,7 +234,7 @@ test("a replay bound to an unavailable Copilot model does not fall back to anoth
       requestHeaders: { authorization: "Bearer gho_original" },
       upstream: { kind: "copilot", accountId: 702 },
     })
-    const admin = await createTestAdminSession()
+    const admin = await createTestAdminSession({ reuseStorage: true })
     requests.length = 0
     const result = await post(
       `/dashboard/api/llm-debug/${id}/replay`,
@@ -241,3 +248,18 @@ test("a replay bound to an unavailable Copilot model does not fall back to anoth
     tokenPool.removeAccountForTest(702)
   }
 })
+
+async function protocolRequest(
+  input: Parameters<typeof server.request>[0],
+  init?: RequestInit,
+) {
+  await seedProtocolDatabase()
+  const headers = new Headers(init?.headers)
+  if (
+    !headers.has("authorization")
+    && !headers.has("x-api-key")
+    && !headers.has("x-goog-api-key")
+  )
+    headers.set("authorization", "Bearer " + PROTOCOL_GATEWAY_KEY)
+  return server.request(input, { ...init, headers })
+}

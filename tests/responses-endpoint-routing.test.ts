@@ -20,6 +20,14 @@ import { selectResponsesUpstreamEndpoint } from "~/routes/responses/handler"
 import { readResponsesRequestJson } from "~/routes/responses/request-json"
 import { server } from "~/server"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 /* eslint-disable max-lines */
 
 const originalFetch = globalThis.fetch
@@ -195,14 +203,17 @@ test("decodes zstd-compressed Codex HTTP continuations before routing", async ()
 test("rejects a plain JSON body mislabeled as zstd", async () => {
   installModel({ supported_endpoints: ["/responses"] })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-encoding": "zstd",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ model: "route-model", input: "not compressed" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-encoding": "zstd",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "route-model", input: "not compressed" }),
+    }),
+  )
 
   expect(response.status).toBe(400)
   expect(await response.json()).toEqual({
@@ -243,14 +254,17 @@ test("preserves client aborts while decoding zstd requests", async () => {
 test("rejects unsupported Responses request content encodings", async () => {
   installModel({ supported_endpoints: ["/responses"] })
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-encoding": "gzip",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ model: "route-model", input: "hello" }),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-encoding": "gzip",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "route-model", input: "hello" }),
+    }),
+  )
 
   expect(response.status).toBe(415)
   expect(await response.json()).toEqual({
@@ -271,14 +285,17 @@ test(
     const expandedBytes = 64 * 1024 * 1024 + 1
     const body = Bun.zstdCompressSync(Buffer.alloc(expandedBytes, 0x20))
 
-    const response = await server.request("/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-encoding": "zstd",
-        "content-type": "application/json",
-      },
-      body,
-    })
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-encoding": "zstd",
+          "content-type": "application/json",
+        },
+        body,
+      }),
+    )
 
     expect(response.status).toBe(413)
     expect(await response.json()).toEqual({
@@ -417,11 +434,16 @@ test.each([
 ])("rejects $name before Responses routing", async ({ body }) => {
   state.models = undefined
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body,
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body,
+    }),
+  )
 
   expect(response.status).toBe(400)
   expect(fetchMock).not.toHaveBeenCalled()
@@ -441,11 +463,16 @@ test.each([
     const errorSpy = spyOn(consola, "error")
 
     try {
-      const response = await server.request("/v1/responses", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      })
+      const response = await seedProtocolDatabase().then(() =>
+        server.request("/v1/responses", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+            "content-type": "application/json",
+          },
+          body,
+        }),
+      )
       const output = JSON.stringify([
         await response.clone().json(),
         errorSpy.mock.calls,
@@ -1708,11 +1735,17 @@ function postResponses(
   headers?: Record<string, string>,
 ): Promise<Response> {
   return Promise.resolve(
-    server.request("/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify({ model: "route-model", ...extra }),
-    }),
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify({ model: "route-model", ...extra }),
+      }),
+    ),
   )
 }
 
@@ -1724,15 +1757,18 @@ function postZstdResponses(
     JSON.stringify({ model: "route-model", ...extra }),
   )
   return Promise.resolve(
-    server.request("/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-encoding": "zstd",
-        "content-type": "application/json",
-        ...headers,
-      },
-      body,
-    }),
+    seedProtocolDatabase().then(() =>
+      server.request("/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+          "content-encoding": "zstd",
+          "content-type": "application/json",
+          ...headers,
+        },
+        body,
+      }),
+    ),
   )
 }
 

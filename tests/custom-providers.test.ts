@@ -1,4 +1,3 @@
-/* eslint-disable max-lines -- hotfix extends an existing integration matrix */
 import {
   afterAll,
   beforeAll,
@@ -8,6 +7,7 @@ import {
   spyOn,
   test,
 } from "bun:test"
+/* eslint-disable max-lines -- hotfix extends an existing integration matrix */
 import consola from "consola"
 
 import type { LlmDebugLogEntry } from "../src/lib/llm-debug-log"
@@ -29,7 +29,7 @@ import {
 import { setModelRedirectsForTest } from "../src/lib/model-redirect"
 import { setModelRoutingOverridesForTest } from "../src/lib/model-routing"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
@@ -43,6 +43,11 @@ import {
   resetTestAdminSession,
   TEST_GATEWAY_KEY,
 } from "./helpers/admin-session"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
 
 const originalFetch = globalThis.fetch
 const originalCustomApiKey = process.env.CUSTOM_PROVIDER_API_KEY
@@ -163,6 +168,8 @@ const models: ModelsResponse = {
   ],
 }
 
+useProtocolDatabase()
+
 beforeAll(() => {
   fetchMock = mock((url: string, init?: RequestInit) => {
     const body =
@@ -204,7 +211,7 @@ beforeAll(() => {
     fetchMock as unknown as typeof fetch
 })
 
-afterAll(() => {
+afterAll(async () => {
   tokenPool.removeAccountForTest(customFastCollisionAccountId)
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   restoreEnv("CUSTOM_PROVIDER_API_KEY", originalCustomApiKey)
@@ -217,14 +224,15 @@ afterAll(() => {
   state.copilotApiBaseUrl = originalCopilotApiBaseUrl
   state.apiKeyAuth = originalApiKeyAuth
   state.isMultiToken = originalIsMultiToken
-  resetTestAdminSession()
+  await resetTestAdminSession()
 })
 
-beforeEach(() => {
+beforeEach(async () => {
+  globalThis.fetch = fetchMock as unknown as typeof fetch
   tokenPool.removeAccountForTest(customFastCollisionAccountId)
   fetchMock.mockClear()
   requests = []
-  clearLlmDebugLogs()
+  await clearLlmDebugLogs()
   resetWebSearchSessionsForTest()
   process.env.CUSTOM_PROVIDER_API_KEY = "custom-key"
   state.models = models
@@ -263,7 +271,7 @@ beforeEach(() => {
         name: "Custom Chat",
         type: "openai-compatible",
         baseUrl: "https://custom.example/v1",
-        apiKeyEnv: "CUSTOM_PROVIDER_API_KEY",
+        apiKey: "custom-key",
         headers: {
           "X-Custom-Provider": "provider-only",
           "X-Custom-Trace": CUSTOM_HEADER_VALUE,
@@ -380,7 +388,7 @@ test.each([
     unknownPath,
     unknownBody,
   }) => {
-    const alias = await server.request(customPath, {
+    const alias = await protocolRequest(customPath, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(customBody),
@@ -391,7 +399,7 @@ test.each([
     expect(requests[0]?.body.model).toBe("gpt-copilot")
 
     requests = []
-    const exact = await server.request(exactPath, {
+    const exact = await protocolRequest(exactPath, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(exactBody),
@@ -403,7 +411,7 @@ test.each([
     )
 
     requests = []
-    const unknown = await server.request(unknownPath, {
+    const unknown = await protocolRequest(unknownPath, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(unknownBody),
@@ -424,7 +432,7 @@ test("custom Google applies detached replacements exactly once", async () => {
     },
   ])
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/custom-chat-alias:generateContent",
     {
       method: "POST",
@@ -476,15 +484,15 @@ function routingSnapshot() {
   })
 }
 
-function latestDebugLog(): LlmDebugLogEntry | undefined {
-  return getLlmDebugLog(listLlmDebugLogs().entries[0]?.id ?? "")
+async function latestDebugLog(): Promise<LlmDebugLogEntry | undefined> {
+  return await getLlmDebugLog((await listLlmDebugLogs()).entries[0]?.id ?? "")
 }
 
 async function waitForLatestDebugStatus(
   status: LlmDebugLogEntry["status"],
 ): Promise<LlmDebugLogEntry | undefined> {
   for (let attempt = 0; attempt < 100; attempt++) {
-    const entry = latestDebugLog()
+    const entry = await latestDebugLog()
     if (entry?.status === status) return entry
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
@@ -509,7 +517,7 @@ function expectChatDispatch(
 }
 
 test("custom models appear in /v1/models with aliases and metadata", async () => {
-  const response = await server.request("/v1/models")
+  const response = await protocolRequest("/v1/models")
   const body = (await response.json()) as {
     data: Array<ListedModel>
   }
@@ -544,7 +552,7 @@ test("custom models appear in /v1/models with aliases and metadata", async () =>
 
 test("chat request routes to custom provider by model id", async () => {
   const infoSpy = spyOn(consola, "info")
-  const response = await server.request("/v1/chat/completions", {
+  const response = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -572,8 +580,8 @@ test("chat request routes to custom provider by model id", async () => {
         path: "/chat/completions",
         url: "https://custom.example/v1/chat/completions",
         headers: {
-          Authorization: "Bearer custom-key",
-          "X-Custom-Trace": CUSTOM_HEADER_VALUE,
+          Authorization: "[REDACTED]",
+          "X-Custom-Trace": "[REDACTED]",
           "content-type": "application/json",
           accept: "application/json",
         },
@@ -624,7 +632,7 @@ test("redirected Responses and Google models resolve custom providers after redi
       { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
     ],
   ] as const) {
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -640,7 +648,7 @@ test("redirected Responses and Google models resolve custom providers after redi
 })
 
 test("priority Responses requests use configured custom fast models", async () => {
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -657,7 +665,7 @@ test("priority Responses requests use configured custom fast models", async () =
 })
 
 test("priority Responses aliases use the canonical custom fast model", async () => {
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -695,7 +703,7 @@ test("priority Responses requests can use a custom fast model when Copilot routi
   state.isMultiToken = true
 
   try {
-    const response = await server.request("/v1/responses", {
+    const response = await protocolRequest("/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -723,7 +731,7 @@ test("priority Responses requests can move from a custom normal model to a Copil
   }
   state.models = { object: "list", data: [...models.data, copilotFastModel] }
 
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -742,12 +750,12 @@ test("priority Responses requests can move from a custom normal model to a Copil
 })
 
 test("custom embedding aliases never dispatch chat through Responses or Google", async () => {
-  const responses = await server.request("/v1/responses", {
+  const responses = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "qwen3-embedding-8b", input: "hello" }),
   })
-  const google = await server.request(
+  const google = await protocolRequest(
     "/v1beta/models/qwen3-embedding-8b:generateContent",
     {
       method: "POST",
@@ -764,7 +772,7 @@ test("custom embedding aliases never dispatch chat through Responses or Google",
 })
 
 test("custom Responses compaction remains excluded from provider dispatch", async () => {
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -783,7 +791,7 @@ test("custom Responses compaction remains excluded from provider dispatch", asyn
 })
 
 test("priority Responses compaction does not dispatch to a custom-only fast model", async () => {
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -803,7 +811,7 @@ test("priority Responses compaction does not dispatch to a custom-only fast mode
 })
 
 test("custom Google countTokens is local and never calls a provider", async () => {
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/custom-chat-alias:countTokens",
     {
       method: "POST",
@@ -843,7 +851,7 @@ test.each([
 ])(
   "$name routes the evaluated Chat candidate to the custom provider",
   async ({ path, payload, expectedModel }) => {
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: {
         authorization: "Bearer gateway-client-secret",
@@ -907,7 +915,7 @@ test("custom providers preserve public identity across Responses and Google stre
     .mockImplementationOnce(streamResponse)
     .mockImplementationOnce(streamResponse)
 
-  const responses = await server.request("/v1/responses", {
+  const responses = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -924,7 +932,7 @@ test("custom providers preserve public identity across Responses and Google stre
   )
   expect(responsesText).not.toContain("response.failed")
 
-  const google = await server.request(
+  const google = await protocolRequest(
     "/v1beta/models/custom-chat-alias:streamGenerateContent?alt=sse",
     {
       method: "POST",
@@ -955,7 +963,7 @@ test("custom Google stream supports JSON-array mode with public identity", async
       }),
   )
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/custom-chat-alias:streamGenerateContent",
     {
       method: "POST",
@@ -981,6 +989,8 @@ test("custom Google stream supports JSON-array mode with public identity", async
 })
 
 test("custom Google web-search continuations stay on the provider", async () => {
+  const providerFetch = globalThis.fetch
+  globalThis.fetch = withSyntheticMcp(providerFetch)
   const toolCall = (id: string, query: string) => ({
     id,
     object: "chat.completion",
@@ -1039,7 +1049,7 @@ test("custom Google web-search continuations stay on the provider", async () => 
     })
   }
 
-  const response = await server.request(
+  const response = await protocolRequest(
     "/v1beta/models/custom-chat-alias:generateContent",
     {
       method: "POST",
@@ -1065,6 +1075,8 @@ test("custom Google web-search continuations stay on the provider", async () => 
 })
 
 test("custom provider web-search continuations never switch to Copilot", async () => {
+  const providerFetch = globalThis.fetch
+  globalThis.fetch = withSyntheticMcp(providerFetch)
   const assistantToolCall = {
     id: "chatcmpl-search",
     object: "chat.completion",
@@ -1128,7 +1140,7 @@ test("custom provider web-search continuations never switch to Copilot", async (
       })
     })
 
-  const response = await server.request("/v1/responses", {
+  const response = await protocolRequest("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1185,7 +1197,7 @@ test.each([
         }),
     )
 
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -1224,7 +1236,7 @@ test.each([
         }),
     )
 
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -1251,7 +1263,7 @@ test.each([
   },
   {
     name: "Google",
-    path: "/v1beta/models/custom-chat-alias:generateContent?key=query-private",
+    path: "/v1beta/models/custom-chat-alias:generateContent?key=gateway-private",
     body: { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
   },
 ])("$name isolates custom provider credentials", async ({ path, body }) => {
@@ -1266,14 +1278,14 @@ test.each([
     "client-provider-private",
     "query-private",
   ]
-  const response = await server.request(path, {
+  const response = await protocolRequest(path, {
     method: "POST",
     headers: {
       authorization: "Bearer gateway-private",
       "content-type": "application/json",
       cookie: "session=cookie-private",
-      "x-api-key": "native-api-private",
-      "x-goog-api-key": "google-api-private",
+      "x-api-key": "gateway-private",
+      "x-goog-api-key": "gateway-private",
       "copilot-session-token": "session-private",
       "anthropic-beta": "anthropic-beta-private",
       "anthropic-version": "anthropic-version-private",
@@ -1320,7 +1332,7 @@ test.each([
       createLateCustomProviderStreamResponse(upstream),
     )
 
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -1370,7 +1382,7 @@ test.each([
         ),
     )
 
-    const response = await server.request(path, {
+    const response = await protocolRequest(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -1391,7 +1403,7 @@ test.each([
 )
 
 test("custom Chat receives the tolerant native candidate without Copilot caching", async () => {
-  const response = await server.request("/v1/chat/completions", {
+  const response = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1421,7 +1433,7 @@ test("custom Chat receives the tolerant native candidate without Copilot caching
 })
 
 test("Anthropic messages request routes to custom chat provider by model id", async () => {
-  const response = await server.request("/v1/messages?beta=true", {
+  const response = await protocolRequest("/v1/messages?beta=true", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1455,8 +1467,8 @@ test("Anthropic messages request routes to custom chat provider by model id", as
     request: {
       body: JSON.stringify(requests[0]?.body),
       headers: {
-        Authorization: "Bearer custom-key",
-        "X-Custom-Trace": CUSTOM_HEADER_VALUE,
+        Authorization: "[REDACTED]",
+        "X-Custom-Trace": "[REDACTED]",
       },
       path: "/chat/completions",
       url: "https://custom.example/v1/chat/completions",
@@ -1502,7 +1514,7 @@ test("streams custom-provider data before raw debug capture completes", async ()
     upstreamClosed = true
     upstreamController.close()
   }
-  const responsePromise = server.request("/v1/chat/completions", {
+  const responsePromise = protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1532,7 +1544,7 @@ test("streams custom-provider data before raw debug capture completes", async ()
     expect(new TextDecoder().decode(firstRead.value)).toContain(
       "streamed immediately",
     )
-    expect(latestDebugLog()?.status).toBe("pending")
+    expect((await latestDebugLog())?.status).toBe("pending")
 
     closeUpstream()
     const complete = await waitForLatestDebugStatus("complete")
@@ -1570,7 +1582,7 @@ test("custom Messages stream closes partial text before one EOF error", async ()
     })
   })
 
-  const response = await server.request("/v1/messages", {
+  const response = await protocolRequest("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1694,7 +1706,7 @@ test.each([
 ] as const)(
   "best-effort translates custom-provider Messages $name before Chat dispatch",
   async ({ extra, check }) => {
-    const response = await server.request("/v1/messages", {
+    const response = await protocolRequest("/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1711,7 +1723,7 @@ test.each([
 
 test("custom Messages dispatches a versioned web-search schema after URL-image fallback", async () => {
   const marker = "PRIVATE_CUSTOM_WEB_SEARCH_SCHEMA"
-  const response = await server.request("/v1/messages", {
+  const response = await protocolRequest("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1780,7 +1792,7 @@ test("custom Messages dispatches a versioned web-search schema after URL-image f
 test("custom Messages dispatches an unknown typed tool with a schema", async () => {
   const privateType = "PRIVATE_CUSTOM_NATIVE_TYPE"
   const privateName = "PRIVATE_CUSTOM_NATIVE_NAME"
-  const response = await server.request("/v1/messages", {
+  const response = await protocolRequest("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1826,7 +1838,7 @@ test.each([
 ])(
   "custom Messages dispatches web-search lookalike type %s as a function tool",
   async (type) => {
-    const response = await server.request("/v1/messages", {
+    const response = await protocolRequest("/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1873,7 +1885,7 @@ test("custom Messages flattens documents before attachment normalization", async
     context: "custom context",
   }
 
-  const response = await server.request("/v1/messages", {
+  const response = await protocolRequest("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1951,7 +1963,7 @@ test.each([
 ] as const)(
   "best-effort translates custom-provider nested $name without local rejection",
   async ({ extra, param }) => {
-    const response = await server.request("/v1/messages", {
+    const response = await protocolRequest("/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -2023,7 +2035,7 @@ test.each([
 )
 
 test("Claude Code Messages cache-control routes to ZenMux custom provider", async () => {
-  const response = await server.request("/v1/messages", {
+  const response = await protocolRequest("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2124,7 +2136,7 @@ test.each([
       )
     })
 
-    const response = await server.request(endpoint, {
+    const response = await protocolRequest(endpoint, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -2269,7 +2281,7 @@ test.each([
       })
 
       const isMessages = endpoint.startsWith("/v1/messages")
-      const response = await server.request(endpoint, {
+      const response = await protocolRequest(endpoint, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -2311,7 +2323,7 @@ test.each([
 )
 
 test("embeddings request routes to Nebius config by alias", async () => {
-  const response = await server.request("/v1/embeddings", {
+  const response = await protocolRequest("/v1/embeddings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2343,11 +2355,11 @@ test("embeddings request routes to Nebius config by alias", async () => {
     request: {
       body: JSON.stringify(requests[0]?.body),
       headers: {
-        Authorization: "Bearer nebius-key",
-        "X-Provider": "nebius",
+        Authorization: "[REDACTED]",
+        "X-Provider": "[REDACTED]",
       },
       path: "/embeddings",
-      url: "https://api.studio.nebius.com/v1/embeddings",
+      url: "[unavailable URL]",
     },
   })
 
@@ -2365,7 +2377,7 @@ test("records custom-provider transport failures without swallowing them", async
     throw new Error("custom provider connection failed")
   })
 
-  const response = await server.request("/v1/chat/completions", {
+  const response = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2423,7 +2435,7 @@ test("preserves custom-provider chat identity while sanitizing failures", async 
           headers: { "content-type": "application/problem+json" },
         }),
     )
-    const response = await server.request("/v1/chat/completions", {
+    const response = await protocolRequest("/v1/chat/completions", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -2452,7 +2464,8 @@ test("preserves custom-provider chat identity while sanitizing failures", async 
         statusText: statusMarker,
       },
     })
-    expect(debug?.response?.body).toContain(bodyMarker)
+    expect(debug?.response?.body).toBeNull()
+    expect(debug?.response?.omittedReason).toBe("unsupported")
     expect(response.headers.get("content-type")).toContain("application/json")
   } finally {
     errorSpy.mockRestore()
@@ -2465,7 +2478,7 @@ test("records custom-provider transport and aborted lifecycles in raw LLM Debug"
     throw new Error(transportMarker)
   })
 
-  const transportResponse = await server.request("/v1/chat/completions", {
+  const transportResponse = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2474,19 +2487,19 @@ test("records custom-provider transport and aborted lifecycles in raw LLM Debug"
     }),
   })
   expect(transportResponse.status).toBe(500)
-  expect(getLlmDebugLog(listLlmDebugLogs().entries[0]?.id ?? "")).toMatchObject(
-    {
-      status: "error",
-      error: { message: transportMarker },
-    },
-  )
+  expect(
+    await getLlmDebugLog((await listLlmDebugLogs()).entries[0]?.id ?? ""),
+  ).toMatchObject({
+    status: "error",
+    error: { message: transportMarker },
+  })
 
   fetchMock.mockImplementationOnce(() => {
     const error = new Error("custom provider request aborted")
     error.name = "AbortError"
     throw error
   })
-  const abortedResponse = await server.request("/v1/chat/completions", {
+  const abortedResponse = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2495,11 +2508,11 @@ test("records custom-provider transport and aborted lifecycles in raw LLM Debug"
     }),
   })
   expect(abortedResponse.status).toBe(499)
-  expect(getLlmDebugLog(listLlmDebugLogs().entries[0]?.id ?? "")).toMatchObject(
-    {
-      status: "aborted",
-    },
-  )
+  expect(
+    await getLlmDebugLog((await listLlmDebugLogs()).entries[0]?.id ?? ""),
+  ).toMatchObject({
+    status: "aborted",
+  })
 })
 
 test("preserves custom-provider embedding identity while sanitizing failures", async () => {
@@ -2531,7 +2544,7 @@ test("preserves custom-provider embedding identity while sanitizing failures", a
         headers: { "content-type": "application/octet-stream" },
       }),
   )
-  const response = await server.request("/v1/embeddings", {
+  const response = await protocolRequest("/v1/embeddings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "qwen3-embedding-8b", input: "hello" }),
@@ -2568,7 +2581,7 @@ test("keeps future-named custom SSE data after comments and unknown fields", asy
       ),
   )
 
-  const response = await server.request("/v1/chat/completions", {
+  const response = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2609,7 +2622,7 @@ test("missing custom provider API key returns a clear error", async () => {
   })
   clearEnv("NEBIUS_API_KEY")
 
-  const response = await server.request("/v1/embeddings", {
+  const response = await protocolRequest("/v1/embeddings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2620,13 +2633,13 @@ test("missing custom provider API key returns a clear error", async () => {
   const body = (await response.json()) as { error: { message: string } }
 
   expect(response.status).toBe(500)
-  expect(body.error.message).toContain("NEBIUS_API_KEY")
+  expect(body.error.message).toContain("stored API key")
   expect(requests).toHaveLength(0)
 })
 
 test("dashboard stores provider API key without returning it", async () => {
   const admin = await createTestAdminSession()
-  const response = await server.request("/dashboard/api/custom-providers", {
+  const response = await protocolRequest("/dashboard/api/custom-providers", {
     method: "POST",
     headers: adminHeaders(admin),
     body: JSON.stringify({
@@ -2649,7 +2662,9 @@ test("dashboard stores provider API key without returning it", async () => {
   expect(body.apiKeyConfigured).toBe(true)
   expect(body.apiKeyEnv).toBeUndefined()
 
-  const chatResponse = await server.request("/v1/chat/completions", {
+  setConfigForTest(null)
+
+  const chatResponse = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -2667,7 +2682,7 @@ test("dashboard stores provider API key without returning it", async () => {
 
 test("Nebius dashboard shortcut never returns the submitted API key", async () => {
   const admin = await createTestAdminSession()
-  const response = await server.request(
+  const response = await protocolRequest(
     "/dashboard/api/custom-providers/nebius-qwen3",
     {
       method: "POST",
@@ -2688,7 +2703,7 @@ test("Nebius dashboard shortcut never returns the submitted API key", async () =
 })
 
 test("Copilot models still route through the existing path", async () => {
-  const response = await server.request("/v1/chat/completions", {
+  const response = await protocolRequest("/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2720,7 +2735,7 @@ test("embedding dimension metadata is validated", async () => {
     })
   })
 
-  const response = await server.request("/v1/embeddings", {
+  const response = await protocolRequest("/v1/embeddings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -2733,3 +2748,50 @@ test("embedding dimension metadata is validated", async () => {
   expect(response.status).toBe(502)
   expect(body.error.message).toContain("expected 4096")
 })
+
+async function protocolRequest(
+  input: Parameters<typeof server.request>[0],
+  init?: RequestInit,
+) {
+  await seedProtocolDatabase({
+    gatewayKeys: [
+      PROTOCOL_GATEWAY_KEY,
+      "gateway-client-secret",
+      "gateway-private",
+      "native-api-private",
+      "google-api-private",
+      "query-private",
+      ...(state.apiKeyAuth ? [state.apiKeyAuth] : []),
+    ],
+  })
+  const headers = new Headers(init?.headers)
+  if (
+    !headers.has("authorization")
+    && !headers.has("x-api-key")
+    && !headers.has("x-goog-api-key")
+  )
+    headers.set("authorization", "Bearer " + PROTOCOL_GATEWAY_KEY)
+  return server.request(input, { ...init, headers })
+}
+
+function withSyntheticMcp(providerFetch: typeof fetch): typeof fetch {
+  return ((input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : input)
+    if (url.pathname !== "/mcp/readonly") return providerFetch(input, init)
+    if (typeof init?.body !== "string")
+      throw new Error("Expected MCP JSON body")
+    const body = JSON.parse(init.body) as { method?: string }
+    return Promise.resolve(
+      body.method === "initialize" ?
+        Response.json(
+          { jsonrpc: "2.0", id: "fixture", result: {} },
+          { headers: { "Mcp-Session-Id": "fixture-mcp" } },
+        )
+      : Response.json({
+          jsonrpc: "2.0",
+          id: "fixture",
+          result: { content: [{ type: "text", text: "Fixture web result" }] },
+        }),
+    )
+  }) as typeof fetch
+}

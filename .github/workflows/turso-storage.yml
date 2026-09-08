@@ -1,0 +1,92 @@
+name: Isolated Turso Storage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-turso-storage
+  cancel-in-progress: false
+
+jobs:
+  remote-storage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATA_DIR: ${{ github.workspace }}/.superpowers/test-data/turso-ci
+      NPM_CONFIG_REGISTRY: https://packagefeedproxy.microsoft.io/npm/
+    steps:
+      - uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f # v6
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@04be95cf3511ea51ebf9f224ddfb99cc7ab87cd4 # v6
+        with:
+          node-version: "22"
+
+      - name: Require dedicated isolated test database secrets
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+        run: |
+          if [ -z "${TURSO_DATABASE_URL//[[:space:]]/}" ] || [ -z "${TURSO_AUTH_TOKEN//[[:space:]]/}" ]; then
+            echo "::error::Configure both TURSO_TEST_DATABASE_URL and TURSO_TEST_AUTH_TOKEN for a dedicated test database."
+            exit 1
+          fi
+
+      - name: Install dependencies without lifecycle scripts
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          npm ci --prefix ui --ignore-scripts
+
+      - name: Build the production image and standalone remote smoke fixture
+        # No remote credentials are available during dependency installation or image builds.
+        run: |
+          docker build --tag copilot-api:turso-storage-base .
+          mkdir -p .superpowers/turso-ci-image
+          bun build tests/fixtures/remote-storage-container-smoke.ts \
+            --target=bun --external @tursodatabase/serverless --external gpt-tokenizer \
+            --outfile .superpowers/turso-ci-image/remote-smoke.js
+          cat > .superpowers/turso-ci-image/Dockerfile <<'DOCKERFILE'
+          FROM copilot-api:turso-storage-base
+          COPY remote-smoke.js /app/remote-smoke.js
+          ENTRYPOINT ["bun", "/app/remote-smoke.js"]
+          DOCKERFILE
+          docker build --tag copilot-api:turso-storage-smoke .superpowers/turso-ci-image
+
+      - name: Verify remote constraints and transaction ownership
+        env:
+          CAP_STORAGE_REMOTE_TEST: "1"
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+        run: bun test tests/turso-remote-contract.test.ts
+
+      - name: Verify remote OAuth concurrency
+        env:
+          CAP_STORAGE_REMOTE_TEST: "1"
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+        run: bun test tests/oauth-storage-concurrency.test.ts --test-name-pattern "live Turso OAuth exchange refresh and revocation races"
+
+      - name: Verify encrypted local and remote transfer
+        env:
+          CAP_STORAGE_REMOTE_TEST: "1"
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+        run: bun test tests/storage-remote-transfer.test.ts
+
+      - name: Verify remote runtime in a read-only container
+        # Fixtures create random owned SQL prefixes and clean only their exact allowlists.
+        # No host data directory, host node_modules, published port, or writable volume.
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+        run: |
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --env TURSO_DATABASE_URL --env TURSO_AUTH_TOKEN \
+            --env CAP_STORAGE_REMOTE_SMOKE=1 --env DATA_DIR=/smoke-must-remain-absent \
+            copilot-api:turso-storage-smoke

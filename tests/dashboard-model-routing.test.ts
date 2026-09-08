@@ -32,6 +32,8 @@ const accounts: Array<Account> = [
     githubToken: GITHUB_TOKEN,
     githubUsername: "octocat",
     healthy: true,
+    enabled: false,
+    deleting: false,
     models: new Set(["dashboard-routing-model"]),
     modelsData: [],
   },
@@ -41,6 +43,8 @@ const accounts: Array<Account> = [
     githubInstanceDomain: "github.com",
     githubToken: GITHUB_TOKEN_WITHOUT_USERNAME,
     healthy: false,
+    enabled: true,
+    deleting: true,
     models: new Set(),
     modelsData: [],
   },
@@ -52,9 +56,9 @@ beforeAll(async () => {
   getAllAccountsSpy.mockReturnValue(accounts)
 })
 
-afterAll(() => {
+afterAll(async () => {
   getAllAccountsSpy.mockRestore()
-  resetTestAdminSession()
+  await resetTestAdminSession()
 })
 
 test("model routing requires dashboard authentication", async () => {
@@ -81,12 +85,16 @@ test("model routing returns account usernames without GitHub tokens", async () =
     accountType: "individual",
     githubUsername: "octocat",
     healthy: true,
+    enabled: false,
+    deleting: false,
     modelsCount: 1,
   })
   expect(accountWithoutUsername).toEqual({
     id: ACCOUNT_WITHOUT_USERNAME_ID,
     accountType: "business",
     healthy: false,
+    enabled: true,
+    deleting: true,
     modelsCount: 0,
   })
   expect(Object.hasOwn(accountWithoutUsername ?? {}, "githubUsername")).toBe(
@@ -127,6 +135,25 @@ test("model routing account formatters fall back without a username", () => {
   expect(formatModelRoutingAccountSummary(account)).toBe(
     "Account #3, individual, Unhealthy",
   )
+})
+
+test("model routing summaries expose disabled and removing account availability", () => {
+  const account = {
+    id: 4,
+    accountType: "individual",
+    healthy: true,
+    modelsCount: 2,
+  }
+  expect(formatModelRoutingAccountSummary({ ...account, enabled: false })).toBe(
+    "Account #4, individual, Disabled",
+  )
+  expect(
+    formatModelRoutingAccountSummary({
+      ...account,
+      enabled: false,
+      deleting: true,
+    }),
+  ).toBe("Account #4, individual, Removing")
 })
 
 test("generated dashboard includes GitHub username account labels", () => {

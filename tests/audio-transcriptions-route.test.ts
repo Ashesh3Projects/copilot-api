@@ -5,11 +5,15 @@ import { setIpAllowlistForTest } from "../src/lib/ip-allowlist"
 import { resetIpSecurityForTest } from "../src/lib/ip-blocker"
 import { shouldOmitRequestBodyFromDiagnostics } from "../src/lib/request-diagnostics"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
 
 const originalApiKeyAuth = state.apiKeyAuth
 const originalFetch = globalThis.fetch
@@ -27,6 +31,8 @@ function getFetchUrl(url: string | URL | Request): string {
   if (url instanceof URL) return url.href
   return url.url
 }
+
+useProtocolDatabase()
 
 beforeEach(() => {
   state.apiKeyAuth = "gateway-secret"
@@ -71,7 +77,7 @@ async function requestTranscription(
   formData: FormData,
   headers: Record<string, string> = {},
 ): Promise<Response> {
-  return await server.request("/v1/audio/transcriptions", {
+  return await protocolRequest("/v1/audio/transcriptions", {
     method: "POST",
     headers: {
       authorization: "Bearer gateway-secret",
@@ -379,7 +385,7 @@ test("rejects response formats unavailable for the Whisper compatibility route",
 })
 
 test("returns an OpenAI-shaped error for non-multipart bodies", async () => {
-  const response = await server.request("/v1/audio/transcriptions", {
+  const response = await protocolRequest("/v1/audio/transcriptions", {
     method: "POST",
     headers: {
       authorization: "Bearer gateway-secret",
@@ -404,7 +410,7 @@ test("returns a bounded server error when Groq is not configured", async () => {
   expect(await response.json()).toEqual({
     error: {
       code: "configuration_error",
-      message: "GROQ_API_KEY is not configured",
+      message: "Groq API key is not configured",
       param: null,
       type: "server_error",
     },
@@ -416,7 +422,7 @@ test("does not let transparent-proxy IP allowlisting bypass endpoint auth", asyn
   const clientIp = "203.0.113.90"
   setIpAllowlistForTest([{ ip: clientIp, enabled: true, source: "manual" }])
 
-  const response = await server.request("/v1/audio/transcriptions", {
+  const response = await protocolRequest("/v1/audio/transcriptions", {
     method: "POST",
     headers: {
       host: "api.anthropic.com",
@@ -478,3 +484,12 @@ test("omits multipart audio bodies from ordinary debug diagnostics", () => {
     true,
   )
 })
+
+async function protocolRequest(
+  input: Parameters<typeof server.request>[0],
+  init?: RequestInit,
+) {
+  await seedProtocolDatabase()
+  const headers = new Headers(init?.headers)
+  return server.request(input, { ...init, headers })
+}

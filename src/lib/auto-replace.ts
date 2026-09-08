@@ -1,11 +1,15 @@
 import consola from "consola"
-import { randomUUID } from "node:crypto"
-import fs from "node:fs/promises"
 import { RE2JS } from "re2js"
 
 import type { ChatCompletionsPayload } from "~/services/copilot/create-chat-completions"
 
-import { PATHS } from "./paths"
+import {
+  getLoadedSetting,
+  readSetting,
+  updateSetting,
+} from "~/lib/storage/domain-settings"
+import { StorageSchemaError } from "~/lib/storage/errors"
+import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export interface ReplacementRule {
   id: string
@@ -86,152 +90,104 @@ const SYSTEM_REPLACEMENTS: Array<ReplacementRule> = [
   },
 ]
 
-// User-configured replacements (loaded from disk)
-let userReplacements: Array<ReplacementRule> = []
-let isLoaded = false
-let skipPersistForTest = false
-let mutationQueue: Promise<void> = Promise.resolve()
+let testReplacements: Array<ReplacementRule> | undefined
 
-function noop(): void {}
-
-async function serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = mutationQueue
-  let release = noop
-  mutationQueue = new Promise<void>((resolve) => {
-    release = resolve
+export function validateStoredReplacements(
+  value: unknown,
+): Array<ReplacementRule> {
+  if (value === undefined) return []
+  if (!Array.isArray(value))
+    throw new StorageSchemaError("Invalid replacement rules")
+  return value.map((item) => {
+    const rule = normalizeStoredRule(item)
+    if (!rule) throw new StorageSchemaError("Invalid replacement rule")
+    return rule
   })
-  await previous
-  try {
-    return await operation()
-  } finally {
-    release()
-  }
 }
 
-/**
- * Load user replacements from disk
- */
+function currentReplacements(): Array<ReplacementRule> {
+  return structuredClone(
+    testReplacements
+      ?? validateStoredReplacements(getLoadedSetting("replacements")),
+  )
+}
+
+async function mutateReplacements<T>(
+  update: (rules: Array<ReplacementRule>) => T,
+): Promise<T> {
+  if (testReplacements) {
+    const next = structuredClone(testReplacements)
+    const result = update(next)
+    testReplacements = next
+    return structuredClone(result)
+  }
+  let result: T | undefined
+  await updateSetting("replacements", (current) => {
+    const next = validateStoredReplacements(current)
+    result = update(next)
+    return normalizeSettingsJson(next)
+  })
+  return structuredClone(result as T)
+}
+
 export async function loadReplacements(): Promise<void> {
-  skipPersistForTest = false
-  try {
-    const data = await fs.readFile(PATHS.REPLACEMENTS_CONFIG_PATH)
-    const parsed = JSON.parse(data.toString()) as unknown
-    userReplacements =
-      Array.isArray(parsed) ?
-        parsed
-          .map((value) => normalizeStoredRule(value))
-          .filter((rule): rule is ReplacementRule => rule !== null)
-      : []
-    isLoaded = true
-    consola.debug(`Loaded ${userReplacements.length} user replacement rules`)
-  } catch {
-    // File doesn't exist or is invalid - start with empty array
-    userReplacements = []
-    isLoaded = true
-  }
+  validateStoredReplacements(await readSetting("replacements"))
+  testReplacements = undefined
 }
 
-/**
- * Save user replacements to disk
- */
 export async function saveReplacements(): Promise<void> {
-  if (skipPersistForTest) return
-  const temporaryPath = `${PATHS.REPLACEMENTS_CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`
-  try {
-    await fs.mkdir(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-    await fs.chmod(PATHS.APP_DIR, 0o700)
-    await fs.writeFile(
-      temporaryPath,
-      JSON.stringify(userReplacements, null, 2),
-      { encoding: "utf8", mode: 0o600 },
-    )
-    await fs.chmod(temporaryPath, 0o600)
-    await fs.rename(temporaryPath, PATHS.REPLACEMENTS_CONFIG_PATH)
-    await fs.chmod(PATHS.REPLACEMENTS_CONFIG_PATH, 0o600)
-    consola.debug(`Saved ${userReplacements.length} user replacement rules`)
-  } catch (error) {
-    await fs.rm(temporaryPath, { force: true }).catch(() => {})
-    consola.error("Failed to save replacement rules:", error)
-    throw error
-  }
+  if (testReplacements) return
+  await updateSetting("replacements", (current) =>
+    normalizeSettingsJson(validateStoredReplacements(current)),
+  )
 }
 
-/**
- * Ensure replacements are loaded before accessing
- */
 export async function ensureLoaded(): Promise<void> {
-  if (!isLoaded) {
-    await loadReplacements()
-  }
+  await Promise.resolve(currentReplacements())
 }
 
-/**
- * Get all replacement rules (system + user)
- */
 export async function getAllReplacements(): Promise<Array<ReplacementRule>> {
-  await ensureLoaded()
-  return [...SYSTEM_REPLACEMENTS, ...userReplacements]
+  return await Promise.resolve([
+    ...structuredClone(SYSTEM_REPLACEMENTS),
+    ...currentReplacements(),
+  ])
 }
 
-/**
- * Get only user-configurable replacements
- */
 export async function getUserReplacements(): Promise<Array<ReplacementRule>> {
-  await ensureLoaded()
-  return userReplacements
+  return await Promise.resolve(currentReplacements())
 }
 
-/**
- * Add a new user replacement rule
- */
 export async function addReplacement(
   pattern: string,
   replacement: string,
   options?: { isRegex?: boolean; name?: string },
 ): Promise<ReplacementRule> {
-  return await serializeMutation(async () => {
-    const { isRegex = false, name } = options ?? {}
-    await ensureLoaded()
-    validateRuleFields(pattern, { isRegex })
-    const rule: ReplacementRule = {
-      id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-      name,
-      pattern,
-      replacement,
-      isRegex,
-      enabled: true,
-      isSystem: false,
-    }
-    userReplacements.push(rule)
-    await saveReplacements()
-    consola.info(`Added replacement rule: "${pattern}" -> "${replacement}"`)
+  const { isRegex = false, name } = options ?? {}
+  validateRuleFields(pattern, { isRegex })
+  const rule: ReplacementRule = {
+    id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    ...(name !== undefined ? { name } : {}),
+    pattern,
+    replacement,
+    isRegex,
+    enabled: true,
+    isSystem: false,
+  }
+  return mutateReplacements((rules) => {
+    rules.push(rule)
     return rule
   })
 }
 
-/**
- * Remove a user replacement rule by ID
- */
 export async function removeReplacement(id: string): Promise<boolean> {
-  return await serializeMutation(async () => {
-    await ensureLoaded()
-    const rule = userReplacements.find((r) => r.id === id)
-    if (!rule) return false
-    if (rule.isSystem) {
-      consola.warn("Cannot remove system replacement rule")
-      return false
-    }
-
-    userReplacements = userReplacements.filter((r) => r.id !== id)
-    await saveReplacements()
-    consola.info(`Removed replacement rule: ${id}`)
+  return mutateReplacements((rules) => {
+    const index = rules.findIndex((rule) => rule.id === id && !rule.isSystem)
+    if (index === -1) return false
+    rules.splice(index, 1)
     return true
   })
 }
 
-/**
- * Update an existing user replacement rule
- */
 export async function updateReplacement(
   id: string,
   updates: {
@@ -242,65 +198,40 @@ export async function updateReplacement(
     enabled?: boolean
   },
 ): Promise<ReplacementRule | null> {
-  return await serializeMutation(async () => {
-    await ensureLoaded()
-
-    const rule = userReplacements.find((r) => r.id === id)
+  return mutateReplacements((rules) => {
+    const rule = rules.find(
+      (candidate) => candidate.id === id && !candidate.isSystem,
+    )
     if (!rule) return null
-    if (rule.isSystem) {
-      consola.warn("Cannot update system replacement rule")
-      return null
-    }
-
-    const nextPattern = updates.pattern ?? rule.pattern
-    const nextIsRegex = updates.isRegex ?? rule.isRegex
-    validateRuleFields(nextPattern, { isRegex: nextIsRegex })
-
+    validateRuleFields(updates.pattern ?? rule.pattern, {
+      isRegex: updates.isRegex ?? rule.isRegex,
+    })
     if (updates.name !== undefined) rule.name = updates.name
     if (updates.pattern !== undefined) rule.pattern = updates.pattern
     if (updates.replacement !== undefined)
       rule.replacement = updates.replacement
     if (updates.isRegex !== undefined) rule.isRegex = updates.isRegex
     if (updates.enabled !== undefined) rule.enabled = updates.enabled
-
-    await saveReplacements()
-    consola.info(`Updated replacement rule: ${rule.name || rule.id}`)
     return rule
   })
 }
 
-/**
- * Toggle a replacement rule on/off
- */
 export async function toggleReplacement(
   id: string,
 ): Promise<ReplacementRule | null> {
-  return await serializeMutation(async () => {
-    await ensureLoaded()
-    const userRule = userReplacements.find((r) => r.id === id)
-    if (userRule) {
-      userRule.enabled = !userRule.enabled
-      await saveReplacements()
-      consola.info(
-        `Toggled replacement rule ${id}: ${userRule.enabled ? "enabled" : "disabled"}`,
-      )
-      return userRule
-    }
-
-    const systemRule = SYSTEM_REPLACEMENTS.find((r) => r.id === id)
-    if (systemRule) consola.warn("Cannot toggle system replacement rule")
-    return null
+  return mutateReplacements((rules) => {
+    const rule = rules.find(
+      (candidate) => candidate.id === id && !candidate.isSystem,
+    )
+    if (!rule) return null
+    rule.enabled = !rule.enabled
+    return rule
   })
 }
 
-/**
- * Clear all user replacements
- */
 export async function clearUserReplacements(): Promise<void> {
-  await serializeMutation(async () => {
-    userReplacements = []
-    await saveReplacements()
-    consola.info("Cleared all user replacement rules")
+  await mutateReplacements((rules) => {
+    rules.splice(0)
   })
 }
 
@@ -471,8 +402,5 @@ export async function applyReplacementsToPayload(
 }
 
 export function setReplacementsForTest(rules: Array<ReplacementRule>): void {
-  userReplacements = rules
-  isLoaded = true
-  skipPersistForTest = true
-  mutationQueue = Promise.resolve()
+  testReplacements = structuredClone(rules)
 }

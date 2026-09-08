@@ -336,9 +336,8 @@ request-local numeric pin without a persistent session/account map.
 
 The session token is an opaque secret, not gateway authentication, and the
 gateway never persists it. Ordinary logs, telemetry, Sentry, and configuration
-exports never expose `Copilot-Session-Token`. Authorized administrator-only LLM
-Debug may contain the token only when it captured a request that was actually
-forwarded. Inference requires both bounded model matching and, in multi-account
+exports never expose `Copilot-Session-Token`. Administrator-only LLM Debug
+also redacts session tokens before bounded captures enter its database queue. Inference requires both bounded model matching and, in multi-account
 mode, bounded issuer proof for the selected account. A mismatch, unknown proof,
 malformed token, or model redirect prevents forwarding. Refresh and intent
 calls with a token require the same issuer proof and otherwise return a fixed
@@ -349,7 +348,7 @@ replay is possible.
 <!-- compatibility-contract:session-token-privacy:start -->
 | Surface | Behavior |
 | --- | --- |
-| Administrator-only LLM Debug | exact forwarded token may be captured |
+| Administrator-only LLM Debug | session token value is redacted |
 | Ordinary handler logs | session token value is redacted |
 | Configuration export | token-keyed values are redacted |
 | Inference forwarding | multi-account mode also requires issuer proof for the selected account |
@@ -430,11 +429,13 @@ and configuration exports keep their established ordinary client/log/Sentry
 controls. Header allowlisting and recursive scrubbing remain independent of
 body forwarding.
 
-Administrator-only LLM Debug remains the broader raw capture. It keeps exact
-short-lived request and response attempts for authorized diagnosis and replay,
-including URLs, headers, bodies, and forwarded credentials. It is process-local,
-expires after ten minutes, and must be treated as credential-bearing material;
-it is no longer the only channel where a final upstream failure body can appear.
+Administrator-only LLM Debug stores bounded, sanitized request and response
+attempts in the selected database. Credentials and secret-bearing fields are
+redacted before enqueue. Successful captures expire after ten minutes; failed
+or interrupted captures after one hour, with earlier capacity eviction possible.
+Replay requires a complete eligible capture and obtains fresh credentials.
+Prompts and non-secret response content can still be sensitive. Final upstream
+HTTP failure bodies retain their separate passthrough contract above.
 
 ## Verification matrix and last-audited date
 

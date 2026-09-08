@@ -1,3 +1,5 @@
+import "./helpers/auth-misc-data-dir"
+
 import { afterAll, beforeEach, expect, mock, test } from "bun:test"
 import { createHash } from "node:crypto"
 
@@ -14,6 +16,12 @@ import {
 import { state } from "../src/lib/state"
 import { trustedJwtDigestStore } from "../src/lib/trusted-jwt-digests"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalApiKeyAuth = state.apiKeyAuth
 const originalModels = state.models
@@ -37,7 +45,7 @@ const chatCompletionsMock = mock(
   },
 )
 
-beforeEach(() => {
+beforeEach(async () => {
   resetIpSecurityForTest()
   state.apiKeyAuth = undefined
   state.models = { object: "list", data: [] }
@@ -46,7 +54,7 @@ beforeEach(() => {
     auth: { apiKeys: ["config-secret"] },
     groqApiKey: "groq-secret",
   })
-  trustedJwtDigestStore.replaceForTest([])
+  trustedJwtDigestStore.resetAfterTest()
   setIpAllowlistForTest([])
   fetchMock.mockClear()
   chatCompletionsMock.mockClear()
@@ -68,6 +76,7 @@ beforeEach(() => {
   ]) {
     unwhitelistIp(ip)
   }
+  await seedProtocolDatabase({ gatewayKeys: ["config-secret"] })
 })
 
 afterAll(() => {
@@ -242,7 +251,7 @@ test("transcribe: a valid bearer directly authorizes and persists the IP fallbac
 test("transcribe: a dashboard-managed ChatGPT-shaped JWT authorizes dictation", async () => {
   const clientIp = "203.0.113.57"
   const token = "header.chatgpt-shaped-payload.signature"
-  trustedJwtDigestStore.add({
+  await trustedJwtDigestStore.add({
     label: "Codex Desktop",
     digest: createHash("sha256").update(token, "utf8").digest("hex"),
   })
@@ -572,6 +581,7 @@ test("codex-responses: an active lease suppresses a ban after valid credential a
 })
 
 test("transcribe: --api-key-auth CLI key directly authorizes dictation", async () => {
+  await seedProtocolDatabase({ gatewayKeys: ["cli-secret"] })
   state.apiKeyAuth = "cli-secret"
   setConfigForTest({ groqApiKey: "groq-secret" }) // no config keys
   const clientIp = "203.0.113.56"

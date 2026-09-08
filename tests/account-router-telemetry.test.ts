@@ -6,11 +6,17 @@ import { routedFetch } from "../src/lib/account-router"
 import { setModelRoutingOverridesForTest } from "../src/lib/model-routing"
 import { runWithRoutingAffinity } from "../src/lib/routing-affinity"
 import {
-  getRoutingTelemetrySnapshot,
+  getRoutingTelemetrySnapshotForTest as getRoutingTelemetrySnapshot,
   resetRoutingTelemetryForTest,
 } from "../src/lib/routing-telemetry"
 import { state } from "../src/lib/state"
 import { tokenPool } from "../src/lib/token-pool"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const queuedResults: Array<Error | Response> = []
@@ -96,10 +102,8 @@ test("keeps direct OAuth authentication rejection separate from failover", async
   tokenPool.rebuildModelIndex()
   queuedResults.push(new Response("Unauthorized", { status: 401 }))
 
-  const result = await routedFetch(
-    "/chat/completions",
-    { method: "POST" },
-    { modelId },
+  const result = await seedProtocolDatabase().then(() =>
+    routedFetch("/chat/completions", { method: "POST" }, { modelId }),
   )
 
   expect(result.response.status).toBe(401)
@@ -134,7 +138,9 @@ test("keeps transport retries on the initially selected account", async () => {
 
   let thrown: unknown
   try {
-    await routedFetch("/chat/completions", { method: "POST" }, { modelId })
+    await seedProtocolDatabase().then(() =>
+      routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+    )
   } catch (error) {
     thrown = error
   }
@@ -162,7 +168,9 @@ test("records one sticky selection when identified failover is suppressed", asyn
   const error = await runWithRoutingAffinity(
     { key: "sticky-failover-session", source: "copilot_session" },
     async () =>
-      await routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      await seedProtocolDatabase().then(() =>
+        routedFetch("/chat/completions", { method: "POST" }, { modelId }),
+      ),
   ).catch((caught: unknown) => caught)
 
   expect(error).toBeInstanceOf(Error)
@@ -191,20 +199,20 @@ test("records typed routing affinity sources and unidentified defaults", async (
       await runWithRoutingAffinity(
         { key: `private-session-${accountId}`, source },
         async () =>
-          await routedFetch(
-            "/chat/completions",
-            { method: "POST" },
-            { modelId },
+          await seedProtocolDatabase().then(() =>
+            routedFetch("/chat/completions", { method: "POST" }, { modelId }),
           ),
       )
     }
     registerAccount(1404, defaultModel, "token-1404")
     tokenPool.rebuildModelIndex()
     queuedResults.push(new Response("{}", { status: 200 }))
-    await routedFetch(
-      "/chat/completions",
-      { method: "POST" },
-      { modelId: defaultModel },
+    await seedProtocolDatabase().then(() =>
+      routedFetch(
+        "/chat/completions",
+        { method: "POST" },
+        { modelId: defaultModel },
+      ),
     )
 
     const usage = snapshot()

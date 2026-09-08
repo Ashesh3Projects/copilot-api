@@ -17,6 +17,14 @@ import { setModelSettingsForTest } from "~/lib/model-settings"
 import { state } from "~/lib/state"
 import { server } from "~/server"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const calls: Array<{ url: string; body: Record<string, unknown> }> = []
 let resultOverride: Response | undefined
@@ -108,16 +116,21 @@ async function post(
   route: string,
   extra: Record<string, unknown> = {},
 ): Promise<Response> {
-  return await server.request(route, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: "user", content: "hello" }],
-      max_tokens: 2048,
-      ...extra,
+  return await seedProtocolDatabase().then(() =>
+    server.request(route, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 2048,
+        ...extra,
+      }),
     }),
-  })
+  )
 }
 
 beforeEach(() => {

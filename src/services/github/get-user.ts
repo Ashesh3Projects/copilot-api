@@ -26,5 +26,6 @@ export async function getGitHubUser(
 
 // Trimmed for the sake of simplicity
 interface GithubUserResponse {
+  id: number
   login: string
 }

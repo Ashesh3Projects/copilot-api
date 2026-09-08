@@ -10,6 +10,7 @@ export function createExportSettingsHandler(
     const archive = await createArchive()
     return new Response(archive.zip, {
       headers: {
+        "cache-control": "no-store",
         "content-disposition": `attachment; filename="${archive.filename}"`,
         "content-type": "application/zip",
       },

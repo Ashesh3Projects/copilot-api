@@ -17,14 +17,14 @@ affected, include its exact version or digest.
   plus CSRF/Origin checks. Inference credentials cannot list or rewrite those
   rules (CS-02).
 - The gateway key protects normal inference traffic and bootstraps OAuth and
-  administrator login. `COPILOT_API_KEY_AUTH` is the only environment-based
-  gateway-key source.
+  administrator login. Gateway credentials are stored as digests in the selected
+  database; legacy environment credentials are explicit import inputs only.
 - OAuth codes and tokens are opaque, scoped, stored as digests, bound to S256
-  PKCE/client/redirect/state, rotated on refresh, and revocable. OAuth never
+  PKCE/client/redirect/state, reusable on refresh, and explicitly revocable. OAuth never
   returns the gateway key. Claude's `create_api_key` compatibility route mints a
   separate inference-only credential. Operators may also register only the
-  SHA-256 digests of client-held secrets through
-  `COPILOT_INFERENCE_CREDENTIAL_SHA256S`; credentials are trimmed before
+  SHA-256 digests of client-held secrets through the dashboard or explicit legacy
+  import; credentials are trimmed before
   hashing, digest text is rejected, and matches resolve solely to
   `user:inference` with no gateway, OAuth profile, key-creation, or
   administrator authority.
@@ -41,9 +41,9 @@ affected, include its exact version or digest.
   has no gateway, OAuth, profile, or administrator authority.
   Current Nginx templates publish only that exact POST path.
 - The dashboard requires the gateway key plus an Argon2id administrator
-  password at login. The verifier can be stored locally or supplied
-  authoritatively through `COPILOT_ADMIN_PASSWORD_HASH`; environment rotations
-  revoke existing sessions. A server-side Secure/HttpOnly session is then
+  password at login. The Argon2id verifier and administrator sessions are stored
+  in the selected SQLite/Turso database; password changes and owner resets
+  revoke existing sessions. Initial setup requires a one-use CLI-issued code. A server-side Secure/HttpOnly session is then
   sufficient for dashboard workflows; there is no second password prompt.
   Mutations still require the SameSite CSRF cookie, matching header, and
   approved Origin.
@@ -58,13 +58,15 @@ affected, include its exact version or digest.
   runtime-valid HTTP(S) destination and redirect. There is no SSRF destination
   policy; caller abort, timeout, byte, redirect, parsing, media, and
   per-attachment degradation limits remain.
-- LLM Debug retains the broader administrator-only raw request and response
-  capture, including credentials, in process memory for ten minutes.
+- LLM Debug stores bounded administrator-only captures in the selected database.
+  Credential-like headers, fields and known literals are scrubbed before queuing.
+  Diagnostic size limits never limit forwarded inference payloads.
 - Remote Control uses short-lived, one-use, administrator/session-bound
   WebSocket tickets. Voice and Responses WebSockets authenticate before upgrade
-  and retain protocol validation without local traffic or resource limits.
-- Direct Connect is disabled by default. The only public health route is exact
-  `GET /health/health`.
+  and recheck database authority before each new Responses/voice inference turn.
+  Already admitted work retains its selected credential/configuration snapshot.
+- Direct Connect is disabled by default. Public liveness/readiness responses are metadata-free;
+  `/health/ready` additionally checks selected database availability.
 - Forwarding headers are honored only when the actual socket peer is in
   `COPILOT_TRUSTED_PROXY_CIDRS`. `/transcribe` accepts a valid inference
   credential directly and retains managed/session IP authorization for clients
@@ -97,10 +99,10 @@ affected, include its exact version or digest.
 
 | ID | Status | Current resolution |
 | --- | --- | --- |
-| F-01 | Resolved | OAuth refresh no longer returns the gateway key. Opaque scoped access/refresh tokens, PKCE-bound one-use codes, rotation, replay-family revocation, and digested persistence replaced the simulated bearer exchange. |
-| F-02 | Resolved with intentional raw compatibility channels | Dashboard authority moved to gateway-plus-password cookie sessions. Gateway credentials alone cannot access dashboard APIs; provider secrets are write-only and configuration exports redact recognized secrets. Final non-empty upstream failure bodies intentionally pass through to normal clients, logs, and Sentry. Administrator-only LLM Debug remains the broader raw request/response capture in process memory for ten minutes. |
+| F-01 | Resolved | OAuth refresh no longer returns the gateway key. Opaque scoped access/refresh tokens, PKCE-bound one-use codes, compatible reusable refresh, explicit revocation, and digested persistence replaced the simulated bearer exchange. |
+| F-02 | Resolved with intentional raw compatibility channels | Dashboard authority moved to gateway-plus-password cookie sessions. Gateway credentials alone cannot access dashboard APIs; provider secrets are write-only and configuration exports redact recognized secrets. Final non-empty upstream failure bodies intentionally pass through to normal clients, logs, and Sentry. Administrator-only LLM Debug persists bounded, scrubbed captures with retention and explicit collection gaps. |
 | F-03 | Resolved | Remote Control requires short-lived, one-use, administrator/session-bound WebSocket tickets with Origin validation. |
-| F-04 | Resolved | Only exact metadata-free `GET /health/health` remains public. Direct Connect is disabled by default and authenticated when explicitly enabled. |
+| F-04 | Resolved | Metadata-free liveness and database readiness remain public. Direct Connect is disabled by default and authenticated when explicitly enabled. |
 | F-05 | Resolved | Voice WebSockets authenticate before upgrade, enforce Origin when supplied, validate protocol messages, and cancel transcription when callers disconnect. |
 | F-06 | Resolved with documented Codex compatibility exceptions | Forwarded headers are accepted only from configured socket peers; Compose binds the backend to loopback. `/transcribe` accepts valid inference credentials directly and falls back to managed/session IP authorization only when no credential is supplied; invalid supplied credentials fail closed. Successful auth promotes only the safely resolved IP to a persistent `/transcribe` entry and process-local ban exemption. New entries use source `authenticated`; existing operator entries retain their source and transparent-proxy permission when re-enabled. Newly automatic entries do not authorize transparent proxy inference. The Codex spoof and public templates forward only exact `POST /transcribe`. The Statsig spoof template forwards only `/v1/initialize`, `/v1/download`, and `/v1/check`; behind a source-NATing load balancer, deploying it explicitly accepts that all downstream callers share the edge's allowlisted identity. |
 | F-07 | Resolved | Nginx templates use hostname-specific route/method allowlists and a final default denial instead of catch-all proxying. |
@@ -115,9 +117,8 @@ affected, include its exact version or digest.
 
 ## Regression fixes after hardening
 
-- Gateway authentication remains environment-only. The temporary key-file
-  source and Docker key-file mount were removed; `COPILOT_API_KEY_AUTH` is the
-  only supported environment source.
+- Gateway authentication is database-backed. Legacy environment and JSON values
+  are accepted only by explicit import into an empty replacement database.
 - CSP nonce injection now modifies only real HTML `script` and `style` opening
   tags. Embedded strings inside the single-file React bundle remain byte-for-byte
   intact, while OAuth pages retain exact validated callback `form-action`
@@ -173,3 +174,20 @@ complete host/container isolation audit. Operators must:
 
 See `README.md` for application setup and `nginx/README.md` for edge rendering
 and black-box validation.
+
+## Cryptographic purposes
+
+Administrator passwords use Argon2id (memoryCost 65,536; timeCost 3). Backup
+passwords use scrypt with a per-backup random salt and AES-256-GCM authenticated
+encryption. SHA-256 elsewhere is used for opaque bearer credential lookup,
+standards-required PKCE S256, already-derived-verifier fingerprints, operation
+input binding, and transfer integrity—not administrator password storage.
+Gateway/API secrets must be long, random values; do not use a memorable password
+as an API key. Automatically issued keys use cryptographic randomness. A database
+reader can recover the upstream credentials that the gateway must forward; protect
+local files and remote database access accordingly.
+
+Code-session identifiers use cryptographic randomness while preserving their
+existing `cse_` prefix and 24-character alphabet. The optional `--insecure` flag is
+an explicit, documented troubleshooting exception; it remains off by default and
+must not be used for a production deployment.

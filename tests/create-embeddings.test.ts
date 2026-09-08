@@ -5,6 +5,14 @@ import { state } from "~/lib/state"
 import { server } from "~/server"
 import { createEmbeddings } from "~/services/copilot/create-embeddings"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const originalAccountType = state.accountType
 const originalCopilotToken = state.copilotToken
@@ -27,7 +35,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   queuedResponse = Response.json({ object: "list", data: [] })
   state.accountType = "individual"
@@ -55,9 +63,10 @@ beforeEach(() => {
       },
     ],
   }
+  await seedProtocolDatabase()
 })
 
-test("preserves native embedding failure identity and exact route bytes", async () => {
+test("preserves native embedding failure metadata and exact route bytes", async () => {
   const body = Uint8Array.from([123, 10, 0, 255, 125])
   const createUpstream = () =>
     new Response(body.slice(), {
@@ -72,15 +81,28 @@ test("preserves native embedding failure identity and exact route bytes", async 
     (caught: unknown) => caught,
   )
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const upstreamFailure = (error as HTTPError).response
+  expect(upstreamFailure.status).toBe(upstream.status)
+  expect(upstreamFailure.statusText).toBe(upstream.statusText)
+  expect(Array.from(upstreamFailure.headers)).toEqual(
+    Array.from(upstream.headers),
+  )
+  expect(upstreamFailure.bodyUsed).toBe(false)
+  expect(
+    Array.from(new Uint8Array(await upstreamFailure.arrayBuffer())),
+  ).toEqual(Array.from(body))
 
   queuedResponse = createUpstream()
-  const response = await server.request("/v1/embeddings", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/embeddings", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
   expect(response.status).toBe(422)
   expect(response.headers.get("content-type")).toBe("application/octet-stream")
   expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual(
@@ -92,16 +114,24 @@ test("returns a fixed invalid JSON error without dispatching embeddings", async 
   for (const request of [
     {
       body: "{",
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
       method: "POST",
     },
     {
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
       method: "POST",
     },
   ]) {
     fetchMock.mockClear()
-    const response = await server.request("/v1/embeddings", request)
+    const response = await seedProtocolDatabase().then(() =>
+      server.request("/v1/embeddings", request),
+    )
     const text = await response.text()
 
     expect(response.status).toBe(400)

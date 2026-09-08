@@ -4,6 +4,13 @@ import type { ModelsResponse } from "../src/services/copilot/get-models"
 
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
+import {
+  useProtocolDatabase,
+  seedProtocolDatabase,
+  PROTOCOL_GATEWAY_KEY,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 let lastSignal: AbortSignal | null | undefined
@@ -146,21 +153,34 @@ beforeEach(() => {
   state.githubToken = "github-token"
   state.isMultiToken = false
   state.manualApprove = false
-  state.models = undefined
+  state.models = {
+    object: "list",
+    data: [
+      {
+        ...responsesCapableModels.data[0],
+        id: "gpt-4o",
+        name: "gpt-4o",
+        supported_endpoints: ["/chat/completions"],
+      },
+    ],
+  }
 })
 
 test("passes the client abort signal to messages upstream requests", async () => {
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 32,
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 32,
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastSignal).toBeInstanceOf(AbortSignal)
@@ -169,16 +189,19 @@ test("passes the client abort signal to messages upstream requests", async () =>
 test("passes the client abort signal to responses upstream requests", async () => {
   state.models = responsesCapableModels
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      input: "Hello",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        input: "Hello",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastSignal).toBeInstanceOf(AbortSignal)
@@ -187,14 +210,19 @@ test("passes the client abort signal to responses upstream requests", async () =
 test("passes the client abort signal to Responses Messages fallback requests", async () => {
   state.models = messagesOnlyResponsesModels
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-messages-only",
-      input: "Hello",
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-messages-only",
+        input: "Hello",
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   expect(lastSignal).toBeInstanceOf(AbortSignal)
@@ -203,22 +231,27 @@ test("passes the client abort signal to Responses Messages fallback requests", a
 test("preserves native Codex web search on the Responses path", async () => {
   state.models = responsesCapableModels
 
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      input: "What changed today?",
-      tools: [
-        {
-          type: "web_search",
-          external_web_access: true,
-          search_context_size: "high",
-          filters: { allowed_domains: ["example.com"] },
-        },
-      ],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        input: "What changed today?",
+        tools: [
+          {
+            type: "web_search",
+            external_web_access: true,
+            search_context_size: "high",
+            filters: { allowed_domains: ["example.com"] },
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   expect(response.status).toBe(200)
   const request = fetchMock.mock.calls.at(-1)?.[1] as RequestInit
@@ -238,18 +271,18 @@ test("preserves native Codex web search on the Responses path", async () => {
 test("passes the client abort signal to Google AI upstream requests", async () => {
   state.models = responsesCapableModels
 
-  const response = await server.request(
-    "/v1/models/gpt-4o-mini:generateContent",
-    {
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/models/gpt-4o-mini:generateContent", {
       method: "POST",
       headers: {
+        authorization: `Bearer ${state.apiKeyAuth ?? PROTOCOL_GATEWAY_KEY}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: "Hello" }] }],
         generationConfig: { maxOutputTokens: 32 },
       }),
-    },
+    }),
   )
 
   expect(response.status).toBe(200)

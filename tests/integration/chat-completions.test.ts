@@ -1,6 +1,9 @@
+import "./data-dir"
+
 import { describe, test, expect, beforeAll } from "bun:test"
 
 import {
+  useIntegrationFixture,
   initializeTestState,
   postJSON,
   collectSSEEvents,
@@ -40,6 +43,8 @@ interface ChatCompletionChunk {
     total_tokens: number
   }
 }
+
+useIntegrationFixture()
 
 beforeAll(async () => {
   await initializeTestState()

@@ -19,6 +19,13 @@ import {
 import { server } from "../src/server"
 import { COMPACTION_PAYLOAD_MAX_BYTES } from "../src/services/copilot/compaction-payload"
 import { createAnthropicMessages } from "../src/services/copilot/create-anthropic-messages"
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
 
 const originalFetch = globalThis.fetch
 const originalModels = state.models
@@ -66,7 +73,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   capturedBody = undefined
   capturedHeaders = undefined
@@ -77,6 +84,7 @@ beforeEach(() => {
   state.accountType = "individual"
   state.copilotToken = "copilot-token"
   state.isMultiToken = false
+  await seedProtocolDatabase()
 })
 
 test("retries exact native thinking signature failure after stripping only thinking", async () => {
@@ -293,7 +301,7 @@ test("does not log native Messages upstream status text or body", async () => {
   }
 })
 
-test("preserves native Messages failure identity and exact route bytes", async () => {
+test("preserves native Messages failure metadata and exact route bytes", async () => {
   const body = new TextEncoder().encode('{"type":"future_error"}\r\n  ')
   const createUpstream = () =>
     new Response(body.slice(), {
@@ -312,8 +320,16 @@ test("preserves native Messages failure identity and exact route bytes", async (
     (caught: unknown) => caught,
   )
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const upstreamFailure = (error as HTTPError).response
+  expect(upstreamFailure.status).toBe(upstream.status)
+  expect(upstreamFailure.statusText).toBe(upstream.statusText)
+  expect(Array.from(upstreamFailure.headers)).toEqual(
+    Array.from(upstream.headers),
+  )
+  expect(upstreamFailure.bodyUsed).toBe(false)
+  expect(
+    Array.from(new Uint8Array(await upstreamFailure.arrayBuffer())),
+  ).toEqual(Array.from(body))
 
   state.models = {
     object: "list",
@@ -339,11 +355,16 @@ test("preserves native Messages failure identity and exact route bytes", async (
     ],
   }
   pendingResponse = Promise.resolve(createUpstream())
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
   expect(response.status).toBe(418)
   expect(response.headers.get("content-type")).toBe("application/problem+json")
   expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual(

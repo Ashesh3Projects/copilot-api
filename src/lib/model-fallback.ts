@@ -6,6 +6,7 @@ import { isHTTPError } from "~/lib/error"
 import {
   getModelFallbackConfig,
   getModelFallbackConfigRevision,
+  getCapturedModelFallbackConfigRevision,
   getLoadedModelFallbackConfig,
   type ModelFallbackConfig,
 } from "~/lib/model-fallback-config"
@@ -422,7 +423,7 @@ export async function runWithModelFallback<T>(
   if (attemptStorage.getStore()) return await execute()
   await getModelFallbackConfig()
   const config = getLoadedModelFallbackConfig()
-  const configRevision = getModelFallbackConfigRevision()
+  const configRevision = getCapturedModelFallbackConfigRevision()
   if (!config.enabled) return await execute()
   refreshCache()
   const identity = getConversationIdentity(options)

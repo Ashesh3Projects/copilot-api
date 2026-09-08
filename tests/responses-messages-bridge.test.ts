@@ -20,6 +20,13 @@ import {
   responsesPayloadToAnthropic,
 } from "~/routes/responses/messages-bridge"
 
+import {
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 /* eslint-disable max-lines */
 
 test("adapts future Responses items and consumes Messages tool results once", async () => {
@@ -254,6 +261,8 @@ test("prepared Responses Messages executor skips source conversion", async () =>
     max_tokens: 128,
     messages: [{ role: "user" as const, content: "hello" }],
   }
+  await seedProtocolDatabase()
+
   const result = await executePreparedResponsesMessagesBridge({
     payload,
     responseContext: { model: "public-model", input: "hello" },
@@ -399,6 +408,8 @@ test("passes explicit native options through the Responses Messages bridge", asy
     fetchMock as unknown as typeof fetch
 
   try {
+    await seedProtocolDatabase()
+
     const result = await executeResponsesMessagesBridge({
       nativeOptions: {
         anthropicBeta: "beta-one, beta-two, beta-one",
@@ -484,6 +495,8 @@ test("defaults translated null Responses max_output_tokens at Messages native di
     fetchMock as unknown as typeof fetch
 
   try {
+    await seedProtocolDatabase()
+
     const result = await executeResponsesMessagesBridge({
       nativeOptions: {
         anthropicVersion: "2023-06-01",

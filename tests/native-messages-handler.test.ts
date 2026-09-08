@@ -11,6 +11,14 @@ import {
 import { server } from "~/server"
 import { resetWebSearchSessionsForTest } from "~/services/copilot/mcp-web-search"
 
+import {
+  PROTOCOL_GATEWAY_KEY,
+  seedProtocolDatabase,
+  useProtocolDatabase,
+} from "./helpers/protocol-database"
+
+useProtocolDatabase()
+
 const originalFetch = globalThis.fetch
 const nativeHeaders: Array<Headers> = []
 const nativeBodies: Array<Record<string, unknown>> = []
@@ -120,7 +128,7 @@ afterAll(() => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockClear()
   nativeHeaders.length = 0
   nativeBodies.length = 0
@@ -134,6 +142,7 @@ beforeEach(() => {
   state.copilotToken = "copilot-token"
   state.githubToken = "github-token"
   state.isMultiToken = false
+  await seedProtocolDatabase()
 })
 
 test("forwards native server tools without schemas and preserves the caller", async () => {
@@ -184,11 +193,16 @@ test("forwards native server tools without schemas and preserves the caller", as
     ],
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  })
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }),
+  )
 
   expect(response.status).toBe(200)
   expect(nativeBodies[0]?.tools).toEqual(tools)
@@ -396,22 +410,27 @@ test("enforces the public native web-search limit after tool rewriting", async (
     ],
   }
 
-  const response = await server.request("/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-current",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "Keep searching." }],
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: 1,
-        },
-      ],
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-current",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Keep searching." }],
+        tools: [
+          {
+            type: "web_search_20250305",
+            name: "web_search",
+            max_uses: 1,
+          },
+        ],
+      }),
     }),
-  })
+  )
 
   const body = await response.json()
 

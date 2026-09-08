@@ -1,8 +1,11 @@
 import { defineCommand } from "citty"
 import consola from "consola"
 
-import { ensurePaths } from "./lib/paths"
-import { setupGitHubToken } from "./lib/token"
+import { getAccountsService } from "./lib/accounts-service"
+import {
+  initializeStorageRuntime,
+  closeStorageRuntime,
+} from "./lib/storage/runtime"
 import {
   getCopilotUsage,
   type QuotaDetail,
@@ -14,10 +17,22 @@ export const checkUsage = defineCommand({
     description: "Show current GitHub Copilot usage/quota information",
   },
   async run() {
-    await ensurePaths()
-    await setupGitHubToken()
+    await initializeStorageRuntime()
     try {
-      const usage = await getCopilotUsage()
+      const snapshot = await getAccountsService().repository.snapshot()
+      const selected = snapshot.accounts.find(
+        (account) =>
+          account.record.enabled
+          && !account.record.deleting
+          && account.record.removedAt === null
+          && account.token,
+      )
+      if (!selected?.token)
+        throw new Error("No enabled GitHub account is configured")
+      const usage = await getCopilotUsage(
+        selected.token,
+        selected.record.instanceDomain,
+      )
       const premium = usage.quota_snapshots.premium_interactions
       const premiumTotal = premium.entitlement
       const premiumUsed = premiumTotal - premium.remaining
@@ -52,7 +67,9 @@ export const checkUsage = defineCommand({
       )
     } catch (err) {
       consola.error("Failed to fetch Copilot usage:", err)
-      process.exit(1)
+      process.exitCode = 1
+    } finally {
+      await closeStorageRuntime()
     }
   },
 })
