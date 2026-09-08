@@ -2,6 +2,7 @@ import type { ComponentType, LazyExoticComponent } from "react"
 
 import CustomProvidersScreen from "./CustomProviders"
 import EnvironmentsScreen from "./Environments"
+import FallbacksScreen from "./Fallbacks"
 import FlagsScreen from "./Flags"
 import LlmDebugScreen from "./LlmDebug"
 import LlmReplayScreen from "./LlmReplay"
@@ -70,6 +71,11 @@ export const SCREENS: Record<string, ScreenEntry> = {
     kicker: "Control",
     title: "Model Settings",
     component: ModelSettingsScreen,
+  },
+  fallbacks: {
+    kicker: "Control",
+    title: "Fallbacks",
+    component: FallbacksScreen,
   },
   "custom-providers": {
     kicker: "Control",

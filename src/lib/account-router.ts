@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- account selection and inference response recording share one transport boundary */
 import consola from "consola"
 import { AsyncLocalStorage } from "node:async_hooks"
 
@@ -17,6 +18,7 @@ import {
 } from "~/lib/account-routing-selection"
 import { sessionTokenMatchesAccount } from "~/lib/copilot-session-token"
 import { LocalHTTPError } from "~/lib/error"
+import { recordModelFallbackResponse } from "~/lib/model-fallback"
 import {
   getClientSessionId,
   getLastUsedRoutedAccountId,
@@ -807,8 +809,25 @@ export async function routedControlPlaneFetch(
  * construction in all modes to avoid double-advancing the round-robin.
  */
 // Keep selection, failover, and the shared logical-call budget together.
-// eslint-disable-next-line complexity
+
 export async function routedFetch(
+  path: string,
+  init: RequestInit | undefined,
+  options: RoutedFetchOptions,
+): Promise<{ response: Response; account: Account | undefined }> {
+  const result = await routedFetchInner(path, init, options)
+  if (
+    path === "/chat/completions"
+    || path === "/responses"
+    || path === "/v1/messages"
+  ) {
+    recordModelFallbackResponse(result.response)
+  }
+  return result
+}
+
+// eslint-disable-next-line complexity -- existing account selection and bounded retry matrix
+async function routedFetchInner(
   path: string,
   init: RequestInit | undefined,
   options: RoutedFetchOptions,

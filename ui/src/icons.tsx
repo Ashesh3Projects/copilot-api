@@ -95,6 +95,23 @@ export const ArrowRightLeftIcon = (props: SVGProps<SVGSVGElement>) => (
   </svg>
 )
 
+export const FallbackIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    strokeWidth="2"
+    aria-hidden="true"
+    {...props}
+  >
+    <path d="M4 18h3a5 5 0 0 0 5-5V6m0 7a5 5 0 0 0 5 5h3" />
+    <path d="m9 9l3-3l3 3m2 6l3 3l-3 3" />
+  </svg>
+)
+
 export const SlidersHorizontalIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg
     xmlns="http://www.w3.org/2000/svg"

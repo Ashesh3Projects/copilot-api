@@ -41,6 +41,13 @@ import {
 } from "~/lib/error"
 import { createHandlerLogger } from "~/lib/logger"
 import {
+  applyModelFallbackToPayload,
+  captureModelFallbackNotice,
+  isModelFallbackActive,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
+import { applyResponsesModelFallbackNotice } from "~/lib/model-fallback-notice"
+import {
   applyModelRedirect,
   formatModelRedirectResult,
   type ModelRedirectVerbosity,
@@ -792,11 +799,24 @@ export const handleResponses = async (c: Context) => {
   return await Sentry.startSpan(
     createSentryInvokeAgentSpanOptions(model, conversationId),
     async () => {
-      return await handleResponsesInner(c, {
-        legacyPayload: structuredClone(payload),
-        nativeOptions,
-        preparedSource,
-      })
+      return await runWithModelFallback(
+        {
+          headers: c.req.raw.headers,
+          payload: sourcePayload,
+          signal: c.req.raw.signal,
+        },
+        async () => {
+          const response = await handleResponsesInner(c, {
+            legacyPayload: structuredClone(payload),
+            nativeOptions,
+            preparedSource: structuredClone(preparedSource),
+          })
+          return applyResponsesModelFallbackNotice(
+            response,
+            captureModelFallbackNotice(),
+          )
+        },
+      )
     },
   )
 }
@@ -810,6 +830,7 @@ async function parseResponsesRequestBody(c: Context): Promise<unknown> {
   }
 }
 
+// eslint-disable-next-line complexity -- native, custom, and fallback routes share preparation state
 const handleResponsesInner = async (
   c: Context,
   options: {
@@ -842,12 +863,16 @@ const handleResponsesInner = async (
     customReferenceBeforeRedirect ? baseModel : normalizeModelName(baseModel)
   const effectiveEffort = normalizeResponsesReasoning(payload, suffixEffort)
   syncLegacyResponsesRouteState(legacyPayload, payload)
-  const directCustomReference = getDirectCustomResponsesReference(
+  let directCustomReference = getDirectCustomResponsesReference(
     customReferenceBeforeRedirect,
     payload,
   )
   if (directCustomReference) {
     applyResponsesServiceTierRouting(c, payload)
+    applyModelFallbackToPayload(payload)
+    directCustomReference = resolveCustomResponsesModel(payload.model, payload)
+  }
+  if (directCustomReference) {
     syncLegacyResponsesRouteState(legacyPayload, payload)
     return await dispatchCustomResponsesRequest(c, {
       finalEffort: effectiveEffort,
@@ -888,11 +913,38 @@ const handleResponsesInner = async (
     customReference: resolveCustomResponsesModel(payload.model, payload),
   })
   applyResponsesServiceTierRouting(undefined, legacyPayload)
+  const normalVariantRedirected =
+    !resolveRoutedCustomResponsesModel(
+      serviceTierRouting.customReference,
+      payload,
+    ) && applyResponsesModelFallback(c, payload)
+  const beforeModelFallback = payload.model
+  applyModelFallbackToPayload(payload)
+  const finalEffort =
+    typeof effectiveEffort === "number" ? effectiveEffort : (
+      normalizeReasoningEffortForModel(
+        payload.model,
+        redirectedEffort ?? effectiveEffort,
+      )
+    )
+  if (
+    beforeModelFallback !== payload.model
+    && typeof finalEffort !== "number"
+  ) {
+    applyRedirectedResponsesEffort({
+      c,
+      payload,
+      model: payload.model,
+      effort: finalEffort,
+      preserveNumericEffort: false,
+    })
+  }
   syncLegacyResponsesRouteState(legacyPayload, payload)
-  const finalEffort = redirectedEffort ?? effectiveEffort
 
   const customReference = resolveRoutedCustomResponsesModel(
-    serviceTierRouting.customReference,
+    beforeModelFallback === payload.model ?
+      serviceTierRouting.customReference
+    : undefined,
     payload,
   )
   if (customReference) {
@@ -907,6 +959,8 @@ const handleResponsesInner = async (
   const copilotSessionToken = resolveResponsesSessionToken(c, {
     payload,
     redirectOccurred: [
+      beforeModelFallback !== payload.model,
+      normalVariantRedirected,
       redirect.redirected,
       serviceTierRouting.redirected,
     ].includes(true),
@@ -1296,8 +1350,7 @@ function resolveResponsesSessionToken(
     requestedModel: string
   },
 ): string | undefined {
-  const modelWasRedirected =
-    options.redirectOccurred || applyResponsesModelFallback(c, options.payload)
+  const modelWasRedirected = options.redirectOccurred
   const token = c.req.header("copilot-session-token")
   return (
       sessionTokenMatchesModel({
@@ -1538,6 +1591,10 @@ interface CCStreamState {
   usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number }
   responseCreated: boolean
   pendingFinishReason?: string
+  preserveFallbackThinking: boolean
+  reasoningText: string
+  reasoningOpaque?: string
+  encryptedContent?: string
 }
 
 type WriteEventFn = (event: string, data: unknown) => Promise<void>
@@ -1554,6 +1611,8 @@ const createCCStreamState = (model: string): CCStreamState => ({
   nextOutputIndex: 0,
   usage: {},
   responseCreated: false,
+  preserveFallbackThinking: isModelFallbackActive(),
+  reasoningText: "",
 })
 
 function ccFailureOutput(state: CCStreamState): Array<ResponseOutputItem> {
@@ -2109,6 +2168,23 @@ const emitDoneEvents = async (
     await emitFunctionCallDoneEvents(s, fcState, writeEvent)
   }
 
+  const reasoning = fallbackStreamReasoning(s)
+  if (reasoning) {
+    const outputIndex = s.nextOutputIndex++
+    await writeEvent("response.output_item.added", {
+      item: { ...reasoning, status: "in_progress" },
+      output_index: outputIndex,
+      sequence_number: s.seqNum++,
+      type: "response.output_item.added",
+    })
+    await writeEvent("response.output_item.done", {
+      item: reasoning,
+      output_index: outputIndex,
+      sequence_number: s.seqNum++,
+      type: "response.output_item.done",
+    })
+  }
+
   return await emitResponseCompleted(s, finishReason, writeEvent)
 }
 
@@ -2207,6 +2283,9 @@ const emitResponseCompleted = async (
       status: "completed",
     } satisfies ResponseOutputFunctionCall)
   }
+
+  const reasoning = fallbackStreamReasoning(s)
+  if (reasoning) finalOutput.push(reasoning)
 
   let finalStatus = "completed"
   let incompleteDetails: ResponsesResult["incomplete_details"] = null
@@ -2318,6 +2397,14 @@ async function processChatCompletionsChunk(
   }
   const choice = chunk.choices.at(0)
   if (choice?.delta) {
+    if (state.preserveFallbackThinking) {
+      if (choice.delta.reasoning_text)
+        state.reasoningText += choice.delta.reasoning_text
+      if (choice.delta.reasoning_opaque)
+        state.reasoningOpaque = choice.delta.reasoning_opaque
+      if (choice.delta.encrypted_content)
+        state.encryptedContent = choice.delta.encrypted_content
+    }
     const content = choice.delta.content as string | undefined
     if (content) await emitTextDelta(state, content, writeEvent)
     for (const toolCall of choice.delta.tool_calls ?? []) {
@@ -2327,6 +2414,30 @@ async function processChatCompletionsChunk(
   const finishReason = choice?.finish_reason
   // eslint-disable-next-line require-atomic-updates
   if (finishReason) state.pendingFinishReason = finishReason
+}
+
+function fallbackStreamReasoning(
+  state: CCStreamState,
+): ResponseOutputReasoning | undefined {
+  if (
+    !state.preserveFallbackThinking
+    || (!state.reasoningOpaque
+      && !state.reasoningText
+      && !state.encryptedContent)
+  )
+    return undefined
+  return {
+    id: state.reasoningOpaque ?? `rs_${state.responseId}`,
+    type: "reasoning",
+    summary:
+      state.reasoningText ?
+        [{ type: "summary_text", text: state.reasoningText }]
+      : [],
+    status: "completed",
+    ...(state.encryptedContent ?
+      { encrypted_content: state.encryptedContent }
+    : {}),
+  }
 }
 
 const handleWithAnthropicMessages = async (options: {

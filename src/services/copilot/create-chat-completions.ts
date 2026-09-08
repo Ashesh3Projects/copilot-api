@@ -679,6 +679,7 @@ export interface Delta {
   content?: string | null
   reasoning_text?: string | null // Claude thinking text from CAPI
   reasoning_opaque?: string | null // Encrypted signature from CAPI (streaming)
+  encrypted_content?: string | null
   role?: "user" | "assistant" | "system" | "tool"
   tool_calls?: Array<{
     index: number

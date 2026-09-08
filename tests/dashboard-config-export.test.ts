@@ -42,6 +42,10 @@ test("config export zips only app config files that exist", async () => {
       '{"featureGates":{},"dynamicConfigs":{}}\n',
     )
     await fs.writeFile(path.join(directory, "model_settings.json"), "[]\n")
+    await fs.writeFile(
+      path.join(directory, "model_fallbacks.json"),
+      JSON.stringify({ enabled: true, rules: [] }),
+    )
     await fs.writeFile(path.join(directory, "ip_allowlist.json"), "[]\n")
     const trustedJwtSentinel =
       "trusted-jwt-export-sentinel-86bb7cf9be3a4d8bbadad2579d959fad"
@@ -76,6 +80,7 @@ test("config export zips only app config files that exist", async () => {
     expect(Object.keys(entries).sort()).toEqual([
       "config.json",
       "ip_allowlist.json",
+      "model_fallbacks.json",
       "model_settings.json",
       "statsig_overrides.json",
     ])

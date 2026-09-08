@@ -81,6 +81,28 @@ export type RedirectSourceEffort = "all" | "default" | ReasoningEffort
 export type RedirectTargetEffort = ReasoningEffort
 export type RedirectTargetVerbosity = "low" | "medium" | "high"
 
+export interface ModelFallbackRule {
+  id: string
+  sourceModel: string
+  targetModel: string
+  enabled: boolean
+}
+
+export interface ModelFallbackConfig {
+  enabled: boolean
+  conversationAffinity: boolean
+  notifyClient: boolean
+  nativeClientNotice: boolean
+  affinityTtlSeconds: number
+  affinityMaxEntries: number
+  rules: Array<ModelFallbackRule>
+}
+
+export interface ModelFallbackSettings {
+  config: ModelFallbackConfig
+  cache: { entries: number }
+}
+
 export interface ModelRedirectConflict {
   id: string
   name?: string

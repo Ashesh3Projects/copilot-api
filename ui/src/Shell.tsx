@@ -14,6 +14,7 @@ import {
   BugIcon,
   ChartBarIcon,
   CopilotIcon,
+  FallbackIcon,
   FlagIcon,
   GaugeIcon,
   LogOutIcon,
@@ -52,6 +53,11 @@ const CONTROL_ITEMS: Array<NavEntry> = [
     section: "model-redirects",
     label: "Model Redirects",
     icon: ArrowRightLeftIcon,
+  },
+  {
+    section: "fallbacks",
+    label: "Fallbacks",
+    icon: FallbackIcon,
   },
   {
     section: "model-settings",

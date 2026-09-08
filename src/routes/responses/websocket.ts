@@ -21,10 +21,21 @@ import {
 } from "~/lib/copilot-contract-observability"
 import { resolveRequestCredential } from "~/lib/credential-resolver"
 import {
+  createCustomProviderChatCompletions,
+  resolveCustomProviderModel,
+  type CustomProviderModelReference,
+} from "~/lib/custom-providers"
+import {
   createEndpointTranslationError,
   isHTTPError,
   reportHttpErrorForTransport,
 } from "~/lib/error"
+import {
+  applyModelFallbackToPayload,
+  createModelFallbackCredentialScope,
+  isModelFallbackActive,
+  runWithModelFallback,
+} from "~/lib/model-fallback"
 import {
   applyModelRedirect,
   formatModelRedirectResult,
@@ -48,6 +59,7 @@ import {
   resolveResponsesRoutingAffinity,
   resolveRoutingAffinityFromHeaders,
 } from "~/lib/routing-affinity"
+import { state } from "~/lib/state"
 import { isResponsesCompactionRequest } from "~/services/copilot/compaction-payload"
 import {
   createChatCompletions,
@@ -81,7 +93,10 @@ import {
   streamChatCompletionsAsResponses,
 } from "./handler"
 import { executePreparedResponsesMessagesBridge } from "./messages-bridge"
-import { getResponsesChatWebSearchMaxUses } from "./responses-chat-adapter"
+import {
+  adaptResponsesToChatCandidate,
+  getResponsesChatWebSearchMaxUses,
+} from "./responses-chat-adapter"
 import { applyResponsesServiceTierRouting } from "./service-tier"
 import { createStreamIdTracker, fixStreamIds } from "./stream-id-sync"
 import {
@@ -107,6 +122,7 @@ import {
   addResponsesWebSocketMetadata,
   classifyEmittedWebSocketTerminal,
   mergeEffectiveNativeMessagesOptions,
+  mergeFallbackIdentityHeaders,
   mergeContinuationInput,
   parseResponsesWebSocketFrame,
   rehydrateContinuationPayloadFromSnapshot,
@@ -125,6 +141,8 @@ export interface ResponsesWebSocketData {
   nativeMessagesOptions: NativeMessagesRequestOptions
   effectiveNativeMessagesOptions: NativeMessagesRequestOptions
   responseSnapshots: Map<string, ResponsesPayload>
+  fallbackHeaders?: Headers
+  fallbackCredentialScope?: string
 }
 
 export interface ResponsesWebSocketState {
@@ -212,6 +230,8 @@ export async function tryUpgradeResponsesWebSocket(
     nativeMessagesOptions,
     effectiveNativeMessagesOptions: { ...nativeMessagesOptions },
     responseSnapshots: new Map<string, ResponsesPayload>(),
+    fallbackHeaders: mergeFallbackIdentityHeaders(req.headers),
+    fallbackCredentialScope: createModelFallbackCredentialScope(req.headers),
   }
   if (!server.upgrade(req, { data })) return "no_match"
   return "upgraded"
@@ -246,6 +266,7 @@ export const responsesWebSocket = {
       initiator,
       nativeMessagesOptions,
       payload: parsedPayload,
+      requestHeaders,
       requestedModel,
     } = parsed.value
     parsedPayload.stream = true
@@ -275,13 +296,28 @@ export const responsesWebSocket = {
         attribution,
         turn,
         async () => {
-          await handleResponseCreate(ws, {
-            initiator,
-            payload,
-            requestedModel,
-            nativeMessagesOptions: turnNativeMessagesOptions,
-            turn,
-          })
+          await runWithModelFallback(
+            {
+              headers: mergeFallbackIdentityHeaders(
+                ws.data.fallbackHeaders,
+                requestHeaders,
+              ),
+              credentialScope: ws.data.fallbackCredentialScope,
+              payload,
+              signal: turn.abortController.signal,
+              canRetry: () =>
+                !turn.outputStarted && turn.terminal.state === "open",
+            },
+            async () => {
+              await handleResponseCreate(ws, {
+                initiator,
+                payload: structuredClone(payload),
+                requestedModel,
+                nativeMessagesOptions: turnNativeMessagesOptions,
+                turn,
+              })
+            },
+          )
         },
       )
       if (turn.terminal.state === "open") {
@@ -353,6 +389,7 @@ export const responsesWebSocket = {
     }
     ws.data.responseSnapshots.clear()
     ws.data.effectiveNativeMessagesOptions = {}
+    ws.data.fallbackHeaders = undefined
     consola.debug("[responses-ws] WebSocket closed")
   },
 }
@@ -445,7 +482,20 @@ async function handleResponseCreate(
     applyResponsesWebSocketRouting(payload),
     turn,
   )
-  const reasoningEffort = routing.reasoningEffort
+  // Each turn owns its snapshot model, including retries of that same turn.
+  // eslint-disable-next-line require-atomic-updates
+  turn.continuationModel = payload.model
+  applyModelFallbackToPayload(payload)
+  if (!turn.requestedModel && payload.model !== turn.continuationModel) {
+    turn.requestedModel = turn.continuationModel
+  }
+  const reasoningEffort =
+    payload.model === turn.continuationModel ?
+      routing.reasoningEffort
+    : normalizeReasoningEffortForModel(payload.model, routing.reasoningEffort)
+  if (payload.model !== turn.continuationModel) {
+    applyRedirectedResponsesEffort(payload, payload.model, reasoningEffort)
+  }
   throwIfWebSocketTurnAborted(turn)
   turn.model = payload.model
   turn.reasoningEffort = reasoningEffort
@@ -458,6 +508,26 @@ async function handleResponseCreate(
   expandCompactionItems(payload)
   disableParallelWebSearch(payload)
   throwIfWebSocketTurnAborted(turn)
+
+  const customReference =
+    isModelFallbackActive() ?
+      resolveCustomProviderModel({
+        model: payload.model,
+        kind: "chat",
+        copilotModelIds: new Set(
+          state.models?.data.map((model) => model.id) ?? [],
+        ),
+      })
+    : undefined
+  if (customReference) {
+    await streamCustomFallbackOverWs({
+      ws,
+      payload,
+      turn,
+      reference: customReference,
+    })
+    return
+  }
 
   const routedModel = selectRoutedModel(payload.model)
   const selectedModel = routedModel.model
@@ -815,7 +885,9 @@ async function emitTurnFrame(
     if (responseStatus !== "failed") {
       recordResponseSnapshotFromFrame(
         ws.data.responseSnapshots,
-        payload,
+        turn.continuationModel ?
+          { ...payload, model: turn.continuationModel }
+        : payload,
         processed,
       )
     }
@@ -1282,6 +1354,76 @@ async function streamChatCompletionsOverWs(options: {
   )
 }
 
+async function streamCustomFallbackOverWs(options: {
+  ws: ResponsesWebSocketState
+  payload: ResponsesPayload
+  turn: ResponsesWebSocketTurn
+  reference: CustomProviderModelReference
+}): Promise<void> {
+  const { ws, payload, turn, reference } = options
+  const candidate = await waitForWebSocketTurn(
+    adaptResponsesToChatCandidate({
+      source: payload,
+      finalModel: payload.model,
+      finalReasoningEffort: payload.reasoning?.effort ?? undefined,
+      signal: turn.abortController.signal,
+    }),
+    turn,
+  )
+  if (!candidate.check.supported)
+    throw createEndpointTranslationError({
+      blockers: candidate.check.findings
+        .filter((finding) => finding.severity === "fatal")
+        .map((finding) => finding.class),
+      code: "endpoint_translation_unsupported",
+      source: "responses",
+    })
+  if (isSyntheticWarmupRequest(payload)) {
+    await handleSyntheticWarmupRequest(ws, payload, turn)
+    return
+  }
+  const completionFactory: ResponsesChatCompletionFactory = async (
+    request,
+    options,
+  ) => ({
+    processedPayload: structuredClone(request),
+    response: await createCustomProviderChatCompletions(
+      reference,
+      { ...request, stream: false },
+      {
+        signal: options.signal,
+        reasoningEffort: parseReasoningEffort(turn.reasoningEffort),
+      },
+    ),
+  })
+  const initial = await waitForWebSocketTurn(
+    completionFactory(candidate.payload, {
+      signal: turn.abortController.signal,
+    }),
+    turn,
+  )
+  const response = await waitForWebSocketTurn(
+    resolvePreparedResponsesWebSearchCalls({
+      completionFactory,
+      initial,
+      maxUses: getResponsesChatWebSearchMaxUses(payload),
+      signal: turn.abortController.signal,
+      webSearch: responsesWebSocketDependencies.webSearch,
+    }),
+    turn,
+  )
+  await streamChatCompletionsAsResponses(
+    {
+      writeSSE: async (event) => {
+        if (event.data !== "[DONE]")
+          await emitTurnFrame(ws, turn, payload, event.data, event.event)
+      },
+    },
+    chatResponseAsStream(response),
+    payload.model,
+  )
+}
+
 async function streamChatWebSearchOverWs(options: {
   ws: ResponsesWebSocketState
   responseContext: ResponsesPayload
@@ -1365,6 +1507,7 @@ function chatResponseAsStream(
                   content: choice.message.content,
                   reasoning_text: choice.message.reasoning_text,
                   reasoning_opaque: choice.message.reasoning_opaque,
+                  encrypted_content: choice.message.encrypted_content,
                   tool_calls: choice.message.tool_calls?.map(
                     (toolCall, index) => ({
                       ...toolCall,

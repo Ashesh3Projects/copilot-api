@@ -1,0 +1,26 @@
+# Model fallbacks
+
+Open **Dashboard → Fallbacks** to configure an exact source model and its alternate. Fallbacks are disabled until enabled. Rules match the effective model after normal aliases, replacements, redirects, and model variants have been resolved. Choose a target available through an enabled account or a configured custom provider.
+
+Only an upstream inference **HTTP 422** triggers the alternate model, regardless of the error code or message. Other HTTP statuses, connection errors, exceptions, aborts, and timeouts do not trigger model fallback. Existing transport retries retain their normal behavior.
+
+Rules can form a chain with a fixed maximum of **3 fallback hops per incoming request**, or **4 model attempts** including the starting model. For example, configure `A → B`, `B → C`, and `C → D` to try `A → B → C → D`. Each arrow requires HTTP 422 from the preceding model. The chain stops at the first successful response, any non-422 error, a model without an enabled fallback rule, or the three-hop limit. Each model is tried at most once: a loop such as `A → B → A` stops before trying `A` again. Attempts run in sequence, so each additional hop adds the time spent on that model.
+
+The gateway rebuilds endpoint selection for the alternate model and returns the client's original protocol and requested model name. Responses HTTP and WebSocket, conversation compaction, Chat Completions, Anthropic Messages, and Google AI requests use the same policy. A stream that has already produced output cannot be restarted as a new model response. Custom-provider WebSocket fallbacks buffer the provider's response before emitting the Responses events.
+
+The `/responses/compact` route uses the remembered conversation model and follows the same three-hop 422 policy. It retains the `response.compaction` result shape when an alternate uses Responses, Chat Completions, Messages, or a custom provider.
+
+Before each model switch, model-specific reasoning and signature history is removed before the next request is prepared. This includes Responses reasoning items, Anthropic thinking and redacted thinking blocks, Chat reasoning fields, and Google thought signatures. Ordinary messages and tool calls remain intact. Once a conversation is remembered, later turns go directly to the final successful model and retain its reasoning and signatures. If a client resends the full history, fingerprints remembered across switches exclude only the known old blocks; new blocks from the current fallback model are preserved. A later HTTP 422 can follow that remembered model's own fallback rule, applying the same transition filtering for the next model. Fingerprints contain no raw reasoning and expire with the conversation route.
+
+Conversation memory is held only in this process. It uses explicit thread, conversation, or client session identifiers and is scoped to the client's authentication credential and the effective source model. A Codex child thread is separate from its parent's session. Request IDs, prompt cache keys, and message contents do not create a conversation identity. Requests without an identity start from the source and follow its configured chain on every 422. Requests with a remembered model start there and may follow up to three further fallback hops; returning to a model already tried in that request is prevented.
+
+An alternate must return a successful HTTP response before its mapping is remembered. Only the final successful destination is retained, so a failed chain does not create a mapping to a failed model. By default entries expire after 86,400 seconds and capacity is 10,000 conversations. Limits are configurable; restarting the process, changing fallback settings, or selecting **Clear conversation cache** resets the memory. Rules and settings persist in `model_fallbacks.json` and are included in sanitized configuration exports. Conversation entries are never written or exported.
+
+Each conversation can retain up to 4,096 old-block fingerprints. If that limit is exceeded, the current fallback still runs but the conversation is not remembered, so later requests repeat the 422 transition instead of using an incomplete filter.
+
+Two independent notice settings are off by default:
+
+- **Include diagnostic response headers** adds `x-copilot-api-fallback-from`, `x-copilot-api-fallback-to`, `x-copilot-api-fallback-reason: http_422`, and `x-copilot-api-fallback-cached` on accepted fallback responses. Responses WebSocket lifecycle events carry the same diagnostics in their header metadata.
+- **Show native client fallback notice** uses supported client reroute signals. Codex may describe the switch as cybersecurity routing, and Claude Code may describe it as refusal fallback. These are the clients' existing labels even when a different reason caused HTTP 422. Claude Code must advertise its server fallback capability in the request; clients using a custom base URL may not enable that capability. Display depends on the installed client's capabilities and settings.
+
+The authenticated dashboard API is `GET`/`PUT /dashboard/api/fallbacks`; `PUT` takes the full configuration object. `DELETE /dashboard/api/fallbacks/cache` clears only conversation memory. Mutations require the existing administrator session and CSRF protections.
