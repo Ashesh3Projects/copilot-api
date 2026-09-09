@@ -128,7 +128,8 @@ test("posts the exact native count-tokens body with request context", async () =
     affinity,
     async () =>
       await countAnthropicTokens(payload, {
-        anthropicBeta: " beta-one, beta-two, beta-one ",
+        anthropicBeta:
+          " interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14 ",
         anthropicVersion: " 2024-01-01 ",
         modelProviderPreference: " anthropic ",
         signal: controller.signal,
@@ -177,7 +178,9 @@ test("posts the exact native count-tokens body with request context", async () =
     ],
     tool_choice: { type: "tool", name: "lookup" },
   })
-  expect(capturedHeaders?.get("anthropic-beta")).toBe("beta-one,beta-two")
+  expect(capturedHeaders?.get("anthropic-beta")).toBe(
+    "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+  )
   expect(capturedHeaders?.get("anthropic-version")).toBe("2024-01-01")
   expect(capturedHeaders?.get("x-model-provider-preference")).toBe("anthropic")
   expect(capturedHeaders?.get("copilot-vision-request")).toBe("true")

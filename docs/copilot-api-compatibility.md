@@ -211,6 +211,34 @@ Messages normalization includes:
 - preserving valid sampling and effort controls for upstream model/provider
   handling.
 
+Before each Copilot inference, control-plane or model-catalog network attempt,
+including retries and LLM Debug replay, the gateway applies the header allowlist in
+`src/services/copilot/copilot-request-headers.ts`. It retains the gateway's
+authentication, API version, integration, session, request identity, supported
+attribution and native Messages headers. Arbitrary client headers, cookies,
+client API keys, Anthropic browser-access controls and SDK telemetry headers
+are omitted. LLM Debug records the filtered headers actually sent upstream.
+Custom providers and MCP web search keep their separate header policies.
+
+`Anthropic-Beta` has a separate, exact, case-sensitive allowlist based on
+`pkg/llmapi/messagesapi/beta_headers.go` in the Copilot backend, reviewed at
+`090bcefa58e6f5afd8a7f8aca9ce0b0accee1619` on 2026-09-09. Only entries with
+`BetaHeaderAllow` pass through. Unknown, obsolete and unsupported flags are
+dropped; an empty result omits the header entirely. The two documented aliases
+`tool-search-tool-2025-10-19` and `tool-examples-2025-10-29` become
+`advanced-tool-use-2025-11-20`, then values are deduplicated. This preserves
+Claude Desktop tool-search requests without sending the flag Copilot rejects.
+Local `context-1m-2025-08-07` model-variant routing happens before filtering;
+the obsolete flag itself is not forwarded. Copilot remains responsible for
+model/provider availability and any model-required beta injection.
+
+Maintain the two allowlists against backend header consumers and the beta
+registry when updating Copilot compatibility. The reference audit also used
+Copilot CLI runtime `9baf312c79b58467f3aa1d52a989136458c9eeef`, Copilot docs
+`f5b4fdd587200777918ad93fe84acedc7266357d`, and the local non-Git integration-docs
+snapshot. Beta normalization used for local routing is intentionally separate
+from this Copilot-only outbound policy.
+
 Malformed JSON, missing required routing fields, a message list with no retained
 usable entry, or hostile object shapes receive an Anthropic-shaped local error.
 Messages, Chat, and Responses candidates are prepared independently; selection

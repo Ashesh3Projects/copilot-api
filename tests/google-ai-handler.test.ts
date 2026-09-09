@@ -2095,7 +2095,8 @@ test("threads typed native options through the Google PDF Messages path", async 
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "anthropic-beta": " beta-one,beta-two,beta-one ",
+        "anthropic-beta":
+          " interleaved-thinking-2025-05-14,context-management-2025-06-27,interleaved-thinking-2025-05-14 ",
         "anthropic-version": "2024-01-01",
         "x-model-provider-preference": "anthropic",
       },
@@ -2123,7 +2124,7 @@ test("threads typed native options through the Google PDF Messages path", async 
   expect(response.status).toBe(200)
   expect(lastPath).toBe("/v1/messages")
   expect(new Headers(lastHeaders).get("anthropic-beta")).toBe(
-    "beta-one,beta-two",
+    "interleaved-thinking-2025-05-14,context-management-2025-06-27",
   )
   expect(new Headers(lastHeaders).get("anthropic-version")).toBe("2024-01-01")
   expect(new Headers(lastHeaders).get("x-model-provider-preference")).toBe(

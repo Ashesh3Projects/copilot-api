@@ -940,19 +940,19 @@ test.each([
     name: "exact identifier",
     beta: "context-1m-2025-08-07",
     expectedModel: "route-model-1m",
-    expectedHeader: "context-1m-2025-08-07",
+    expectedHeader: null,
   },
   {
     name: "duplicate canonical identifiers",
-    beta: " beta-one,context-1m-2025-08-07,beta-one ",
+    beta: " interleaved-thinking-2025-05-14,context-1m-2025-08-07,interleaved-thinking-2025-05-14 ",
     expectedModel: "route-model-1m",
-    expectedHeader: "beta-one,context-1m-2025-08-07",
+    expectedHeader: "interleaved-thinking-2025-05-14",
   },
   {
     name: "substring only",
     beta: "not-context-1m-2025-08-07-extra",
     expectedModel: "route-model",
-    expectedHeader: "not-context-1m-2025-08-07-extra",
+    expectedHeader: null,
   },
 ] as const)(
   "uses canonical beta membership for $name model routing",
@@ -1008,9 +1008,7 @@ test("retains valid beta identifiers before model-variant routing", async () => 
   expect(response.status).toBe(200)
   expect(upstreamPaths).toEqual(["/v1/messages"])
   expect(upstreamBodies[0]?.model).toBe("route-model-1m")
-  expect(upstreamHeaders[0]?.get("anthropic-beta")).toBe(
-    "context-1m-2025-08-07",
-  )
+  expect(upstreamHeaders[0]?.get("anthropic-beta")).toBeNull()
 })
 
 test("rejects an unknown Messages model without fabricating Chat support", async () => {
@@ -1071,7 +1069,8 @@ test("recovers once from a deterministic native signature rejection", async () =
       thinking: { type: "enabled" },
     },
     {
-      "anthropic-beta": "beta-one, beta-two, beta-one",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
     },
@@ -1083,7 +1082,9 @@ test("recovers once from a deterministic native signature rejection", async () =
   expect(JSON.stringify(upstreamBodies[1])).not.toContain('"type":"thinking"')
   expect(upstreamBodies[1]).toHaveProperty("thinking", { type: "enabled" })
   for (const headers of upstreamHeaders) {
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2024-01-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
   }

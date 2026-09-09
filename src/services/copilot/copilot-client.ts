@@ -52,6 +52,7 @@ import { rediscoverCopilotOAuthBaseUrl } from "~/services/github/resolve-copilot
 
 import type { RetryBudget, RetryClaim } from "./transport-retry"
 
+import { filterCopilotRequestHeaders } from "./copilot-request-headers"
 import {
   isEncryptedCompactionVerificationError,
   refreshRequestIdForRetry,
@@ -163,10 +164,7 @@ function assignTypedOptionHeaders(
   headers: Record<string, string>,
   options: CopilotHeaderOptions | undefined,
 ): void {
-  assignSanitizedHeader(headers, {
-    name: "Anthropic-Beta",
-    value: options?.anthropicBeta,
-  })
+  if (options?.anthropicBeta) headers["Anthropic-Beta"] = options.anthropicBeta
   assignSanitizedHeader(headers, {
     name: "anthropic-version",
     value: options?.anthropicVersion,
@@ -253,7 +251,7 @@ export function copilotHeaders(
 
   assignTypedOptionHeaders(headers, options)
 
-  return headers
+  return filterCopilotRequestHeaders(headers)
 }
 
 // --- Quota Headers ---
@@ -319,36 +317,6 @@ export function isDeterministic400(body: string): boolean {
   if (body.trim() === "Bad Request") return true
 
   return false
-}
-
-// --- Header Normalization ---
-
-function toHeaderRecord(
-  headersInit: RequestInit["headers"],
-): Record<string, string> {
-  const headers: Record<string, string> = {}
-  if (!headersInit) return headers
-
-  if (headersInit instanceof Headers) {
-    for (const [key, value] of headersInit.entries()) {
-      headers[key] = value
-    }
-    return headers
-  }
-
-  if (Array.isArray(headersInit)) {
-    for (const [key, value] of headersInit) {
-      headers[key] = value
-    }
-    return headers
-  }
-
-  for (const [key, value] of Object.entries(headersInit)) {
-    if (typeof value === "string") {
-      headers[key] = value
-    }
-  }
-  return headers
 }
 
 function isLlmDebugPath(path: string): boolean {
@@ -794,7 +762,7 @@ export async function copilotFetch(
     const url = `${fetchOptions?.baseUrl ?? copilotBaseUrl()}${path}`
 
     try {
-      const headers = toHeaderRecord(requestInit?.headers)
+      const headers = filterCopilotRequestHeaders(requestInit?.headers)
 
       debugLogId = startLlmDebugAttempt({
         headers,

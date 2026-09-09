@@ -318,7 +318,8 @@ test("passes explicit native beta, version, and provider preference through Resp
   const response = await postResponses(
     { input: "hello" },
     {
-      "anthropic-beta": "beta-one, beta-two, beta-one",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14",
       "anthropic-version": "2023-06-01",
       "x-model-provider-preference": "anthropic",
     },
@@ -326,7 +327,9 @@ test("passes explicit native beta, version, and provider preference through Resp
 
   expect(response.status).toBe(200)
   expect(lastUpstreamPath).toBe("/v1/messages")
-  expect(lastUpstreamHeaders?.get("anthropic-beta")).toBe("beta-one,beta-two")
+  expect(lastUpstreamHeaders?.get("anthropic-beta")).toBe(
+    "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+  )
   expect(lastUpstreamHeaders?.get("anthropic-version")).toBe("2023-06-01")
   expect(lastUpstreamHeaders?.get("x-model-provider-preference")).toBe(
     "anthropic",
@@ -339,7 +342,7 @@ test("does not pass native Messages headers through Responses to native Response
   const response = await postResponses(
     { input: "hello" },
     {
-      "anthropic-beta": "beta-one",
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
     },

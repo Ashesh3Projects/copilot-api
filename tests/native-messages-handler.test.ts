@@ -290,7 +290,8 @@ test("preserves explicit native header options across every web-search iteration
   }
 
   const response = await resolveNativeWebSearch(payload, {
-    anthropicBeta: " beta-one, beta-two, beta-one ",
+    anthropicBeta:
+      " interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14 ",
     anthropicVersion: "2023-06-01",
     modelProviderPreference: "anthropic",
     requestedModel: "requested-alias",
@@ -300,7 +301,9 @@ test("preserves explicit native header options across every web-search iteration
   expect(response.id).toBe("msg_final")
   expect(nativeHeaders).toHaveLength(2)
   for (const headers of nativeHeaders) {
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2023-06-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
   }
