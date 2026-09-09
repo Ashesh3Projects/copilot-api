@@ -37,6 +37,10 @@ import {
   RelTime,
 } from "../components/common"
 import { JsonTreeViewer } from "../components/JsonTreeViewer"
+import {
+  LlmFallbackBadge,
+  LlmFallbackBanner,
+} from "../components/LlmFallbackIndicator"
 import { Page } from "../components/Page"
 import { RequestExportMenu } from "../components/RequestExportMenu"
 import { ResponseInspector } from "../components/ResponseInspector"
@@ -167,7 +171,7 @@ function LlmDebugListView() {
       if (statusFilter !== "all" && entry.status !== statusFilter) return false
       if (!needle) return true
       const haystack =
-        `${entry.method} ${entry.path} ${entry.model ?? ""} ${entry.requestId ?? ""}`.toLowerCase()
+        `${entry.method} ${entry.path} ${entry.model ?? ""} ${entry.requestId ?? ""} ${entry.fallback ? `fallback ${entry.fallback.sourceModel} ${entry.fallback.fromModel} ${entry.fallback.targetModel}` : ""}`.toLowerCase()
       return haystack.includes(needle)
     }) as Array<DebugRow>
   }, [entries, query, statusFilter])
@@ -253,12 +257,19 @@ function LlmDebugListView() {
       header: "Model",
       width: proportional(1, { minWidth: 120 }),
       sortable: true,
-      renderCell: (row) =>
-        row.model ?
-          <MonoText>{row.model}</MonoText>
-        : <Text type="supporting" color="secondary">
-            —
-          </Text>,
+      renderCell: (row) => (
+        <VStack gap={1}>
+          {row.model ?
+            <MonoText>{row.model}</MonoText>
+          : <Text type="supporting" color="secondary">
+              —
+            </Text>
+          }
+          {row.fallback ?
+            <LlmFallbackBadge fallback={row.fallback} />
+          : null}
+        </VStack>
+      ),
     },
     {
       key: "size",
@@ -652,6 +663,9 @@ function LlmDebugDetailView({ id }: { id: string }) {
           title="Capture incomplete"
           description={captureWarning}
         />
+      : null}
+      {data?.fallback ?
+        <LlmFallbackBanner fallback={data.fallback} />
       : null}
       {data ?
         <VStack gap={4}>

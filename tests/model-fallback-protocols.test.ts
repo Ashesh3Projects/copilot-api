@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import type { Model } from "~/services/copilot/get-models"
 
 import { setConfigForTest } from "~/lib/config"
+import { listLlmDebugLogs } from "~/lib/llm-debug-log"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -95,6 +96,9 @@ test("native Messages fallback redirects override body effort on each turn", asy
     "fast-target",
     "fast-target",
   ])
+  expect((await listLlmDebugLogs()).entries[0]).toMatchObject({
+    fallback: { cached: true, targetModel: "fast-target" },
+  })
 })
 
 test.each([

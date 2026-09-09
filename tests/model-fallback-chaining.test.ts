@@ -4,6 +4,7 @@ import type { ResponsesWebSocketData } from "~/routes/responses/websocket"
 import type { Model } from "~/services/copilot/get-models"
 
 import { setConfigForTest } from "~/lib/config"
+import { listLlmDebugLogs } from "~/lib/llm-debug-log"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -270,6 +271,17 @@ test("Responses allows the third fallback hop to succeed", async () => {
     "chain-c",
     "chain-d",
   ])
+  const summaries = (await listLlmDebugLogs()).entries
+  expect(summaries.find((entry) => entry.model === "chain-d")).toMatchObject({
+    fallback: {
+      reason: "http_422",
+      sourceModel: "chain-a",
+      fromModel: "chain-c",
+      targetModel: "chain-d",
+      cached: false,
+      hop: 3,
+    },
+  })
 })
 
 test("Responses stops after three fallback hops and never tries a fifth model", async () => {

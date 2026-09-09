@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 
+import type { ModelFallbackDebugInfo } from "~/lib/model-fallback"
 import type { JsonValue } from "~/lib/storage/types"
 import type { HistoryRuntime } from "~/lib/telemetry-writer"
 
@@ -50,6 +51,7 @@ export interface LlmDebugLogResponse extends CapturedBody {
 }
 
 export interface LlmDebugLogEntry {
+  fallback?: ModelFallbackDebugInfo
   upstream?:
     | { kind: "custom"; providerId: string }
     | { kind: "copilot"; accountId?: number }
@@ -70,6 +72,7 @@ export interface LlmDebugLogEntry {
 }
 
 export interface LlmDebugLogSummary {
+  fallback?: ModelFallbackDebugInfo
   durationMs?: number
   endedAt?: string
   errorMessage?: string
@@ -105,6 +108,7 @@ interface AbortLlmDebugLogOptions {
 }
 
 interface StartLlmDebugLogInput {
+  fallback?: ModelFallbackDebugInfo
   upstream?: LlmDebugLogEntry["upstream"]
   method: string
   path: string
@@ -444,6 +448,7 @@ function toSummary(entry: LlmDebugLogEntry): LlmDebugLogSummary {
     "content-type",
   )
   return {
+    ...(entry.fallback ? { fallback: { ...entry.fallback } } : {}),
     durationMs: entry.durationMs,
     endedAt: entry.endedAt,
     errorMessage:
@@ -491,6 +496,7 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
   })
   const entry: LlmDebugLogEntry = {
     id,
+    ...(input.fallback ? { fallback: { ...input.fallback } } : {}),
     ...(input.upstream ? { upstream: { ...input.upstream } } : {}),
     model: inferModel(body.body),
     request: {

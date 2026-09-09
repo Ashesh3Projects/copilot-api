@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import type { Model } from "~/services/copilot/get-models"
 
 import { setConfigForTest } from "~/lib/config"
+import { getLlmDebugLog, listLlmDebugLogs } from "~/lib/llm-debug-log"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -26,6 +27,85 @@ const originalState = { ...state }
 const calls: Array<{ path: string; body: Record<string, unknown> }> = []
 let sourceStatus = 422
 let targetStatus = 200
+
+test("LLM Debug labels resulting and cached fallback attempts independently of client notices", async () => {
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "debug-fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      enabled: true,
+    },
+  ])
+  const headers = { "thread-id": "debug-fallback-trace" }
+  const first = await post({}, headers)
+  expect(first.status).toBe(200)
+  await first.text()
+  const entries = (await listLlmDebugLogs()).entries
+  const original = entries.find((entry) => entry.model === "source-model")
+  const fallback = entries.find((entry) => entry.model === "fast-target")
+  expect(original).not.toHaveProperty("fallback")
+  expect(fallback).toMatchObject({
+    fallback: {
+      reason: "http_422",
+      sourceModel: "source-model",
+      fromModel: "source-model",
+      configuredTargetModel: "target-model",
+      targetModel: "fast-target",
+      cached: false,
+      hop: 1,
+    },
+  })
+  expect((await getLlmDebugLog(fallback?.id ?? ""))?.fallback).toEqual(
+    fallback?.fallback,
+  )
+  const next = await post({}, headers)
+  expect(next.status).toBe(200)
+  await next.text()
+  expect((await listLlmDebugLogs()).entries[0]).toMatchObject({
+    model: "fast-target",
+    fallback: {
+      cached: true,
+      sourceModel: "source-model",
+      targetModel: "fast-target",
+    },
+  })
+})
+
+test("LLM Debug labels a fallback while pending even if that attempt later fails", async () => {
+  targetStatus = 500
+  const original = globalThis.fetch
+  let pending: unknown
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    if (
+      typeof init?.body === "string"
+      && (JSON.parse(init.body) as Record<string, unknown>).model
+        === "target-model"
+    ) {
+      pending = (await listLlmDebugLogs()).entries.find(
+        (entry) => entry.model === "target-model",
+      )
+      return new Response("fallback failed", { status: 422 })
+    }
+    return await original(input, init)
+  }) as typeof fetch
+  const response = await post()
+  expect(response.status).toBe(422)
+  await response.text()
+  expect(pending).toMatchObject({
+    status: "pending",
+    fallback: {
+      cached: false,
+      reason: "http_422",
+      targetModel: "target-model",
+    },
+  })
+})
 
 function model(id: string, endpoint = "/responses"): Model {
   return {

@@ -215,6 +215,41 @@ export function getModelFallbackNotice():
   return noticeForAttempt(attempt)
 }
 
+export interface ModelFallbackDebugInfo {
+  reason: "http_422"
+  sourceModel: string
+  fromModel: string
+  configuredTargetModel: string
+  targetModel: string
+  cached: boolean
+  hop: number
+}
+
+/** Captured before dispatch, including pending and failed fallback attempts. */
+export function getModelFallbackDebugInfo():
+  | ModelFallbackDebugInfo
+  | undefined {
+  const attempt = attemptStorage.getStore()
+  const hop = attempt?.route.at(-1)
+  if (
+    !attempt
+    || (!attempt.retry && !attempt.cached)
+    || !attempt.sourceModel
+    || !attempt.targetModel
+    || !hop
+  )
+    return undefined
+  return {
+    reason: "http_422",
+    sourceModel: attempt.sourceModel,
+    fromModel: hop.source,
+    configuredTargetModel: hop.target,
+    targetModel: attempt.targetModel,
+    cached: attempt.cached,
+    hop: attempt.route.length,
+  }
+}
+
 export function captureModelFallbackNotice(): () => ReturnType<
   typeof getModelFallbackNotice
 > {

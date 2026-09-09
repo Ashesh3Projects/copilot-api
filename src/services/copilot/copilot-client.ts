@@ -24,6 +24,7 @@ import {
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
+import { getModelFallbackDebugInfo } from "~/lib/model-fallback"
 import {
   clearCopilotResponseHeaders,
   getClientSessionId,
@@ -406,6 +407,7 @@ function startLlmDebugAttempt(opts: {
 
   const requestCapture = bodyToDebugCapture(requestInit?.body)
   return startLlmDebugLog({
+    fallback: getModelFallbackDebugInfo(),
     requestCapture,
     upstream: { kind: "copilot", accountId: opts.accountId },
     method: requestInit?.method ?? "GET",

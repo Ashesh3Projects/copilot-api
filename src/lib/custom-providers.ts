@@ -31,7 +31,10 @@ import {
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
-import { recordModelFallbackResponse } from "~/lib/model-fallback"
+import {
+  recordModelFallbackResponse,
+  getModelFallbackDebugInfo,
+} from "~/lib/model-fallback"
 import {
   getRoutingTelemetryRequestState,
   updateRoutingTelemetryRequestState,
@@ -465,6 +468,7 @@ async function fetchCustomProvider(
     `Custom provider request: ${reference.provider.name}/${reference.provider.id}/${reference.upstreamModel} POST ${path}`,
   )
   const logId = startLlmDebugLog({
+    fallback: getModelFallbackDebugInfo(),
     upstream: { kind: "custom", providerId: reference.provider.id },
     method: "POST",
     path,
