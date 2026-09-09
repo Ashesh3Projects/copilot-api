@@ -122,7 +122,7 @@ affected, include its exact version or digest.
 | F-15 | Partially addressed; host/container scope remains operator-owned | The tracked Compose bind is loopback-only, build context excludes common secret material, and application data files use restrictive modes. Rootless/read-only filesystem, capability drops, and host resource policy are not claimed by this application audit. |
 | F-17 | Resolved in application/deployment assets | Usage details retain complete minute/model aggregates with separate lifetime totals and coalesced atomic writes. An optional Nginx logrotate policy is supplied for operator-managed logs. |
 | F-18 | Resolved | Replacements use RE2-compatible matching; unsafe object names are rejected; the legacy inline-handler feature page was removed. |
-| F-20 | Resolved for current repository settings/workflows | Runtime audit, CodeQL, dependency review, image scanning, SBOM, SHA-pinned actions, Dependabot, secret scanning/push protection, and read-only workflow defaults are enabled. Branch review count is zero for the sole maintainer; CI/CodeQL still run on pull requests. |
+| F-20 | Resolved for current repository settings/workflows | Runtime audit, CodeQL, dependency review, image scanning, SBOM, SHA-pinned actions, secret scanning/push protection, and read-only workflow defaults are enabled. Dependabot update PRs are disabled. Branch review count is zero for the sole maintainer; CI/CodeQL still run on pull requests. |
 
 ## Regression fixes after hardening
 
