@@ -763,6 +763,8 @@ export async function copilotFetch(
 
     try {
       const headers = filterCopilotRequestHeaders(requestInit?.headers)
+      // Retry request-ID refreshes must retain all normalized beta lines.
+      requestInit = { ...requestInit, headers }
 
       debugLogId = startLlmDebugAttempt({
         headers,
@@ -786,7 +788,7 @@ export async function copilotFetch(
       const response = captureLlmDebugAttemptResponse(
         debugLogId,
         upstreamResponse,
-        requestInit?.signal ?? undefined,
+        requestInit.signal ?? undefined,
       )
       // Once a new response arrived, an earlier retry response can no longer
       // be returned. Drain through its tap with bounded stream backpressure.

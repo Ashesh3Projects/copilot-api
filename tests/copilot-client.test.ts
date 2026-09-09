@@ -321,6 +321,45 @@ test.each(["record", "Headers", "tuples"] as const)(
   },
 )
 
+test("preserves repeated beta header lines through endpoint rediscovery", async () => {
+  state.copilotApiBaseUrl = "https://api.individual.githubcopilot.com"
+  queuedResults.push(
+    new Response("Misdirected Request", { status: 421 }),
+    Response.json({
+      endpoints: { api: "https://api.business.githubcopilot.com" },
+    }),
+    Response.json({ ok: true }),
+  )
+
+  const response = await copilotFetch("/v1/messages", {
+    method: "POST",
+    body: "{}",
+    headers: [
+      ["Authorization", "Bearer test-upstream-token"],
+      ["Anthropic-Beta", "interleaved-thinking-2025-05-14"],
+      ["Anthropic-Beta", "tool-search-tool-2025-10-19"],
+      ["X-Request-Id", "before-rediscovery"],
+    ],
+  })
+
+  expect(response.status).toBe(200)
+  const messagesRequests = capturedRequests.filter(({ url }) =>
+    url.endsWith("/v1/messages"),
+  )
+  expect(messagesRequests).toHaveLength(2)
+  for (const request of messagesRequests) {
+    expect(new Headers(request.init?.headers).get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20",
+    )
+  }
+  expect(messagesRequests[1]?.url).toBe(
+    "https://api.business.githubcopilot.com/v1/messages",
+  )
+  expect(
+    new Headers(messagesRequests[1]?.init?.headers).get("x-request-id"),
+  ).not.toBe("before-rediscovery")
+})
+
 test("does not exchange or retry an immutable public OAuth token after a 401", async () => {
   queuedResults.push(new Response("Unauthorized", { status: 401 }))
 
