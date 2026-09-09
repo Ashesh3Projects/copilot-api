@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 
 import type {
   JsonValue,
@@ -11,25 +11,12 @@ import type {
   PendingHistoryRecord,
 } from "~/lib/telemetry-writer"
 
-import {
-  interruptRunCaptures,
-  reconcileRuns,
-  renewRun,
-} from "~/lib/storage/history-lifecycle"
+import { reconcileRuns, renewRun } from "~/lib/storage/history-lifecycle"
 
-export type DiagnosticKind = "debug"
-export interface HistoryPageOptions {
-  limit?: number
-  cursor?: string
-  since?: number
-  until?: number
-  type?: string
-  now?: number
-}
-export interface HistoryPage {
-  records: Array<HistoryRecord>
-  cursor: string | null
-  generation: number
+export function isHistoryRecordKind(
+  value: unknown,
+): value is HistoryRecord["kind"] {
+  return value === "usage" || value === "routing" || value === "collection-gap"
 }
 export interface UsageHistory {
   buckets: Array<{
@@ -52,7 +39,6 @@ export interface CollectionStatus {
   unknownGaps: number
 }
 export interface CollectionStatusOptions {
-  kind?: DiagnosticKind
   since?: number
   until?: number
 }
@@ -61,9 +47,7 @@ export interface HistoryRepository {
     batchId: string,
     records: ReadonlyArray<HistoryRecord>,
   ): Promise<void>
-  clear(kind: DiagnosticKind): Promise<number>
   prune(now: number): Promise<void>
-  generations(): Promise<Record<DiagnosticKind, number>>
   startRun(id: string, now: number): Promise<void>
   heartbeatRun(id: string, now: number): Promise<void>
   endRun(id: string, now: number): Promise<void>
@@ -83,17 +67,6 @@ export interface HistoryRepository {
     lifetime: JsonValue
     startedAt: number | null
   }>
-  list(
-    kind: DiagnosticKind,
-    options?: HistoryPageOptions,
-    pending?: ReadonlyArray<PendingHistoryRecord>,
-  ): Promise<HistoryPage>
-  get(
-    kind: DiagnosticKind,
-    id: string,
-    pending?: ReadonlyArray<PendingHistoryRecord>,
-    now?: number,
-  ): Promise<HistoryRecord | null>
 }
 
 export function historyObject(value: JsonValue): { [key: string]: JsonValue } {
@@ -127,16 +100,6 @@ export function sumHistoryCounters(
   return result
 }
 
-async function generation(
-  session: SqlSession,
-  kind: DiagnosticKind,
-): Promise<number> {
-  const rows = await session.query({
-    sql: "SELECT value FROM capi_metadata WHERE key = ?",
-    args: [`history_${kind}_generation`],
-  })
-  return Number(rows[0]?.value ?? 0)
-}
 async function uncommitted(
   session: SqlSession,
   pending: ReadonlyArray<PendingHistoryRecord>,
@@ -281,98 +244,27 @@ async function applyRoutingBatch(
     args: [String(selected[0].recordedAt)],
   })
 }
-function diagnosticExpiry(record: HistoryRecord): number {
-  const p = historyObject(record.payload)
-  const completed = p.status === "complete" || p.status === "completed"
-  return (
-    number(p.startedAtMs ?? p.updatedAt ?? record.recordedAt)
-    + (completed ? 10 : 60) * 60_000
-  )
-}
-async function applyDiagnostics(
-  session: SqlSession,
-  records: ReadonlyArray<HistoryRecord>,
-) {
-  const selected = records.filter((record) => record.kind === "debug")
-  if (selected.length === 0) return
-  const current = await generation(session, "debug")
-  const rows = selected
-    .filter((record) => record.generation === current)
-    .map((record) => {
-      const payload = JSON.stringify(record.payload)
-      const p = historyObject(record.payload)
-      return [
-        record.id,
-        record.generation,
-        record.recordedAt,
-        number(p.updatedAt ?? record.recordedAt),
-        diagnosticExpiry(record),
-        typeof p.status === "string" ? p.status : "pending",
-        p.replayable === true ? 1 : 0,
-        payload,
-        Buffer.byteLength(payload),
-      ]
-    })
-  const columns =
-    "id,generation,created_at,updated_at,expires_at,status,replayable,payload_json,payload_bytes"
-  const width = columns.split(",").length
-  const chunkSize = Math.floor(900 / width)
-  const conflict =
-    "DO UPDATE SET updated_at = excluded.updated_at, expires_at = excluded.expires_at, status = excluded.status, replayable = excluded.replayable, payload_json = excluded.payload_json, payload_bytes = excluded.payload_bytes WHERE excluded.updated_at >= updated_at"
-  for (let offset = 0; offset < rows.length; offset += chunkSize) {
-    const chunk = rows.slice(offset, offset + chunkSize)
-    const placeholders = chunk
-      .map(() => `(${Array.from({ length: width }, () => "?").join(",")})`)
-      .join(",")
-    await session.execute({
-      sql: `INSERT INTO capi_debug (${columns}) VALUES ${placeholders} ON CONFLICT(id) ${conflict}`,
-      args: chunk.flat(),
-    })
-  }
-}
-async function pruneDiagnostics(session: SqlSession, now: number) {
+async function pruneCounters(session: SqlSession, now: number): Promise<void> {
   await session.execute({
-    sql: "DELETE FROM capi_debug WHERE expires_at <= ?",
-    args: [now],
+    sql: "DELETE FROM capi_routing_minutes WHERE minute < ?",
+    args: [minute(now - 86400_000)],
   })
+  // One day exceeds five-minute queue age and the adapters' 30-second deadline.
   await session.execute({
-    sql: "DELETE FROM capi_debug WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS position, SUM(payload_bytes) OVER (ORDER BY created_at DESC, id DESC) AS total_bytes FROM capi_debug) WHERE position > ? OR (total_bytes > ? AND position > 1))",
-    args: [2000, 128 * 1024 * 1024],
+    sql: "DELETE FROM capi_applied_operations WHERE kind = 'history_batch' AND created_at < ?",
+    args: [now - 86400_000],
   })
 }
 
 async function readCollectionStatus(
   session: SqlSession,
-  now: number,
   options: CollectionStatusOptions & {
     pending: ReadonlyArray<PendingHistoryRecord>
   },
 ): Promise<CollectionStatus> {
   const clauses: Array<string> = [],
     args: Array<SqlValue> = []
-  let current = 0,
-    clearedAt = -1
-  let since = options.since ?? -Infinity
-  if (options.kind) {
-    const kind = options.kind
-    current = await generation(session, kind)
-    const cutoff = await session.query({
-      sql: "SELECT value FROM capi_metadata WHERE key = ?",
-      args: [`history_${kind}_cleared_at`],
-    })
-    clauses.push(
-      "(json_extract(payload_json, '$.historyKind') IS NULL OR json_extract(payload_json, '$.historyKind') = ?)",
-    )
-    args.push(kind)
-    clauses.push("COALESCE(ended_at, started_at) >= ?")
-    since = Math.max(now - 3600_000, options.since ?? 0)
-    args.push(since)
-    clauses.push(
-      `(CASE WHEN json_extract(payload_json, '$.historyKind') = ? THEN json_extract(payload_json, '$.generation') ELSE json_extract(payload_json, '$.${kind}Generation') END = ? OR (CASE WHEN json_extract(payload_json, '$.historyKind') = ? THEN json_extract(payload_json, '$.generation') ELSE json_extract(payload_json, '$.${kind}Generation') END IS NULL AND started_at > ?))`,
-    )
-    clearedAt = Number(cutoff[0]?.value ?? -1)
-    args.push(kind, current, kind, clearedAt)
-  } else if (options.since !== undefined) {
+  if (options.since !== undefined) {
     clauses.push("COALESCE(ended_at, started_at) >= ?")
     args.push(options.since)
   }
@@ -390,11 +282,14 @@ async function readCollectionStatus(
     unknownGaps: number(rows[0]?.unknown_count),
   }
   for (const record of await uncommitted(session, options.pending)) {
+    if (record.kind !== "collection-gap") continue
+    const payload = historyObject(record.payload)
     if (
-      !matchesCollectionScope(record, { ...options, since, current, clearedAt })
+      (options.since !== undefined && record.recordedAt < options.since)
+      || (options.until !== undefined
+        && number(payload.startedAt ?? record.recordedAt) > options.until)
     )
       continue
-    const payload = historyObject(record.payload)
     if (payload.unknown === true) status.unknownGaps++
     else {
       status.knownLostRecords += number(payload.lostRecords)
@@ -403,70 +298,6 @@ async function readCollectionStatus(
   }
   return status
 }
-
-function matchesCollectionScope(
-  record: HistoryRecord,
-  scope: CollectionStatusOptions & {
-    since: number
-    current: number
-    clearedAt: number
-  },
-): boolean {
-  if (record.kind !== "collection-gap" || record.recordedAt < scope.since)
-    return false
-  const payload = historyObject(record.payload)
-  const startedAt = number(payload.startedAt ?? record.recordedAt)
-  if (scope.until !== undefined && startedAt > scope.until) return false
-  if (!scope.kind) return true
-  if (payload.historyKind && payload.historyKind !== scope.kind) return false
-  const gapGeneration =
-    payload.historyKind ?
-      payload.generation
-    : payload[`${scope.kind}Generation`]
-  return (
-    gapGeneration === scope.current
-    || (typeof gapGeneration !== "number" && startedAt > scope.clearedAt)
-  )
-}
-function fromRow(
-  row: Record<string, unknown>,
-  kind: DiagnosticKind,
-): HistoryRecord {
-  return {
-    id: String(row.id),
-    kind,
-    recordedAt: Number(row.created_at),
-    generation: Number(row.generation),
-    payload: JSON.parse(String(row.payload_json)) as JsonValue,
-  }
-}
-function compareRecords(a: HistoryRecord, b: HistoryRecord): number {
-  if (a.recordedAt !== b.recordedAt) return b.recordedAt - a.recordedAt
-  if (a.id === b.id) return 0
-  return a.id < b.id ? 1 : -1
-}
-function decodeCursor(
-  cursor?: string,
-): { timestamp: number; id: string } | undefined {
-  if (!cursor) return undefined
-  try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString()) as {
-      timestamp?: unknown
-      id?: unknown
-    }
-    if (
-      typeof value.timestamp === "number"
-      && Number.isSafeInteger(value.timestamp)
-      && typeof value.id === "string"
-      && value.id.length <= 200
-    )
-      return { timestamp: value.timestamp, id: value.id }
-  } catch {
-    /* Invalid cursors are rejected without exposing parser errors. */
-  }
-  throw new Error("Invalid history cursor")
-}
-
 // eslint-disable-next-line max-lines-per-function -- Repository methods share a backend and process-run identity.
 export function createHistoryRepository(
   storage: Storage,
@@ -475,6 +306,8 @@ export function createHistoryRepository(
   const clock = options.now ?? Date.now
   return {
     async applyBatch(batchId, records) {
+      if (records.some((record) => !isHistoryRecordKind(record.kind)))
+        throw new Error("Unsupported history record kind")
       const digest = createHash("sha256")
         .update(JSON.stringify(records))
         .digest("hex")
@@ -490,35 +323,22 @@ export function createHistoryRepository(
         }
         await applyUsageBatch(session, records)
         await applyRoutingBatch(session, records)
-        await applyDiagnostics(session, records)
         for (const record of records) {
-          switch (record.kind) {
-            case "usage": {
-              break
-            }
-            case "routing": {
-              break
-            }
-            case "debug": {
-              break
-            }
-            default: {
-              const p = historyObject(record.payload)
-              await session.execute({
-                sql: "INSERT INTO capi_collection_gaps (id, process_run_id, started_at, ended_at, kind, lost_records, lost_bytes, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
-                args: [
-                  record.id,
-                  options.runId ?? null,
-                  number(p.startedAt ?? record.recordedAt),
-                  record.recordedAt,
-                  p.unknown === true ? "unknown" : "known",
-                  p.unknown === true ? null : number(p.lostRecords),
-                  p.unknown === true ? null : number(p.lostBytes),
-                  JSON.stringify(p),
-                ],
-              })
-            }
-          }
+          if (record.kind !== "collection-gap") continue
+          const p = historyObject(record.payload)
+          await session.execute({
+            sql: "INSERT INTO capi_collection_gaps (id, process_run_id, started_at, ended_at, kind, lost_records, lost_bytes, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            args: [
+              record.id,
+              options.runId ?? null,
+              number(p.startedAt ?? record.recordedAt),
+              record.recordedAt,
+              p.unknown === true ? "unknown" : "known",
+              p.unknown === true ? null : number(p.lostRecords),
+              p.unknown === true ? null : number(p.lostBytes),
+              JSON.stringify(p),
+            ],
+          })
         }
         const now = clock()
         await session.execute({
@@ -530,69 +350,11 @@ export function createHistoryRepository(
             sql: "UPDATE capi_process_runs SET last_flush_at = ? WHERE id = ?",
             args: [now, options.runId],
           })
-        await pruneDiagnostics(session, now)
-        await session.execute({
-          sql: "DELETE FROM capi_routing_minutes WHERE minute < ?",
-          args: [minute(now - 86400_000)],
-        })
-        // One day exceeds five-minute queue age and the adapters' 30-second deadline.
-        await session.execute({
-          sql: "DELETE FROM capi_applied_operations WHERE kind = 'history_batch' AND created_at < ?",
-          args: [now - 86400_000],
-        })
+        await pruneCounters(session, now)
       })
-    },
-    async generations() {
-      return storage.read(async (s) => ({
-        debug: await generation(s, "debug"),
-      }))
-    },
-    async clear(kind) {
-      const id = randomUUID()
-      try {
-        return await storage.transaction(async (s) => {
-          const next = (await generation(s, kind)) + 1
-          await s.execute({
-            sql: "UPDATE capi_metadata SET value = ? WHERE key = ?",
-            args: [String(next), `history_${kind}_generation`],
-          })
-          await s.execute({
-            sql: "INSERT INTO capi_metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            args: [`history_${kind}_cleared_at`, String(clock())],
-          })
-          await s.execute({
-            sql: "DELETE FROM capi_debug",
-            args: [],
-          })
-          // A clear has its own receipt; it never advances configuration revision.
-          await s.execute({
-            sql: "INSERT INTO capi_applied_operations (id, kind, actor_id, input_digest, committed_revision, result_json, created_at) VALUES (?, 'history_clear', 'admin', ?, 0, ?, ?)",
-            args: [id, kind, JSON.stringify({ generation: next }), clock()],
-          })
-          return next
-        })
-      } catch (error) {
-        const receipt = await storage.read((s) =>
-          s.query({
-            sql: "SELECT result_json FROM capi_applied_operations WHERE id = ? AND kind = 'history_clear'",
-            args: [id],
-          }),
-        )
-        if (receipt.length === 0) throw error
-        const result = JSON.parse(String(receipt[0].result_json)) as {
-          generation: number
-        }
-        return result.generation
-      }
     },
     async prune(now) {
-      await storage.transaction(async (s) => {
-        await pruneDiagnostics(s, now)
-        await s.execute({
-          sql: "DELETE FROM capi_routing_minutes WHERE minute < ?",
-          args: [minute(now - 86400_000)],
-        })
-      })
+      await storage.transaction((session) => pruneCounters(session, now))
     },
     async startRun(id, now) {
       await storage.transaction(async (s) => {
@@ -608,7 +370,7 @@ export function createHistoryRepository(
       await storage.transaction(async (s) => {
         await reconcileRuns(s, id, now)
         await renewRun(s, id, now)
-        await pruneDiagnostics(s, now)
+        await pruneCounters(s, now)
       })
     },
     async endRun(id, now) {
@@ -617,12 +379,11 @@ export function createHistoryRepository(
           sql: "UPDATE capi_process_runs SET ended_at = ?, clean = 1 WHERE id = ?",
           args: [now, id],
         })
-        await interruptRunCaptures(s)
       })
     },
     async collectionStatus(options = {}, pending = []) {
       return storage.read((s) =>
-        readCollectionStatus(s, clock(), { ...options, pending }),
+        readCollectionStatus(s, { ...options, pending }),
       )
     },
     async readUsage(cutoff, pending = []) {
@@ -699,94 +460,6 @@ export function createHistoryRepository(
               : Math.min(startedAt, record.recordedAt)
           }
         return { buckets, lifetime, startedAt }
-      })
-    },
-    async list(kind, opts = {}, pending = []) {
-      // eslint-disable-next-line complexity -- SQL and pending overlay apply the same independent optional filters.
-      return storage.read(async (s) => {
-        const current = await generation(s, kind),
-          now = opts.now ?? clock(),
-          cursor = decodeCursor(opts.cursor)
-        const limit = Math.max(1, Math.min(200, Math.floor(opts.limit ?? 50)))
-        const clauses = ["generation = ?", "expires_at > ?"],
-          args: Array<SqlValue> = [current, now]
-        if (opts.since !== undefined) {
-          clauses.push("created_at >= ?")
-          args.push(opts.since)
-        }
-        if (opts.until !== undefined) {
-          clauses.push("created_at <= ?")
-          args.push(opts.until)
-        }
-        if (opts.type) {
-          clauses.push("status = ?")
-          args.push(opts.type)
-        }
-        if (cursor) {
-          clauses.push("(created_at < ? OR (created_at = ? AND id < ?))")
-          args.push(cursor.timestamp, cursor.timestamp, cursor.id)
-        }
-        const rows = await s.query({
-          sql: `SELECT * FROM capi_debug WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ?`,
-          // Pending completions can remove matching stored rows; overread the
-          // bounded queue size so pagination still reaches older matches.
-          args: [...args, limit + 1 + pending.length],
-        })
-        const byId = new Map(
-          rows.map((row) => {
-            const record = fromRow(row, kind)
-            return [record.id, record]
-          }),
-        )
-        for (const record of await uncommitted(s, pending))
-          if (record.kind === kind && record.generation === current) {
-            byId.delete(record.id)
-            if (diagnosticExpiry(record) <= now) continue
-            const p = historyObject(record.payload)
-            if (
-              (opts.since !== undefined && record.recordedAt < opts.since)
-              || (opts.until !== undefined && record.recordedAt > opts.until)
-              || (opts.type && p.status !== opts.type)
-              || (cursor
-                && (record.recordedAt > cursor.timestamp
-                  || (record.recordedAt === cursor.timestamp
-                    && record.id >= cursor.id)))
-            )
-              continue
-            byId.set(record.id, record)
-          }
-        const all = [...byId.values()].sort(compareRecords),
-          records = all.slice(0, limit),
-          last = records.at(-1)
-        return {
-          records,
-          generation: current,
-          cursor:
-            all.length > limit && last ?
-              Buffer.from(
-                JSON.stringify({ timestamp: last.recordedAt, id: last.id }),
-              ).toString("base64url")
-            : null,
-        }
-      })
-    },
-    // eslint-disable-next-line max-params -- Caller supplies optional fixture time independently of pending overlay.
-    async get(kind, id, pending = [], now = clock()) {
-      return storage.read(async (s) => {
-        const current = await generation(s, kind)
-        const rows = await s.query({
-          sql: "SELECT * FROM capi_debug WHERE id = ? AND generation = ? AND expires_at > ?",
-          args: [id, current, now],
-        })
-        let result = rows[0] ? fromRow(rows[0], kind) : null
-        for (const record of await uncommitted(s, pending))
-          if (
-            record.kind === kind
-            && record.id === id
-            && record.generation === current
-          )
-            result = diagnosticExpiry(record) > now ? record : null
-        return result
       })
     },
   }

@@ -21,11 +21,13 @@ const { credentialDigest } = await import(
 )
 const { tokenPool } = await import("../../src/lib/token-pool")
 const { state } = await import("../../src/lib/state")
+const { clearLlmDebugLogs } = await import("../../src/lib/llm-debug-log")
 
 export const PROTOCOL_GATEWAY_KEY = "protocol-fixture-gateway-key"
 let databaseNumber = 0
 
 export async function setupProtocolDatabase() {
+  await clearLlmDebugLogs()
   await peekHistoryRuntime()?.close(1000)
   await closeStorageRuntime()
   const runtime = await initializeStorageRuntime({
@@ -45,6 +47,7 @@ export async function setupProtocolDatabase() {
 export function useProtocolDatabase() {
   beforeEach(setupProtocolDatabase)
   afterAll(async () => {
+    await clearLlmDebugLogs()
     await peekHistoryRuntime()?.close(1000)
     await closeStorageRuntime()
     const checked = resolve(directory)

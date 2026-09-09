@@ -6,23 +6,16 @@ import {
   StorageCommitUnknownError,
   StorageSchemaError,
 } from "~/lib/storage/errors"
+import { initialMigration } from "~/lib/storage/migrations/001-initial"
 import {
-  initialMigration,
-  initialTables,
-  initialIndexes,
-} from "~/lib/storage/migrations/001-initial"
-import {
-  currentIndexes,
   currentSchemaVersion,
-  currentTables,
-  schemaThreeTables,
   storageMigrations,
+  storageSchema,
 } from "~/lib/storage/schema"
 
 const checksums = storageMigrations.map((migration) =>
   createHash("sha256").update(JSON.stringify(migration)).digest("hex"),
 )
-const counterKeys = ["config_revision", "history_debug_generation"] as const
 
 export function parseStorageCounter(value: unknown): number {
   if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/.test(value)) {
@@ -67,6 +60,7 @@ async function validateSchema(
   session: SqlSession,
   version: number,
 ): Promise<void> {
+  const schema = storageSchema(version)
   const objects = await applicationObjects(session)
   const tables = new Set(
     objects.filter((row) => row.type === "table").map((row) => row.name),
@@ -74,14 +68,10 @@ async function validateSchema(
   const indexes = new Set(
     objects.filter((row) => row.type === "index").map((row) => row.name),
   )
-  let expectedTables: object = currentTables
-  if (version === 1) expectedTables = initialTables
-  else if (version < 4) expectedTables = schemaThreeTables
   if (
-    Object.keys(expectedTables).some((name) => !tables.has(name))
-    || Object.keys(version < 4 ? initialIndexes : currentIndexes).some(
-      (name) => !indexes.has(name),
-    )
+    Object.keys(schema.tables).some((name) => !tables.has(name))
+    || Object.keys(schema.indexes).some((name) => !indexes.has(name))
+    || retiredStatePresent(version, tables)
   ) {
     throw new StorageSchemaError("Application schema is incomplete")
   }
@@ -102,9 +92,9 @@ async function validateSchema(
   ) {
     throw new StorageSchemaError("Required storage metadata is invalid")
   }
-  for (const key of counterKeys) parseStorageCounter(metadata.get(key))
-  if (version < 4)
-    parseStorageCounter(metadata.get("history_activity_generation"))
+  for (const key of schema.counterKeys) parseStorageCounter(metadata.get(key))
+  if (retiredStatePresent(version, new Set(metadata.keys()), true))
+    throw new StorageSchemaError("Retired history metadata is present")
   const lifetime = await session.query({
     sql: "SELECT id FROM capi_usage_lifetime",
     args: [],
@@ -112,6 +102,19 @@ async function validateSchema(
   if (lifetime.length !== 1 || lifetime[0]?.id !== 1) {
     throw new StorageSchemaError("Usage lifetime singleton is missing")
   }
+}
+
+function retiredStatePresent(
+  version: number,
+  names: ReadonlySet<unknown>,
+  metadata = false,
+): boolean {
+  return (
+    (version >= 3
+      && names.has(metadata ? "history_debug_generation" : "capi_debug"))
+    || (version >= 5
+      && names.has(metadata ? "history_activity_generation" : "capi_activity"))
+  )
 }
 
 /** All DDL and migration metadata commit together; never repair partial schemas. */
@@ -126,8 +129,9 @@ export async function migrateStorage(storage: Storage): Promise<void> {
         const metadata: Array<[string, string]> = [
           ["schema_version", String(initialMigration.version)],
           ["store_id", randomUUID()],
-          ["history_activity_generation", "0"],
-          ...counterKeys.map((key): [string, string] => [key, "0"]),
+          ...storageSchema(initialMigration.version).counterKeys.map(
+            (key): [string, string] => [key, "0"],
+          ),
         ]
         for (const [key, value] of metadata) {
           await session.execute({

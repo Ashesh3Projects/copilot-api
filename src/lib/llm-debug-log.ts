@@ -1,8 +1,6 @@
 import { randomUUID } from "node:crypto"
 
 import type { ModelFallbackDebugInfo } from "~/lib/model-fallback"
-import type { JsonValue } from "~/lib/storage/types"
-import type { HistoryRuntime } from "~/lib/telemetry-writer"
 
 import {
   rawDebugCapture,
@@ -10,7 +8,6 @@ import {
   releaseDebugCaptureMemory,
   type CapturedBody,
 } from "~/lib/debug-capture"
-import { getHistoryRuntime, peekHistoryRuntime } from "~/lib/telemetry-writer"
 
 import {
   readDescriptorSnapshotValue,
@@ -120,100 +117,101 @@ interface StartLlmDebugLogInput {
   url: string
 }
 
-interface LiveCapture {
+interface DebugCapture {
   entry: LlmDebugLogEntry
   controller: AbortController
-  runtime: HistoryRuntime
-  generation: number
   bytes: number
 }
-const liveCaptures = new Map<string, LiveCapture>()
-const MAX_LIVE_REQUESTS = 2000
+// This store must remain independent of database, telemetry and backup state.
+const captures = new Map<string, DebugCapture>()
+const MAX_CAPTURES = 2000
+let pruneTimer: ReturnType<typeof setTimeout> | undefined
+let pruneDeadline: number | undefined
 
 function releaseCapture(id: string): void {
-  const capture = liveCaptures.get(id)
+  const capture = captures.get(id)
   if (!capture) return
+  captures.delete(id)
   releaseDebugCaptureMemory(capture.bytes)
   capture.controller.abort()
-  liveCaptures.delete(id)
 }
 
-function pruneLive(now = Date.now()): void {
-  const runtime = peekHistoryRuntime()
-  for (const [id, capture] of liveCaptures) {
-    if (
-      capture.runtime !== runtime
-      || capture.generation !== runtime.generations.debug
-      || capture.entry.startedAtMs + LLM_DEBUG_FAILURE_HISTORY_WINDOW_MS <= now
-    )
-      releaseCapture(id)
-  }
+function captureDeadline(entry: LlmDebugLogEntry): number {
+  return (
+    entry.startedAtMs
+    + (entry.status === "complete" ?
+      LLM_DEBUG_HISTORY_WINDOW_MS
+    : LLM_DEBUG_FAILURE_HISTORY_WINDOW_MS)
+  )
 }
-const livePruneTimer = setInterval(pruneLive, 60_000)
-livePruneTimer.unref()
+
+function schedulePrune(): void {
+  let next: number | undefined
+  for (const { entry } of captures.values()) {
+    const deadline = captureDeadline(entry)
+    if (next === undefined || deadline < next) next = deadline
+  }
+  if (next === pruneDeadline) return
+  if (pruneTimer !== undefined) clearTimeout(pruneTimer)
+  pruneTimer = undefined
+  pruneDeadline = next
+  if (next === undefined) return
+  pruneTimer = setTimeout(
+    () => {
+      pruneTimer = undefined
+      pruneDeadline = undefined
+      pruneCaptures()
+    },
+    Math.max(0, next - Date.now()),
+  )
+  pruneTimer.unref()
+}
+
+function pruneCaptures(now = Date.now()): void {
+  for (const [id, { entry }] of captures)
+    if (captureDeadline(entry) <= now) releaseCapture(id)
+  schedulePrune()
+}
 
 /** Capture readers stop on clear, TTL expiry, capacity eviction, or completion. */
 export function getLlmDebugCaptureSignal(id: string): AbortSignal {
-  return liveCaptures.get(id)?.controller.signal ?? AbortSignal.abort()
+  pruneCaptures()
+  return captures.get(id)?.controller.signal ?? AbortSignal.abort()
 }
 
-function unavailableBody(body: CapturedBody): CapturedBody {
-  return {
-    ...body,
-    body: null,
-    truncated: true,
-    omittedReason: "queue-pressure",
-  }
-}
-
-function queueCapture(capture: LiveCapture): void {
-  const record = {
-    id: capture.entry.id,
-    kind: "debug" as const,
-    recordedAt: capture.entry.startedAtMs,
-    generation: capture.generation,
-    payload: capture.entry as unknown as JsonValue,
-  }
-  if (capture.runtime.writer.enqueue(record)) return
-  // Report admission loss explicitly without presenting a missing body as an
-  // exact capture. The writer separately records the dropped bytes/records.
-  capture.runtime.writer.enqueue({
-    ...record,
-    payload: {
-      ...capture.entry,
-      status: "error",
-      replayable: false,
-      request: {
-        ...capture.entry.request,
-        ...unavailableBody(capture.entry.request),
-      },
-      ...(capture.entry.response ?
-        {
-          response: {
-            ...capture.entry.response,
-            ...unavailableBody(capture.entry.response),
-          },
-        }
+function reserveCapture(capture: DebugCapture): boolean {
+  const { entry } = capture
+  // Count retained strings as UTF-16 without serializing the raw bodies again.
+  const bytes =
+    ((entry.request.body?.length ?? 0) + (entry.response?.body?.length ?? 0))
+      * 2
+    + JSON.stringify({
+      ...entry,
+      request: { ...entry.request, body: null },
+      ...(entry.response ?
+        { response: { ...entry.response, body: null } }
       : {}),
-    } as unknown as JsonValue,
-  })
+    }).length
+      * 2
+  // Replace the whole reservation so a lone entry can grow past the budget
+  // when its response arrives, just as a lone oversized request can.
+  releaseDebugCaptureMemory(capture.bytes)
+  capture.bytes = 0
+  let reserved = reserveDebugCaptureMemory(bytes, true)
+  for (const [id, candidate] of captures) {
+    if (reserved) break
+    if (candidate === capture) continue
+    releaseCapture(id)
+    reserved = reserveDebugCaptureMemory(bytes, true)
+  }
+  if (reserved) capture.bytes = bytes
+  return reserved
 }
 
-function interruptCapture(id: string, now: number): void {
-  const capture = liveCaptures.get(id)
-  if (!capture) return
-  capture.entry.status = "interrupted"
-  capture.entry.replayable = false
-  capture.entry.endedAt = new Date(now).toISOString()
-  capture.entry.updatedAt = now
-  capture.entry.durationMs = now - capture.entry.startedAtMs
-  capture.entry.error = {
-    name: "DebugCaptureInterrupted",
-    message:
-      "Capture stopped because the active diagnostic collection budget was exhausted.",
-  }
-  queueCapture(capture)
-  releaseCapture(id)
+function retainTerminalCapture(capture: DebugCapture): void {
+  capture.controller.abort()
+  if (!reserveCapture(capture)) releaseCapture(capture.entry.id)
+  pruneCaptures()
 }
 
 function compactWhitespace(value: string): string {
@@ -486,10 +484,8 @@ function findHeader(
 
 export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
   const id = randomUUID()
-  const runtime = peekHistoryRuntime()
-  if (!runtime) return id
   const startedAtMs = input.startedAtMs ?? Date.now()
-  pruneLive(startedAtMs)
+  pruneCaptures()
   const body = rawDebugCapture({
     ...input.requestCapture,
     body: input.requestBody,
@@ -511,68 +507,35 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
     startedAtMs,
     updatedAt: startedAtMs,
     status: "pending",
-    replayable:
-      body.body !== null
-      && !body.truncated
-      && !body.omittedReason
-      && body.bodyBytesComplete !== false,
+    replayable: body.body !== null && !incompleteBody(body),
     stream: inferStream(body.body),
   }
-  const capture: LiveCapture = {
+  const capture: DebugCapture = {
     entry,
     controller: new AbortController(),
-    runtime,
-    generation: runtime.generations.debug,
-    // Strings are immutable; account for their storage without copying or
-    // serializing the raw body again before the upstream fetch starts.
-    bytes:
-      (body.body?.length ?? 0) * 2
-      + JSON.stringify({ ...entry, request: { ...entry.request, body: null } })
-        .length
-        * 2,
+    bytes: 0,
   }
-  while (liveCaptures.size >= MAX_LIVE_REQUESTS) {
-    const oldest = liveCaptures.keys().next().value
+  while (captures.size >= MAX_CAPTURES) {
+    const oldest = captures.keys().next().value
     if (!oldest) break
-    interruptCapture(oldest, startedAtMs)
+    releaseCapture(oldest)
   }
-  let reserved = reserveDebugCaptureMemory(capture.bytes, true)
-  while (!reserved && liveCaptures.size > 0) {
-    const oldest = liveCaptures.keys().next().value
-    if (!oldest) break
-    interruptCapture(oldest, startedAtMs)
-    reserved = reserveDebugCaptureMemory(capture.bytes, true)
-  }
-  if (reserved) {
-    liveCaptures.set(id, capture)
-    queueCapture(capture)
+  if (reserveCapture(capture)) {
+    captures.set(id, capture)
   } else {
-    queueCapture({
-      ...capture,
-      entry: {
-        ...entry,
-        status: "error",
-        replayable: false,
-        request: {
-          ...entry.request,
-          body: null,
-          truncated: true,
-          omittedReason: "queue-pressure",
-        },
-      },
-    })
     capture.controller.abort()
   }
+  pruneCaptures()
   return id
 }
 
 function terminalCapture(
   id: string,
   endedAtMs: number,
-): LiveCapture | undefined {
-  pruneLive(endedAtMs)
-  const capture = liveCaptures.get(id)
-  if (!capture) return undefined
+): DebugCapture | undefined {
+  pruneCaptures(endedAtMs)
+  const capture = captures.get(id)
+  if (!capture || capture.entry.status !== "pending") return undefined
   capture.entry.endedAt = new Date(endedAtMs).toISOString()
   capture.entry.durationMs = endedAtMs - capture.entry.startedAtMs
   capture.entry.updatedAt = endedAtMs
@@ -581,7 +544,7 @@ function terminalCapture(
 
 function captureResponse(
   response: Omit<LlmDebugLogResponse, "bodyBytes"> & { bodyBytes?: number },
-  capture: LiveCapture,
+  capture: DebugCapture,
 ): LlmDebugLogResponse {
   const body = rawDebugCapture(response)
   if (incompleteBody(body) || response.bodyReadError)
@@ -621,8 +584,7 @@ export function finishLlmDebugLog(
     ) ?
       "error"
     : "complete"
-  queueCapture(capture)
-  releaseCapture(id)
+  retainTerminalCapture(capture)
 }
 
 export function failLlmDebugLog(
@@ -634,8 +596,7 @@ export function failLlmDebugLog(
   if (!capture) return
   capture.entry.error = normalizeError(error)
   capture.entry.status = "error"
-  queueCapture(capture)
-  releaseCapture(id)
+  retainTerminalCapture(capture)
 }
 
 export function abortLlmDebugLog(
@@ -648,42 +609,90 @@ export function abortLlmDebugLog(
   if (options.response)
     capture.entry.response = captureResponse(options.response, capture)
   capture.entry.status = "aborted"
-  queueCapture(capture)
-  releaseCapture(id)
+  retainTerminalCapture(capture)
 }
 
+export class LlmDebugQueryError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "LlmDebugQueryError"
+  }
+}
+
+function decodeCursor(
+  cursor?: string,
+): { timestamp: number; id: string } | undefined {
+  if (!cursor) return undefined
+  try {
+    if (cursor.length > 512) throw new Error("Oversized cursor")
+    const value: unknown = JSON.parse(
+      Buffer.from(cursor, "base64url").toString(),
+    )
+    if (
+      isRecord(value)
+      && typeof value.timestamp === "number"
+      && Number.isSafeInteger(value.timestamp)
+      && typeof value.id === "string"
+      && value.id.length <= 200
+    ) {
+      return { timestamp: value.timestamp, id: value.id }
+    }
+  } catch {
+    // The opaque cursor never exposes parser errors or payload data.
+  }
+  throw new LlmDebugQueryError("Invalid debug log cursor")
+}
+
+// eslint-disable-next-line @typescript-eslint/require-await -- Preserve the async public API with strictly synchronous memory access.
 export async function listLlmDebugLogs(
   options: { limit?: number; cursor?: string } = {},
 ): Promise<LlmDebugLogListResponse> {
-  pruneLive()
-  const runtime = getHistoryRuntime()
-  const page = await runtime.writer.read((pending) =>
-    runtime.repository.list("debug", options, pending),
-  )
-  const entries = page.records.map((record) =>
-    toSummary(record.payload as unknown as LlmDebugLogEntry),
-  )
+  pruneCaptures()
+  if (options.limit !== undefined && !Number.isFinite(options.limit))
+    throw new LlmDebugQueryError("Invalid debug log limit")
+  const limit = Math.max(1, Math.min(200, Math.floor(options.limit ?? 50)))
+  const cursor = decodeCursor(options.cursor)
+  const all = [...captures.values()]
+    .map(({ entry }) => entry)
+    .filter(
+      (entry) =>
+        !cursor
+        || entry.startedAtMs < cursor.timestamp
+        || (entry.startedAtMs === cursor.timestamp && entry.id < cursor.id),
+    )
+    .sort((left, right) => {
+      if (left.startedAtMs !== right.startedAtMs)
+        return right.startedAtMs - left.startedAtMs
+      if (left.id === right.id) return 0
+      return left.id < right.id ? 1 : -1
+    })
+  const page = all.slice(0, limit)
+  const entries = page.map((entry) => toSummary(entry))
+  const last = page.at(-1)
   return {
     count: entries.length,
     entries,
     generatedAt: new Date().toISOString(),
-    cursor: page.cursor,
+    cursor:
+      all.length > limit && last ?
+        Buffer.from(
+          JSON.stringify({ timestamp: last.startedAtMs, id: last.id }),
+        ).toString("base64url")
+      : null,
   }
 }
 
+// eslint-disable-next-line @typescript-eslint/require-await -- Preserve the async public API with strictly synchronous memory access.
 export async function getLlmDebugLog(
   id: string,
 ): Promise<LlmDebugLogEntry | undefined> {
-  pruneLive()
-  const runtime = getHistoryRuntime()
-  const record = await runtime.writer.read((pending) =>
-    runtime.repository.get("debug", id, pending),
-  )
-  return record ? (record.payload as unknown as LlmDebugLogEntry) : undefined
+  pruneCaptures()
+  const capture = captures.get(id)
+  return capture ? structuredClone(capture.entry) : undefined
 }
 
+// eslint-disable-next-line @typescript-eslint/require-await -- Clear immediately while preserving the awaitable public API.
 export async function clearLlmDebugLogs(): Promise<void> {
-  const runtime = getHistoryRuntime()
-  await runtime.clear("debug")
-  pruneLive()
+  for (const id of captures.keys()) releaseCapture(id)
+  schedulePrune()
 }

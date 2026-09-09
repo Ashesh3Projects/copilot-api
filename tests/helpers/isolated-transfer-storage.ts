@@ -5,13 +5,10 @@ import type { SqlSession, SqlStatement, Storage } from "~/lib/storage/types"
 
 import { migrateStorage } from "~/lib/storage/migrations"
 import {
-  initialIndexes,
-  initialTables,
-} from "~/lib/storage/migrations/001-initial"
-import {
   currentIndexes,
   currentTables,
   storageMigrations,
+  storageSchema,
 } from "~/lib/storage/schema"
 
 const applicationObjectsSql =
@@ -25,14 +22,12 @@ export function isolatedNamespace(underlying: Storage) {
   if (!/^test_[a-f\d]{32}_$/.test(prefix))
     throw new Error("Invalid test namespace")
   const mapping = new Map(
-    // Migration 001 creates Activity before migration 004 removes it. Scope all
-    // historical objects to the same owned prefix during that transaction.
     [
       ...new Set([
         ...tableNames,
         ...indexNames,
-        ...Object.keys(initialTables),
-        ...Object.keys(initialIndexes),
+        ...Object.keys(storageSchema(1).tables),
+        ...Object.keys(storageSchema(1).indexes),
       ]),
     ].map((name) => [name, `${prefix}${name}`]),
   )

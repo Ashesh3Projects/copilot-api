@@ -8,7 +8,7 @@ export const accountIntegrationTables = {
 } as const
 
 export const accountIntegrationMigration = {
-  version: 3,
+  version: 4,
   name: "account-integration",
   statements: [`ALTER TABLE capi_accounts ADD COLUMN ${integrationColumn}`],
 } as const

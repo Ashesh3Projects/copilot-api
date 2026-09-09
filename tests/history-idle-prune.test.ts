@@ -1,54 +1,70 @@
-import { expect, test } from "bun:test"
-import { join } from "node:path"
+import { afterEach, beforeEach, expect, jest, test } from "bun:test"
 
-import { LocalSqliteStorage } from "../src/lib/storage/local-sqlite"
-import { migrateStorage } from "../src/lib/storage/migrations"
-import { createHistoryRuntime } from "../src/lib/telemetry-writer"
+import { debugCaptureMemoryUsage } from "../src/lib/debug-capture"
+import {
+  clearLlmDebugLogs,
+  failLlmDebugLog,
+  finishLlmDebugLog,
+  getLlmDebugCaptureSignal,
+  getLlmDebugLog,
+  LLM_DEBUG_HISTORY_WINDOW_MS,
+  listLlmDebugLogs,
+  startLlmDebugLog,
+} from "../src/lib/llm-debug-log"
 
-async function waitForTimer() {
-  await new Promise((resolve) => setTimeout(resolve, 1200))
-}
+beforeEach(async () => {
+  await clearLlmDebugLogs()
+  jest.useFakeTimers()
+})
 
-test("idle timer physically prunes successful and failed captures at their retention deadlines", async () => {
-  const storage = new LocalSqliteStorage(
-    join(
-      import.meta.dir,
-      "../.superpowers/test-data/idle-prune",
-      `${crypto.randomUUID()}.sqlite`,
-    ),
-  )
-  await migrateStorage(storage)
-  let now = Date.now()
-  const history = await createHistoryRuntime(storage, { now: () => now })
-  const rows = () =>
-    storage.read((s) =>
-      s.query({ sql: "SELECT id FROM capi_debug ORDER BY id", args: [] }),
-    )
-  try {
-    for (const status of ["complete", "error"])
-      history.writer.enqueue({
-        id: status,
-        kind: "debug",
-        generation: history.generations.debug,
-        recordedAt: now,
-        payload: {
-          startedAtMs: now,
-          updatedAt: now,
-          status,
-          request: { body: "synthetic raw" },
-        },
-      })
-    await history.writer.flush()
-    expect(await rows()).toHaveLength(2)
-    now += 600_001
-    await waitForTimer()
-    expect(await rows()).toEqual([{ id: "error" }])
-    now += 3000_000
-    await waitForTimer()
-    expect(await rows()).toEqual([])
-    expect(history.writer.status().degraded).toBe(false)
-  } finally {
-    await history.close(1000)
-    await storage.close()
+afterEach(async () => {
+  await clearLlmDebugLogs()
+  jest.useRealTimers()
+})
+
+test("idle timer releases successful, failed and pending capture memory at their retention deadlines", async () => {
+  const baseline = debugCaptureMemoryUsage()
+  const startedAtMs = Date.now()
+  const input = {
+    method: "POST",
+    path: "/responses",
+    url: "https://example.test/responses",
+    requestHeaders: {},
+    requestBody: '{"input":"synthetic raw"}',
   }
+  const complete = startLlmDebugLog(input)
+  const failed = startLlmDebugLog(input)
+  const pending = startLlmDebugLog(input)
+  const pendingSignal = getLlmDebugCaptureSignal(pending)
+  finishLlmDebugLog(complete, {
+    body: '{"output":"synthetic raw"}',
+    headers: {},
+    status: 200,
+    statusText: "OK",
+  })
+  failLlmDebugLog(failed, new Error("synthetic raw failure"))
+
+  const retainedBytes = debugCaptureMemoryUsage()
+  jest.advanceTimersByTime(LLM_DEBUG_HISTORY_WINDOW_MS - 1)
+  expect(debugCaptureMemoryUsage()).toBe(retainedBytes)
+  jest.advanceTimersByTime(1)
+  expect(debugCaptureMemoryUsage()).toBeGreaterThan(baseline)
+  expect(debugCaptureMemoryUsage()).toBeLessThan(retainedBytes)
+  expect(pendingSignal.aborted).toBe(false)
+
+  // No log reads have run: the timer must schedule the remaining one-hour TTL.
+  const remainingBytes = debugCaptureMemoryUsage()
+  jest.advanceTimersByTime(60 * 60_000 - LLM_DEBUG_HISTORY_WINDOW_MS - 1)
+  expect(debugCaptureMemoryUsage()).toBe(remainingBytes)
+  expect(pendingSignal.aborted).toBe(false)
+  jest.advanceTimersByTime(1)
+  expect(debugCaptureMemoryUsage()).toBe(baseline)
+  expect(pendingSignal.aborted).toBe(true)
+
+  // Rewinding proves idle cleanup released entries, not just hidden old dates.
+  jest.setSystemTime(startedAtMs)
+  expect(await getLlmDebugLog(complete)).toBeUndefined()
+  expect(await getLlmDebugLog(failed)).toBeUndefined()
+  expect(await getLlmDebugLog(pending)).toBeUndefined()
+  expect((await listLlmDebugLogs()).count).toBe(0)
 })

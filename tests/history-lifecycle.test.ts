@@ -23,17 +23,21 @@ test("closing the owning storage runtime drains history and marks the run clean 
     for (const id of ["one", "two"])
       history.writer.enqueue({
         id,
-        kind: "debug",
+        kind: "usage",
         generation: 0,
         recordedAt: Date.now(),
-        payload: { status: "complete", request: { body: "fixture" } },
+        payload: { inputTokens: 7, outputTokens: 11, requestCount: 1 },
       })
     const closing = closeStorageRuntime()
     await Promise.all([closing, closeStorageRuntime()])
     expect(peekHistoryRuntime()).toBeUndefined()
     const reopened = await initializeStorageRuntime({ config: fixture.config })
     const repository = createHistoryRepository(reopened.storage)
-    expect((await repository.list("debug")).records).toHaveLength(2)
+    expect((await repository.readUsage(0)).lifetime).toMatchObject({
+      inputTokens: 14,
+      outputTokens: 22,
+      requestCount: 2,
+    })
     const runs = await reopened.storage.read((session) =>
       session.query({
         sql: "SELECT clean, ended_at FROM capi_process_runs",
@@ -64,11 +68,11 @@ test("a real read-only CLI command creates no history run and leaves a live gate
       autoFlush: false,
     })
     history.writer.enqueue({
-      id: "debug",
-      kind: "debug",
+      id: "routing",
+      kind: "routing",
       generation: 0,
       recordedAt: Date.now(),
-      payload: { status: "streaming", request: { body: "fixture" } },
+      payload: { totals: { requests: 1, upstreamCalls: 2 } },
     })
     await history.writer.flush()
     const child = Bun.spawn(
@@ -101,9 +105,109 @@ test("a real read-only CLI command creates no history run and leaves a live gate
         }),
       ),
     ).toEqual([{ count: 1 }])
-    expect((await history.repository.list("debug")).records).toHaveLength(1)
+    expect((await history.repository.readRouting(0)).lifetime).toEqual({
+      requests: 1,
+      upstreamCalls: 2,
+    })
     await history.close(1000)
   } finally {
+    await fixture.close()
+  }
+})
+
+test("idle maintenance renews the run and prunes routing minutes and receipts while retaining usage and lifetime counters", async () => {
+  const fixture = await createRuntimeStorage()
+  try {
+    await initializeStorageRuntime(fixture)
+    let now = Date.now()
+    const history = await createHistoryRuntime(fixture.storage, {
+      now: () => now,
+    })
+    history.writer.enqueue({
+      id: "usage",
+      kind: "usage",
+      generation: 0,
+      recordedAt: now,
+      payload: { inputTokens: 7, outputTokens: 11, requestCount: 1 },
+    })
+    history.writer.enqueue({
+      id: "routing",
+      kind: "routing",
+      generation: 0,
+      recordedAt: now,
+      payload: { totals: { requests: 1, upstreamCalls: 2 } },
+    })
+    await history.writer.flush()
+    now += 86400_000 + 60_000
+    await Bun.sleep(1100)
+    expect((await history.repository.readUsage(0)).buckets).toHaveLength(1)
+    expect((await history.repository.readRouting(0)).buckets).toHaveLength(0)
+    expect((await history.repository.readRouting(0)).lifetime).toEqual({
+      requests: 1,
+      upstreamCalls: 2,
+    })
+    expect(
+      await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT id FROM capi_applied_operations WHERE kind = 'history_batch'",
+          args: [],
+        }),
+      ),
+    ).toEqual([])
+    expect(
+      await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT clean, ended_at, json_extract(payload_json, '$.heartbeatAt') AS heartbeat FROM capi_process_runs",
+          args: [],
+        }),
+      ),
+    ).toEqual([{ clean: 0, ended_at: null, heartbeat: now }])
+    expect((await history.repository.collectionStatus()).unknownGaps).toBe(0)
+  } finally {
+    await fixture.close()
+  }
+})
+
+test("close returns within its deadline when the final clean-run transaction stalls", async () => {
+  const fixture = await createRuntimeStorage()
+  const entered = Promise.withResolvers<undefined>()
+  const released = Promise.withResolvers<undefined>()
+  let stalled = false
+  let history: Awaited<ReturnType<typeof createHistoryRuntime>> | undefined
+  try {
+    await initializeStorageRuntime(fixture)
+    history = await createHistoryRuntime(
+      {
+        ...fixture.storage,
+        async transaction(work) {
+          if (stalled) {
+            entered.resolve(undefined)
+            await released.promise
+          }
+          return fixture.storage.transaction(work)
+        },
+      },
+      { autoFlush: false },
+    )
+    stalled = true
+    const started = performance.now()
+    const closing = history.close(30)
+    await entered.promise
+    expect(await closing).toMatchObject({ pendingRecords: 0, degraded: true })
+    expect(performance.now() - started).toBeLessThan(500)
+    expect(peekHistoryRuntime()).toBeUndefined()
+    released.resolve(undefined)
+    expect(
+      await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT clean, ended_at FROM capi_process_runs",
+          args: [],
+        }),
+      ),
+    ).toEqual([{ clean: 0, ended_at: null }])
+  } finally {
+    released.resolve(undefined)
+    await history?.close(1000)
     await fixture.close()
   }
 })

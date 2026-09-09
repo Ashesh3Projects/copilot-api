@@ -48,7 +48,18 @@ test("handler logging has no file writes, signal hooks, or stored activity and k
       process.listenerCount("SIGTERM"),
     ]).toEqual(signals)
     expect(runtime.writer.status().pendingRecords).toBe(0)
-    expect((await runtime.repository.list("debug")).records).toHaveLength(0)
+    expect((await runtime.repository.readUsage(0)).lifetime.requestCount).toBe(
+      0,
+    )
+    expect((await runtime.repository.readRouting(0)).buckets).toHaveLength(0)
+    expect(
+      await storage.read((session) =>
+        session.query({
+          sql: "SELECT id FROM capi_applied_operations WHERE kind = 'history_batch'",
+          args: [],
+        }),
+      ),
+    ).toEqual([])
     expect(output.join("")).not.toContain("credential-value")
     expect(output.join("")).not.toContain("Bearer private")
     expect(output.join("")).toContain("Prepared request")

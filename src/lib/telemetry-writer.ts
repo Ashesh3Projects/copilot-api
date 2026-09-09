@@ -1,22 +1,20 @@
 import { randomUUID } from "node:crypto"
 
-import type {
-  DiagnosticKind,
-  HistoryRepository,
-} from "~/lib/storage/history-repository"
+import type { HistoryRepository } from "~/lib/storage/history-repository"
 import type { JsonValue, Storage } from "~/lib/storage/types"
 
 import { StorageUnavailableError } from "~/lib/storage/errors"
 import {
   createHistoryRepository,
   historyObject,
+  isHistoryRecordKind,
   sumHistoryCounters,
 } from "~/lib/storage/history-repository"
 import { withStorageDeadline } from "~/lib/storage/operation-budget"
 
 export interface HistoryRecord {
   id: string
-  kind: "usage" | "routing" | "debug" | "collection-gap"
+  kind: "usage" | "routing" | "collection-gap"
   recordedAt: number
   generation: number
   payload: JsonValue
@@ -35,7 +33,7 @@ export interface TelemetryStatus {
 export interface TelemetryWriter {
   enqueue(record: HistoryRecord): boolean
   flush(): Promise<void>
-  status(kind?: DiagnosticKind): TelemetryStatus
+  status(): TelemetryStatus
   close(deadlineMs: number): Promise<TelemetryStatus>
   read<T>(
     work: (pending: ReadonlyArray<PendingHistoryRecord>) => Promise<T>,
@@ -45,8 +43,6 @@ export interface HistoryRuntime {
   storage: Storage
   repository: HistoryRepository
   writer: TelemetryWriter
-  generations: Record<DiagnosticKind, number>
-  clear(kind: DiagnosticKind): Promise<number>
   close(deadlineMs: number): Promise<TelemetryStatus>
 }
 interface Queued {
@@ -61,14 +57,11 @@ interface Batch {
   createdAt: number
 }
 interface TelemetryWriterOptions {
-  runId?: string
   autoFlush?: boolean
   beforeFlush?: () => Promise<void>
-  acceptDiagnostic?(kind: DiagnosticKind): boolean
-  generationDegraded?(): boolean
 }
 const MAX_RECORDS = 2000,
-  MAX_BYTES = 128 * 1024 * 1024,
+  MAX_BYTES = 16 * 1024 * 1024,
   MAX_AGE = 300_000
 let lastWarning = -Infinity
 export function reportTelemetryFailure(): void {
@@ -81,10 +74,10 @@ export function reportTelemetryFailure(): void {
 
 function coalesce(records: ReadonlyArray<HistoryRecord>): Array<HistoryRecord> {
   const counters = new Map<string, HistoryRecord>(),
-    diagnostics: Array<HistoryRecord> = []
+    collectionGaps: Array<HistoryRecord> = []
   for (const record of records) {
     if (record.kind !== "usage" && record.kind !== "routing") {
-      diagnostics.push(record)
+      collectionGaps.push(record)
       continue
     }
     const p = historyObject(record.payload)
@@ -106,7 +99,7 @@ function coalesce(records: ReadonlyArray<HistoryRecord>): Array<HistoryRecord> {
         Number(p.firstRequestAt ?? record.recordedAt),
       )
   }
-  return [...counters.values(), ...diagnostics]
+  return [...counters.values(), ...collectionGaps]
 }
 
 // eslint-disable-next-line max-lines-per-function -- One closure owns queue, retry batch and admission state.
@@ -133,21 +126,14 @@ export function createTelemetryWriter(
     return result
   }
   const count = () => queue.length + (active?.items.length ?? 0)
-  const loss = (item: Queued, unknown = false, generationUncertain = false) => {
-    const key = JSON.stringify([
-      item.record.kind,
-      generationUncertain ? null : item.record.generation,
-      unknown,
-    ])
+  const loss = (item: Queued, unknown = false) => {
+    const key = JSON.stringify([item.record.kind, unknown])
     const prior = gaps.get(key)
     const payload =
       prior ?
         historyObject(prior.payload)
       : {
           historyKind: item.record.kind,
-          ...(generationUncertain ?
-            {}
-          : { generation: item.record.generation }),
           startedAt: item.enqueuedAt,
           ...(unknown ?
             { unknown: true, reason: "expired-unconfirmed-batch" }
@@ -200,23 +186,12 @@ export function createTelemetryWriter(
       active = undefined
     }
   }
-  const snapshot = (kind?: DiagnosticKind): TelemetryStatus => ({
-    pendingRecords:
-      kind ?
-        [...queue, ...(active?.items ?? [])].filter(
-          (item) => item.record.kind === kind,
-        ).length
-      : count(),
-    pendingBytes:
-      kind ?
-        [...queue, ...(active?.items ?? [])]
-          .filter((item) => item.record.kind === kind)
-          .reduce((sum, item) => sum + item.bytes, 0)
-      : pendingBytes,
+  const snapshot = (): TelemetryStatus => ({
+    pendingRecords: count(),
+    pendingBytes,
     droppedRecords,
     lastSuccessfulFlush,
-    degraded:
-      failed || gaps.size > 0 || (options.generationDegraded?.() ?? false),
+    degraded: failed || gaps.size > 0,
   })
   const flushOnce = async () => {
     try {
@@ -249,12 +224,8 @@ export function createTelemetryWriter(
         return
       }
       const records = coalesce(items.map((item) => item.record))
-      // A large debug entry is committed by itself. Preserve small loss reports
-      // for the next batch instead of appending to an already oversized write.
-      if (batchBytes <= 1024 * 1024) {
-        records.push(...gaps.values())
-        gaps.clear()
-      }
+      records.push(...gaps.values())
+      gaps.clear()
       active = { id: randomUUID(), items, records, createdAt: clock.now() }
     }
     try {
@@ -280,98 +251,33 @@ export function createTelemetryWriter(
       }, 1000)
   timer?.unref()
   const writer: TelemetryWriter = {
-    // eslint-disable-next-line complexity -- Admission accounts for record, byte and priority limits without changing captured payloads.
     enqueue(record) {
-      if (closed) return false
+      if (closed || !isHistoryRecordKind(record.kind)) return false
       try {
-        const owned =
-          record.kind === "debug" && options.runId ?
-            {
-              ...record,
-              payload: {
-                ...historyObject(record.payload),
-                _historyRunId: options.runId,
-              },
-            }
-          : record
-        const serialized = JSON.stringify(owned)
-        const bytes = Buffer.byteLength(serialized),
-          item = {
-            record: JSON.parse(serialized) as HistoryRecord,
-            bytes,
-            enqueuedAt: clock.now(),
-          }
-        if (record.kind === "debug") {
-          const updatedAt = Number(
-            historyObject(item.record.payload).updatedAt
-              ?? item.record.recordedAt,
-          )
-          const prior = queue.find(
-            (queued) =>
-              queued.record.kind === "debug"
-              && queued.record.id === record.id
-              && queued.record.generation === record.generation,
-          )
-          if (
-            prior
-            && Number(
-              historyObject(prior.record.payload).updatedAt
-                ?? prior.record.recordedAt,
-            ) > updatedAt
-          )
-            return true
-          for (let index = queue.length - 1; index >= 0; index--) {
-            const queued = queue[index]
-            if (
-              queued.record.kind === "debug"
-              && queued.record.id === record.id
-              && queued.record.generation === record.generation
-            ) {
-              pendingBytes -= queued.bytes
-              queue.splice(index, 1)
-            }
-          }
+        const serialized = JSON.stringify(record)
+        const bytes = Buffer.byteLength(serialized)
+        const item: Queued = {
+          record: JSON.parse(serialized) as HistoryRecord,
+          bytes,
+          enqueuedAt: clock.now(),
         }
-        const generationBlocked =
-          record.kind === "debug"
-          && options.acceptDiagnostic?.(record.kind) === false
-        const oversizedAlone =
-          record.kind === "debug"
-          && item.bytes > MAX_BYTES
-          && count() === 0
-          && !active
-        if ((item.bytes > MAX_BYTES && !oversizedAlone) || generationBlocked) {
+        if (bytes > MAX_BYTES) {
           droppedRecords++
-          loss(item, false, generationBlocked)
-          if (generationBlocked) void writer.flush()
+          loss(item)
           return false
         }
-        while (
-          !oversizedAlone
-          && (count() >= MAX_RECORDS || pendingBytes + item.bytes > MAX_BYTES)
-        ) {
-          const index = queue.findIndex(
-            (value) => value.record.kind === "debug",
-          )
-          let candidate = index
-          if (
-            candidate === -1
-            && (record.kind === "usage" || record.kind === "routing")
-          )
-            candidate = 0
-          if (candidate < 0 || queue.length === 0) {
+        while (count() >= MAX_RECORDS || pendingBytes + bytes > MAX_BYTES) {
+          const oldest = queue.shift()
+          if (!oldest) {
             droppedRecords++
             loss(item)
             return false
           }
-          drop(queue.splice(candidate, 1)[0])
+          drop(oldest)
         }
         queue.push(item)
-        pendingBytes += item.bytes
-        if (
-          options.autoFlush !== false
-          && (queue.length >= 100 || oversizedAlone)
-        )
+        pendingBytes += bytes
+        if (options.autoFlush !== false && queue.length >= 100)
           void writer.flush()
         return true
       } catch {
@@ -444,7 +350,7 @@ export function createTelemetryWriter(
 }
 
 let current: HistoryRuntime | undefined
-// eslint-disable-next-line max-lines-per-function -- One runtime owns generation reconciliation, ordered clears, and shutdown publication.
+
 export async function createHistoryRuntime(
   storage: Storage,
   options: { now?: () => number; autoFlush?: boolean } = {},
@@ -452,52 +358,19 @@ export async function createHistoryRuntime(
   const now = options.now ?? Date.now,
     runId = randomUUID()
   const repository = createHistoryRepository(storage, { runId, now })
-  const generations = await repository.generations()
   await repository.startRun(runId, now())
-  const clearTails: Record<DiagnosticKind, Promise<unknown>> = {
-    debug: Promise.resolve(),
-  }
-  const pendingClears: Record<DiagnosticKind, number> = {
-    debug: 0,
-  }
-  const clearEpochs: Record<DiagnosticKind, number> = { debug: 0 }
-  const unresolved = new Set<DiagnosticKind>()
   let lastHeartbeat = now()
-  const reconcileGenerations = async () => {
-    if (now() - lastHeartbeat >= 30_000) {
-      await repository.heartbeatRun(runId, now())
-      // eslint-disable-next-line require-atomic-updates -- Only the writer's serialized flush owner invokes this callback.
-      lastHeartbeat = now()
-      const confirmed = await repository.generations()
-      for (const kind of ["debug"] as const)
-        if (!pendingClears[kind])
-          generations[kind] = Math.max(generations[kind], confirmed[kind])
-    }
-    const needed = [...unresolved].filter((kind) => pendingClears[kind] === 0)
-    if (needed.length === 0) return
-    const observedEpochs = { ...clearEpochs }
-    const confirmed = await repository.generations()
-    for (const kind of needed) {
-      // Another clear may have started while this read was in flight.
-      if (
-        pendingClears[kind] !== 0
-        || observedEpochs[kind] !== clearEpochs[kind]
-      )
-        continue
-      generations[kind] = Math.max(generations[kind], confirmed[kind])
-      unresolved.delete(kind)
-    }
-  }
   const writer = createTelemetryWriter(
     repository,
     { now },
     {
-      ...options,
-      runId,
-      beforeFlush: reconcileGenerations,
-      acceptDiagnostic: (kind) =>
-        !unresolved.has(kind) && pendingClears[kind] === 0,
-      generationDegraded: () => unresolved.size > 0 || pendingClears.debug > 0,
+      autoFlush: options.autoFlush,
+      async beforeFlush() {
+        if (now() - lastHeartbeat < 30_000) return
+        await repository.heartbeatRun(runId, now())
+        // eslint-disable-next-line require-atomic-updates -- Only the writer's serialized flush owner invokes this callback.
+        lastHeartbeat = now()
+      },
     },
   )
   let closing: Promise<TelemetryStatus> | undefined
@@ -505,26 +378,6 @@ export async function createHistoryRuntime(
     storage,
     repository,
     writer,
-    generations,
-    clear(kind) {
-      pendingClears[kind]++
-      clearEpochs[kind]++
-      const operation = clearTails[kind].then(async () => {
-        try {
-          const next = await repository.clear(kind)
-          generations[kind] = Math.max(generations[kind], next)
-          unresolved.delete(kind)
-          return next
-        } catch (error) {
-          unresolved.add(kind)
-          throw error
-        } finally {
-          pendingClears[kind]--
-        }
-      })
-      clearTails[kind] = operation.catch(() => undefined)
-      return operation
-    },
     close(deadlineMs) {
       closing ??= (async () => {
         const started = Date.now()

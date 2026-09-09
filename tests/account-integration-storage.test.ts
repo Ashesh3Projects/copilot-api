@@ -87,10 +87,43 @@ async function rewriteBackup(
           manifest?: { schemaVersion: number; recordsSha256: string }
         },
     )
+  if (schemaVersion < 5) {
+    const counters = [
+      "history_activity_generation",
+      ...(schemaVersion < 3 ? ["history_debug_generation"] : []),
+    ]
+    for (const key of counters)
+      frames.splice(0, 0, {
+        seq: 0,
+        kind: "record",
+        record: {
+          table: "capi_metadata",
+          key: JSON.stringify([key]),
+          value: { key, value: "0" },
+        },
+      } as (typeof frames)[number])
+    const metadata = frames
+      .filter((frame) => frame.record?.table === "capi_metadata")
+      .sort((a, b) =>
+        String(a.record?.value.key).localeCompare(String(b.record?.value.key)),
+      )
+    const rest = frames.filter(
+      (frame) => frame.record?.table !== "capi_metadata",
+    )
+    frames.splice(0, frames.length, ...metadata, ...rest)
+    for (const [seq, frame] of frames.entries()) {
+      frame.seq = seq
+    }
+    const manifest = frames.at(-1)
+      ?.manifest as (typeof frames)[number]["manifest"] & {
+      recordCounts: Record<string, number>
+    }
+    manifest.recordCounts.capi_metadata += counters.length
+  }
   const digest = createHash("sha256")
   const lines = frames.map((frame) => {
     if (frame.record?.table === "capi_accounts") {
-      if (schemaVersion === 2) delete frame.record.value.integration_id
+      if (schemaVersion < 4) delete frame.record.value.integration_id
       else if (integrationId !== undefined)
         frame.record.value.integration_id = integrationId
     }
@@ -233,7 +266,7 @@ test("version two encrypted backups restore with the default override under the 
             args: [],
           }),
         ),
-      ).toEqual([{ value: "4" }])
+      ).toEqual([{ value: "5" }])
     })
   })
 })
@@ -243,7 +276,7 @@ test("restore rejects a validly encrypted backup containing an unsafe integratio
     await seedAccount(source)
     const bytes = await rewriteBackup(
       await streamBytes(createBackupStream(password, undefined, source)),
-      3,
+      5,
       "good\r\nInjected: yes",
     )
     await withTransferStorage(async (target) => {

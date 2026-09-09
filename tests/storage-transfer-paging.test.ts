@@ -48,12 +48,8 @@ test("backup payload pages avoid combining large fields and preserve continuatio
         args: [JSON.stringify({ extraPrompts: { large } })],
       },
       ...Array.from({ length: 6 }, (_, i) => ({
-        sql: "INSERT INTO capi_debug(id,generation,created_at,updated_at,expires_at,status,payload_json,payload_bytes) VALUES(?,0,0,0,1,'pending',?,?)",
-        args: [
-          `large-${i}`,
-          JSON.stringify({ message: "x".repeat(600000) }),
-          600014,
-        ],
+        sql: "INSERT INTO capi_collection_gaps(id,started_at,kind,lost_records,payload_json) VALUES(?,0,'known',1,?)",
+        args: [`large-${i}`, JSON.stringify({ message: "x".repeat(600000) })],
       })),
     ])
     let payloadQueries = 0
@@ -63,7 +59,7 @@ test("backup payload pages avoid combining large fields and preserve continuatio
         query: async (statement) => {
           const rows = await session.query(statement)
           if (
-            /SELECT (?:key,value|id,generation|namespace,value_json)/.test(
+            /SELECT (?:key,value|id,process_run_id|namespace,value_json)/.test(
               statement.sql,
             )
           ) {
@@ -95,7 +91,7 @@ test("backup payload pages avoid combining large fields and preserve continuatio
       }
       expect(restored.extraPrompts.large).toBe(large)
       expect(
-        records.filter((record) => record.table === "capi_debug"),
+        records.filter((record) => record.table === "capi_collection_gaps"),
       ).toHaveLength(6)
     })
     expect(payloadQueries).toBeGreaterThan(1)

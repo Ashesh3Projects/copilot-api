@@ -531,7 +531,8 @@ docker compose up -d copilot-api
 ```
 
 LLM Debug retains original outbound request and response bodies, URLs, headers,
-and error details without sensitive-value filtering or JSON/SSE reconstruction.
+and error details in server memory only, without sensitive-value filtering or
+JSON/SSE reconstruction. Captures never enter SQLite, Turso, or application backups.
 Successful captures expire after ten minutes; failed or
 interrupted captures after one hour. Capacity limits can evict entries sooner.
 Replay supports complete replayable Chat Completions and Responses captures,
@@ -539,7 +540,8 @@ preserves the captured request body, and obtains fresh server-side credentials.
 Incomplete and legacy redacted request bodies can be edited before replay;
 expired entries and removed or changed providers remain unavailable.
 Large response captures use an anonymous temporary file while collecting the
-stream. Capture follows downstream consumption with bounded read-ahead.
+stream; the file is removed when capture finishes, and retained captures are
+process-local. Clear and restart remove captures. Capture follows downstream consumption with bounded read-ahead.
 Read-only containers need a writable temporary directory, supplied by
 the Turso Compose example's `/tmp` tmpfs mount.
 
@@ -548,16 +550,17 @@ Leave it blank to use the hardcoded `copilot-developer-cli` default shown in the
 placeholder. Saving refreshes that account's models and applies its override to
 its subsequent inference requests; other accounts keep their own settings.
 
-Version 5.1.0 removes the separate Activity page and its stored history. The
-database upgrade discards the obsolete Activity table. LLM Debug, usage totals,
+Version 5.1.0 includes the memory-only LLM Debug migration (`003`), adds account
+integration overrides (`004`), and removes Activity and its stored history (`005`).
+The database upgrade discards the obsolete debug and Activity tables. LLM Debug, usage totals,
 account settings, and the other dashboard pages remain available.
 
 `GET /usage` returns current Copilot quota data. Dashboard utilization instead
 uses committed minute/model usage buckets and lifetime counters; committed old
 usage is retained. Diagnostic and routing detail has bounded retention. Pending
-telemetry is bounded to 2,000 records, 128 MiB, and five minutes, with a single
-oversized debug record allowed on its own. Pressure evicts whole records and
-records the loss instead of rewriting captured bodies. Collection-gap indicators
+usage/routing telemetry is bounded to 2,000 records, 16 MiB, and five minutes.
+LLM Debug has its own process-local count and memory budget; pressure evicts
+whole captures instead of rewriting captured bodies. Collection-gap indicators
 report known loss and uncertainty instead of claiming complete history.
 
 Sanitized ZIP export excludes credential and history tables and replaces
@@ -1002,8 +1005,8 @@ returns `200` with `{ "text": "..." }`.
   to the client, ordinary logs, and Sentry with its status and content type.
   Protect their transport, retention, and access, and rotate credentials exposed
   through those channels.
-- **Diagnostic history is raw.** LLM Debug retains complete unfiltered request
-  and response content, including credentials. Access requires an administrator
+- **Diagnostic history is raw and memory only.** LLM Debug retains complete
+  unfiltered request and response content, including credentials, outside the database and backups. Access requires an administrator
   session; successful captures expire after ten minutes and unsuccessful
   captures after one hour.
 - **Use Sentry deliberately.** When `SENTRY_DSN` is set, AI prompt and completion

@@ -23,7 +23,7 @@ import {
   storageMigrations,
 } from "~/lib/storage/schema"
 import {
-  LEGACY_TRANSFER_TABLES,
+  transferTablesForSchema,
   transferColumns,
   transferKey,
 } from "~/lib/storage/transfer-records"
@@ -52,7 +52,7 @@ async function seedLegacy(storage: Storage, version: number): Promise<void> {
       store_id: randomUUID(),
       config_revision: "5",
       history_activity_generation: "2",
-      history_debug_generation: "1",
+      ...(version < 3 ? { history_debug_generation: "1" } : {}),
     }))
       await session.execute({
         sql: "INSERT INTO capi_metadata(key,value) VALUES(?,?)",
@@ -62,7 +62,7 @@ async function seedLegacy(storage: Storage, version: number): Promise<void> {
       sql: "INSERT INTO capi_accounts(id,domain,upstream_user_id,login,created_at,updated_at) VALUES(1,'github.com','123','fixture',1,1)",
       args: [],
     })
-    if (version >= 3)
+    if (version >= 4)
       await session.execute({
         sql: "UPDATE capi_accounts SET integration_id='fixture-integration' WHERE id=1",
         args: [],
@@ -91,19 +91,20 @@ async function seedLegacy(storage: Storage, version: number): Promise<void> {
       sql: "INSERT INTO capi_activity(id,generation,created_at,expires_at,kind,payload_json,payload_bytes) VALUES('removed',2,?,?, 'info','{\"message\":\"obsolete fixture\"}',30)",
       args: [now, now + 10000],
     })
-    await session.execute({
-      sql: "INSERT INTO capi_debug(id,generation,created_at,updated_at,expires_at,status,replayable,payload_json,payload_bytes) VALUES('keep-debug',1,?,?,?,'complete',1,?,100)",
-      args: [
-        now,
-        now,
-        now + 600000,
-        JSON.stringify({
-          status: "complete",
-          request: { body: "raw request fixture" },
-          response: { body: "raw response fixture" },
-        }),
-      ],
-    })
+    if (version < 3)
+      await session.execute({
+        sql: "INSERT INTO capi_debug(id,generation,created_at,updated_at,expires_at,status,replayable,payload_json,payload_bytes) VALUES('keep-debug',1,?,?,?,'complete',1,?,100)",
+        args: [
+          now,
+          now,
+          now + 600000,
+          JSON.stringify({
+            status: "complete",
+            request: { body: "raw request fixture" },
+            response: { body: "raw response fixture" },
+          }),
+        ],
+      })
     await session.execute({
       sql: "INSERT INTO capi_collection_gaps(id,started_at,kind,lost_records,lost_bytes,payload_json) VALUES('remove-gap',1,'known',3,30,'{\"historyKind\":\"activity\"}'),('keep-gap',1,'known',2,20,'{\"historyKind\":\"usage\"}')",
       args: [],
@@ -117,17 +118,18 @@ async function legacyBackup(
 ): Promise<Uint8Array> {
   const records: Array<TransferRecord> = []
   await storage.read(async (session) => {
-    for (const table of LEGACY_TRANSFER_TABLES) {
-      const columns = transferColumns(table, true)
-        .map((column) => column.name)
-        .filter((name) => version !== 2 || name !== "integration_id")
+    for (const table of transferTablesForSchema(version)) {
+      const columns = transferColumns(table, version).map(
+        (column) => column.name,
+      )
+
       const rows = await session.query({
         sql: `SELECT ${columns.join(",")} FROM ${table}`,
         args: [],
       })
       const entries = rows.map((row) => ({
         table,
-        key: transferKey(table, row, true),
+        key: transferKey(table, row, version),
         value: row as TransferRecord["value"],
       }))
       entries.sort((a, b) =>
@@ -204,7 +206,7 @@ async function assertRetained(
     ).toEqual([
       {
         id: 1,
-        integration_id: version === 2 ? null : "fixture-integration",
+        integration_id: version < 4 ? null : "fixture-integration",
         oauth_value: "fixture-oauth",
       },
     ])
@@ -238,19 +240,16 @@ async function assertRetained(
         args: [],
       }),
     ).toEqual([{ id: "keep-gap", lost_records: 2 }])
-    const debug = await session.query({
-      sql: "SELECT payload_json FROM capi_debug WHERE id='keep-debug'",
-      args: [],
-    })
-    expect(JSON.parse(String(debug[0]?.payload_json))).toEqual({
-      status: "complete",
-      request: { body: "raw request fixture" },
-      response: { body: "raw response fixture" },
-    })
+    expect(
+      await session.query({
+        sql: "SELECT name FROM sqlite_master WHERE name LIKE 'capi_debug%'",
+        args: [],
+      }),
+    ).toEqual([])
   })
 }
 
-test.each([2, 3])(
+test.each([2, 3, 4])(
   "migration removes Activity from populated schema %d and preserves retained state",
   async (version) => {
     const fixture = await createSchemaFixture()
@@ -278,7 +277,7 @@ test.each([2, 3])(
   },
 )
 
-test.each([2, 3])(
+test.each([2, 3, 4])(
   "encrypted schema %d backup validates discarded Activity and restores every retained table",
   async (version) => {
     const fixture = await createSchemaFixture()

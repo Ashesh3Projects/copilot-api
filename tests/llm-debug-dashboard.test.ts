@@ -1,4 +1,14 @@
-import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  expect,
+  mock,
+  test,
+} from "bun:test"
+
+import type { ModelFallbackDebugInfo } from "~/lib/model-fallback"
 
 import {
   AccountsService,
@@ -87,6 +97,10 @@ beforeEach(async () => {
   await service.create({ token: "github-token" }, context)
 })
 
+afterEach(async () => {
+  await clearLlmDebugLogs()
+})
+
 afterAll(async () => {
   for (const account of tokenPool.getAllAccounts())
     tokenPool.deleteAccount(account.id)
@@ -97,6 +111,15 @@ afterAll(async () => {
 })
 
 test("serves LLM debug logs through dashboard API", async () => {
+  const fallback: ModelFallbackDebugInfo = {
+    reason: "http_422",
+    sourceModel: "gpt-source",
+    fromModel: "gpt-source",
+    configuredTargetModel: "gpt-ui-alias",
+    targetModel: "gpt-ui",
+    cached: false,
+    hop: 1,
+  }
   const requestBody = `{ "input": "dashboard lookup", "api_key": "body-secret", "model": "gpt-ui" }`
   const responseBody = `{ "access_token": "response-secret", "ok": true }`
   const requestHeaders = {
@@ -109,6 +132,7 @@ test("serves LLM debug logs through dashboard API", async () => {
   }
   const url = "https://example.test/responses?api_key=query-secret"
   const id = startLlmDebugLog({
+    fallback,
     method: "POST",
     path: "/responses",
     requestBody,
@@ -127,10 +151,16 @@ test("serves LLM debug logs through dashboard API", async () => {
     headers: adminHeaders(adminSession, false),
   })
   expect(listResponse.status).toBe(200)
+  expect(listResponse.headers.get("cache-control")).toBe("no-store")
   const listBody = (await listResponse.json()) as {
-    entries: Array<{ id: string; requestPreview: string }>
+    entries: Array<{
+      fallback?: ModelFallbackDebugInfo
+      id: string
+      requestPreview: string
+    }>
   }
   expect(listBody.entries[0]?.id).toBe(id)
+  expect(listBody.entries[0]?.fallback).toEqual(fallback)
   expect(listBody.entries[0]?.requestPreview).toContain("dashboard lookup")
 
   const detailResponse = await server.request(
@@ -140,7 +170,9 @@ test("serves LLM debug logs through dashboard API", async () => {
     },
   )
   expect(detailResponse.status).toBe(200)
+  expect(detailResponse.headers.get("cache-control")).toBe("no-store")
   const detailBody = (await detailResponse.json()) as {
+    fallback?: ModelFallbackDebugInfo
     request: {
       body: string | null
       headers: Record<string, string>
@@ -151,6 +183,7 @@ test("serves LLM debug logs through dashboard API", async () => {
       headers: Record<string, string>
     }
   }
+  expect(detailBody.fallback).toEqual(fallback)
   expect(detailBody.request).toMatchObject({
     body: requestBody,
     headers: requestHeaders,
@@ -166,6 +199,7 @@ test("serves LLM debug logs through dashboard API", async () => {
     method: "DELETE",
   })
   expect(clearResponse.status).toBe(200)
+  expect(clearResponse.headers.get("cache-control")).toBe("no-store")
 
   const afterClearResponse = await server.request("/dashboard/api/llm-debug", {
     headers: adminHeaders(adminSession, false),
@@ -211,6 +245,55 @@ test("dashboard bundle ships the LLM debug UI", () => {
   expect(DASHBOARD_HTML).not.toContain("Quick Add: Nebius Qwen3 Embedding")
 })
 
+test("dashboard debug pagination serves distinct pages from memory", async () => {
+  const startedAtMs = Date.now()
+  const ids = Array.from({ length: 3 }, () =>
+    startLlmDebugLog({
+      method: "POST",
+      path: "/responses",
+      requestHeaders: {},
+      requestBody: "{}",
+      url: "https://example.test/responses",
+      startedAtMs,
+    }),
+  )
+    .sort()
+    .reverse()
+  const firstResponse = await server.request(
+    "/dashboard/api/llm-debug?limit=2",
+    {
+      headers: adminHeaders(adminSession, false),
+    },
+  )
+  const first = (await firstResponse.json()) as {
+    cursor: string
+    entries: Array<{ id: string }>
+  }
+  expect(first.entries.map((entry) => entry.id)).toEqual(ids.slice(0, 2))
+  const secondResponse = await server.request(
+    `/dashboard/api/llm-debug?limit=2&cursor=${encodeURIComponent(first.cursor)}`,
+    {
+      headers: adminHeaders(adminSession, false),
+    },
+  )
+  const second = (await secondResponse.json()) as {
+    cursor: string | null
+    entries: Array<{ id: string }>
+  }
+  expect(second.entries.map((entry) => entry.id)).toEqual(ids.slice(2))
+  expect(second.cursor).toBeNull()
+})
+
+test("dashboard rejects invalid debug pagination without caching the response", async () => {
+  for (const query of ["cursor=invalid", "limit=invalid", "limit=Infinity"]) {
+    const response = await server.request(`/dashboard/api/llm-debug?${query}`, {
+      headers: adminHeaders(adminSession, false),
+    })
+    expect(response.status).toBe(400)
+    expect(response.headers.get("cache-control")).toBe("no-store")
+  }
+})
+
 test("replays a chat completions debug log with fresh auth and parses SSE metadata", async () => {
   const id = startLlmDebugLog({
     method: "POST",
@@ -241,6 +324,7 @@ test("replays a chat completions debug log with fresh auth and parses SSE metada
   )
 
   expect(response.status).toBe(200)
+  expect(response.headers.get("cache-control")).toBe("no-store")
   const body = (await response.json()) as {
     finishReason: string
     responseId: string
@@ -272,6 +356,7 @@ test("rejects invalid replay requests", async () => {
     },
   )
   expect(missingResponse.status).toBe(404)
+  expect(missingResponse.headers.get("cache-control")).toBe("no-store")
 
   const embeddingsId = startLlmDebugLog({
     method: "POST",

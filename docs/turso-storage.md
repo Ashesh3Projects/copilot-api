@@ -2,9 +2,11 @@
 
 This checkout uses one selected database for runtime persistence. Accounts,
 provider secrets, settings, administrator and client credentials, usage, and
-bounded diagnostic history use the same schema in local SQLite and remote
-Turso. JSON remains an API/export format and an explicit legacy import source;
-it is no longer a parallel runtime store.
+routing history use the same schema in local SQLite and remote
+Turso. LLM Debug captures live only in process memory. JSON remains an
+API/export format and an explicit legacy import source; it is no longer a
+parallel runtime store. See the [table review](database-table-review.md) for
+each table's purpose and retention.
 
 Commands below use `bun src/main.ts` from a source checkout. An installed build
 exposes the same commands as `copilot-api`; the container entrypoint accepts
@@ -222,10 +224,14 @@ Restore preserves account IDs and client credential state while invalidating
 administrator sessions. Active bridge jobs, sockets, and connection-local
 conversation state do not become resumable through backup/restore.
 
-Schema-2 encrypted backups include gateway raw-secret records and validate each
-raw value against its metadata digest. Old schema-1 backups are rejected rather
-than silently restoring digest-only gateway access. Legacy imports that supply
-actual raw keys write both gateway records; digest-only values are not recovered.
+Schema-5 encrypted backups include gateway raw-secret records and validate each
+raw value against its metadata digest. They exclude LLM Debug captures and the
+retired debug generation metadata. Restore also accepts schema-2, schema-3, and schema-4 backups: it
+verifies the archive and skips obsolete `capi_debug` and `capi_activity` records and their generation
+metadata when restoring the remaining state. Existing backup files are not
+rewritten or erased. Old schema-1 backups are rejected rather than silently
+restoring digest-only gateway access. Legacy imports that supply actual raw
+keys write both gateway records; digest-only values are not recovered.
 
 An interrupted import or definitely rolled-back restore leaves an incomplete-transfer marker that
 blocks readiness. To abandon only that transfer, use its exact reported ID:
@@ -250,22 +256,30 @@ removing environment variables alone never transfers data.
 
 Committed usage minute/model buckets and lifetime counters are retained,
 including imported old usage. Routing-minute detail retains 24 hours. Activity
-retains seven days, up to 50,000 records or 64 MiB. Debug history retains
-successful captures for ten minutes and failed/interrupted captures for one
-hour, with caps of 2,000 records or 128 MiB. Count/byte pressure may remove older
-diagnostics before their time limit.
+and its stored history are removed in version 5.1.0.
 
-LLM Debug sanitizes credential-bearing URLs, headers, structured fields, and
-recognized literal secrets before enqueue. Capture bodies are bounded and may
-be omitted or redacted; such captures cannot be replayed. Eligible replay gets
-fresh server-side credentials. Prompts and non-secret response content can
-still be sensitive.
+LLM Debug keeps unfiltered original request/response text, headers, URLs and
+errors only in the serving process's memory. Successful captures expire ten
+minutes after `startedAt`; all other statuses expire one hour after `startedAt`.
+The store is capped at 2,000 entries and a shared 128 MiB working budget, with
+whole-entry eviction under pressure and one oversized entry allowed alone.
+Clear and restart remove captures. Raw streaming capture uses bounded read-ahead
+and an anonymous temporary buffer for large bodies, removed after collection.
+The read-only Turso container mounts `/tmp` as temporary storage. Captures never
+enter SQLite, Turso, or application backups. Fallback attempts display a badge
+and explain the HTTP 422 trigger, source, target, redirects, and cached routing.
 
-The pending telemetry queue is bounded to 2,000 records, 16 MiB, and five
-minutes. Outages or pressure can drop diagnostic bodies and records. The UI
-reports collection gaps and uncertain intervals; committed history is not
-silently represented as complete. Clearing diagnostic history advances its
-generation so pending old records cannot reappear.
+Migration `003` from the memory-only debug release is preserved unchanged.
+Migration `004` adds account integration IDs; migration `005` drops Activity.
+The current schema has 27 application tables. Existing external backup files
+and provider retention copies are not erased. Restore validates older archives
+and discards retired debug/Activity records before insertion.
+
+The pending durable telemetry queue is bounded to 2,000 records, 16 MiB, and
+five minutes. It carries usage, routing, and collection-gap records. Outages or
+pressure can drop records. Collection gaps remain explicit; raw debug has an
+independent process-local store.
+
 
 `GET /health` and `GET /health/health` are metadata-free liveness endpoints.
 `GET /health/ready` returns `200` for an available selected database with no

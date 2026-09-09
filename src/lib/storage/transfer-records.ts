@@ -8,8 +8,11 @@ import type {
 } from "~/lib/storage/types"
 
 import { StorageSchemaError } from "~/lib/storage/errors"
-import { initialTables } from "~/lib/storage/migrations/001-initial"
-import { currentTables, schemaThreeTables } from "~/lib/storage/schema"
+import {
+  currentSchemaVersion,
+  currentTables,
+  storageSchema,
+} from "~/lib/storage/schema"
 import { validateTransferScopes } from "~/lib/storage/transfer-validation"
 
 export interface TransferManifest {
@@ -41,35 +44,36 @@ const excluded = new Set([
 export const TRANSFER_TABLES = Object.keys(currentTables).filter(
   (table) => !excluded.has(table),
 )
-/** Decode old authenticated backups without allowing obsolete rows into storage. */
-export const LEGACY_TRANSFER_TABLES = Object.keys(schemaThreeTables).filter(
-  (table) => !excluded.has(table),
-)
+export function transferTablesForSchema(version: number): Array<string> {
+  return Object.keys(storageSchema(version).tables).filter(
+    (table) => !excluded.has(table),
+  )
+}
 export const REQUIRED_TRANSFER_METADATA_KEYS = [
   "store_id",
   "schema_version",
   "config_revision",
-  "history_debug_generation",
 ]
 const metadataKeys = [
   ...REQUIRED_TRANSFER_METADATA_KEYS,
   "history_routing_lifetime",
   "history_routing_started_at",
-  "history_debug_cleared_at",
 ]
 
-function definition(table: string, legacyActivity = false): string {
-  if (legacyActivity && table === "capi_activity")
-    return initialTables.capi_activity
-  if (!TRANSFER_TABLES.includes(table))
+function definition(
+  table: string,
+  version: number = currentSchemaVersion,
+): string {
+  const tables: Readonly<Record<string, string>> = storageSchema(version).tables
+  if (excluded.has(table) || !Object.hasOwn(tables, table))
     throw new StorageSchemaError("Unknown transfer table")
-  return currentTables[table as keyof typeof currentTables]
+  return tables[table]
 }
 export function transferColumns(
   table: string,
-  legacyActivity = false,
+  version: number = currentSchemaVersion,
 ): Array<{ name: string; type: string; declaration: string }> {
-  return definition(table, legacyActivity)
+  return definition(table, version)
     .split("\n")
     .flatMap((line) => {
       const match = /^\s*(\w+) (TEXT|INTEGER)\b(.*)/.exec(line)
@@ -81,22 +85,20 @@ export function transferColumns(
 export function transferKey(
   table: string,
   value: Record<string, unknown>,
-  legacyActivity = false,
+  version: number = currentSchemaVersion,
 ): string {
   return JSON.stringify(
-    transferKeyColumns(table, legacyActivity).map((name) => value[name]),
+    transferKeyColumns(table, version).map((name) => value[name]),
   )
 }
 function transferKeyColumns(
   table: string,
-  legacyActivity = false,
+  version: number = currentSchemaVersion,
 ): Array<string> {
-  const composite = /PRIMARY KEY \(([^)]+)\)/.exec(
-    definition(table, legacyActivity),
-  )
+  const composite = /PRIMARY KEY \(([^)]+)\)/.exec(definition(table, version))
   return composite ?
       composite[1].split(",").map((name) => name.trim())
-    : transferColumns(table, legacyActivity)
+    : transferColumns(table, version)
         .filter((column) => column.declaration.includes("PRIMARY KEY"))
         .map((column) => column.name)
 }
@@ -123,11 +125,11 @@ export function completeTransferRecord(
 // eslint-disable-next-line complexity -- Validate every field at the untrusted transfer boundary.
 export function validateTransferRecord(
   record: TransferRecord,
-  legacyActivity = false,
+  version: number = currentSchemaVersion,
 ): Record<string, SqlValue> {
   if (Object.keys(record).sort().join(",") !== "key,table,value")
     throw new StorageSchemaError("Invalid transfer record shape")
-  const columns = transferColumns(record.table, legacyActivity)
+  const columns = transferColumns(record.table, version)
   if (
     !record.value
     || typeof record.value !== "object"
@@ -171,23 +173,22 @@ export function validateTransferRecord(
         throw new StorageSchemaError("Invalid transferred timestamp")
     }
   }
-  if (record.key !== transferKey(record.table, value, legacyActivity))
+  if (record.key !== transferKey(record.table, value, version))
     throw new StorageSchemaError("Invalid transfer key")
   if (
     record.table === "capi_metadata"
-    && !isTransferMetadataKey(value.key, legacyActivity)
+    && (typeof value.key !== "string"
+      || (!metadataKeys.includes(value.key)
+        && !legacyMetadataKey(value.key, version)))
   )
     throw new StorageSchemaError("Invalid transferred metadata")
   return value as Record<string, SqlValue>
 }
-function isTransferMetadataKey(
-  key: JsonValue,
-  legacyActivity: boolean,
-): boolean {
-  if (typeof key !== "string") return false
-  if (metadataKeys.includes(key)) return true
+
+function legacyMetadataKey(key: string, version: number): boolean {
+  if (version === 2 && key === "history_debug_generation") return true
   return (
-    legacyActivity
+    version < 5
     && ["history_activity_cleared_at", "history_activity_generation"].includes(
       key,
     )
@@ -263,7 +264,7 @@ export async function assertEmptyTransferTarget(
       )
   }
   const marker = await session.query({
-    sql: "SELECT key FROM capi_metadata WHERE key NOT IN ('store_id','schema_version','config_revision','history_debug_generation') OR (key IN ('config_revision','history_debug_generation') AND value != '0')",
+    sql: "SELECT key FROM capi_metadata WHERE key NOT IN ('store_id','schema_version','config_revision','history_activity_generation') OR (key IN ('config_revision','history_activity_generation') AND value != '0')",
     args: [],
   })
   if (marker.length > 0)

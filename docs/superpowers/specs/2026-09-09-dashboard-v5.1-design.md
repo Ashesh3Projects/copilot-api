@@ -14,6 +14,10 @@ Settings remains one page unless the user chooses tabs. Group compact credential
 
 Retain original request/response body strings, headers and URLs without secret filtering or JSON/SSE reconstruction. Keep successful retention at ten minutes and unsuccessful retention at one hour. Capture must not alter or delay the client stream. Preserve true read/transport failure reporting; do not claim an incomplete capture is complete. Remove replay denial and warnings caused solely by redaction. Old already-redacted entries cannot be reconstructed. Other logs and sanitized configuration export keep their existing behavior.
 
+User followup: LLM Debug must label fallback-generated attempts with a warning/info badge and clear reason, source and resulting model; distinguish cached continuation from a new HTTP 422. Preserve pending/failed attempt metadata as well as successful responses.
+
+Upstream sync: PR119 merged memory-only debug storage to master as e9e06e6. Preserve this contract: no captured data in SQLite/Turso or backups, clear/restart discard captures, exact TTL timer removes idle captures. Large transient stream buffers may spill anonymously and close after collection. Upstream applied migration003 remains byte-for-byte unchanged; account override migration becomes004 and Activity removal005.
+
 ## Activity removal (user revision)
 
 The user explicitly removed Activity from scope as a feature and authorized deleting its storage. Remove the page, sidebar/registry entry, dashboard API, event recording and current database table. An additive migration drops existing activity history. Preserve unrelated usage/routing telemetry and LLM debug storage, capture, retention and generic process-run/shutdown correctness. Support older encrypted backups by discarding obsolete activity on restore while preserving all remaining data. Applied migrations stay immutable.

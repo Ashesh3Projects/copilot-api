@@ -429,8 +429,8 @@ and configuration exports keep their established ordinary client/log/Sentry
 controls. Header allowlisting and recursive scrubbing remain independent of
 body forwarding.
 
-Administrator-only LLM Debug stores raw request and response attempts in the
-selected database, including credentials and secret-bearing fields. Captured
+Administrator-only LLM Debug stores raw request and response attempts only in
+process memory, including credentials and secret-bearing fields. Captures never enter the database or application backups. Captured
 body text and headers are not filtered. Successful captures expire after ten minutes; failed
 or interrupted captures after one hour, with earlier capacity eviction possible.
 Replay requires a complete eligible capture and obtains fresh credentials.

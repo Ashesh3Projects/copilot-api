@@ -90,6 +90,8 @@ dashboardRoutes.get("/", (c) => {
 dashboardRoutes.route("/auth", dashboardAuthRoutes)
 
 dashboardRoutes.use("/api/*", async (c, next) => {
+  if (/\/api\/llm-debug(?:\/|$)/.test(c.req.path))
+    c.header("Cache-Control", "no-store")
   const mutating = !["GET", "HEAD", "OPTIONS"].includes(c.req.method)
   const session = await authenticateAdminRequest(c.req.raw, {
     requireCsrf: mutating,
