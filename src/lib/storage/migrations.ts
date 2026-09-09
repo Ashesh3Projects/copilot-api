@@ -7,14 +7,19 @@ import {
   StorageSchemaError,
 } from "~/lib/storage/errors"
 import {
-  initialIndexes,
   initialMigration,
   initialTables,
 } from "~/lib/storage/migrations/001-initial"
+import {
+  currentIndexes,
+  currentSchemaVersion,
+  currentTables,
+  storageMigrations,
+} from "~/lib/storage/schema"
 
-const checksum = createHash("sha256")
-  .update(JSON.stringify(initialMigration))
-  .digest("hex")
+const checksums = storageMigrations.map((migration) =>
+  createHash("sha256").update(JSON.stringify(migration)).digest("hex"),
+)
 const counterKeys = [
   "config_revision",
   "history_activity_generation",
@@ -39,7 +44,31 @@ async function applicationObjects(session: SqlSession) {
   })
 }
 
-async function validateSchema(session: SqlSession): Promise<void> {
+async function appliedVersion(session: SqlSession): Promise<number> {
+  const migrations = await session.query({
+    sql: "SELECT version, name, checksum FROM capi_schema_migrations ORDER BY version",
+    args: [],
+  })
+  if (
+    migrations.length === 0
+    || migrations.length > storageMigrations.length
+    || migrations.some((row, index) => {
+      const expected = storageMigrations[index]
+      return (
+        row.version !== expected.version
+        || row.name !== expected.name
+        || row.checksum !== checksums[index]
+      )
+    })
+  )
+    throw new StorageSchemaError("Unsupported or changed schema migration")
+  return migrations.length
+}
+
+async function validateSchema(
+  session: SqlSession,
+  version: number,
+): Promise<void> {
   const objects = await applicationObjects(session)
   const tables = new Set(
     objects.filter((row) => row.type === "table").map((row) => row.name),
@@ -48,21 +77,14 @@ async function validateSchema(session: SqlSession): Promise<void> {
     objects.filter((row) => row.type === "index").map((row) => row.name),
   )
   if (
-    Object.keys(initialTables).some((name) => !tables.has(name))
-    || Object.keys(initialIndexes).some((name) => !indexes.has(name))
+    Object.keys(version === 1 ? initialTables : currentTables).some(
+      (name) => !tables.has(name),
+    )
+    || Object.keys(currentIndexes).some((name) => !indexes.has(name))
   ) {
     throw new StorageSchemaError("Application schema is incomplete")
   }
-  const migrations = await session.query({
-    sql: "SELECT version, name, checksum FROM capi_schema_migrations ORDER BY version",
-    args: [],
-  })
-  if (
-    migrations.length !== 1
-    || migrations[0]?.version !== initialMigration.version
-    || migrations[0].name !== initialMigration.name
-    || migrations[0].checksum !== checksum
-  ) {
+  if ((await appliedVersion(session)) !== version) {
     throw new StorageSchemaError("Unsupported or changed schema migration")
   }
   const rows = await session.query({
@@ -71,7 +93,7 @@ async function validateSchema(session: SqlSession): Promise<void> {
   })
   const metadata = new Map(rows.map((row) => [row.key, row.value]))
   if (
-    metadata.get("schema_version") !== String(initialMigration.version)
+    metadata.get("schema_version") !== String(version)
     || typeof metadata.get("store_id") !== "string"
     || !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/.test(
       String(metadata.get("store_id")),
@@ -114,18 +136,39 @@ export async function migrateStorage(storage: Storage): Promise<void> {
           args: [
             initialMigration.version,
             initialMigration.name,
-            checksum,
+            checksums[0],
             Date.now(),
           ],
         })
       }
-      await validateSchema(session)
+      const version = await appliedVersion(session)
+      await validateSchema(session, version)
+      for (const migration of storageMigrations.slice(version)) {
+        for (const sql of migration.statements)
+          await session.execute({ sql, args: [] })
+        await session.execute({
+          sql: "INSERT INTO capi_schema_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)",
+          args: [
+            migration.version,
+            migration.name,
+            checksums[migration.version - 1],
+            Date.now(),
+          ],
+        })
+        await session.execute({
+          sql: "UPDATE capi_metadata SET value=? WHERE key='schema_version'",
+          args: [String(migration.version)],
+        })
+      }
+      await validateSchema(session, currentSchemaVersion)
     })
   } catch (error) {
     if (!(error instanceof StorageCommitUnknownError)) throw error
     // The adapter opens a fresh read session; no DDL is replayed after ambiguity.
     try {
-      await storage.read(validateSchema)
+      await storage.read((session) =>
+        validateSchema(session, currentSchemaVersion),
+      )
     } catch {
       throw error
     }

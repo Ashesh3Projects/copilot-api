@@ -38,6 +38,14 @@ export class StorageSchemaError extends Error {
   }
 }
 
+export class StorageNotFoundError extends Error {
+  readonly code = "storage_not_found"
+  constructor(message = "Requested record does not exist") {
+    super(message)
+    this.name = "StorageNotFoundError"
+  }
+}
+
 export class StorageCommitUnknownError extends Error {
   readonly code = "storage_commit_unknown"
   readonly operationId?: string
@@ -58,6 +66,7 @@ export function storageError(error: unknown, rolledBack = false): Error {
     error instanceof StorageUnavailableError
     || error instanceof StorageConflictError
     || error instanceof StorageSchemaError
+    || error instanceof StorageNotFoundError
     || error instanceof StorageCommitUnknownError
   )
     return error

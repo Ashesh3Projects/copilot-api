@@ -6,45 +6,54 @@ import { Heading, Text } from "@astryxdesign/core/Text"
 import { TextInput } from "@astryxdesign/core/TextInput"
 import { useState } from "react"
 
-import { del, get, post, put } from "../lib/api"
-import { gatewayCreationFeedback } from "../lib/gateway-creation"
+import { api, get, put } from "../lib/api"
+import { generateGatewayKey } from "../lib/gateway-creation"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
 import { ConfirmButton } from "./common"
+import { SecretInput } from "./SecretInput"
+import { SecretValue } from "./SecretValue"
 
 interface Credential {
   id: string
   label: string
   createdAt: number
   revokedAt: number | null
+  maskedValue: string
 }
 const root = "/dashboard/api/credentials"
 const load = async () => {
   const [gateway, groq] = await Promise.all([
-    get<{ credentials: Array<Credential> }>(`${root}/gateway`),
+    get<{ credentials: Array<Credential>; revision: number }>(
+      `${root}/gateway`,
+    ),
     get<{ apiKeyConfigured: boolean }>(`${root}/groq`),
   ])
-  return { credentials: gateway.credentials, groq: groq.apiKeyConfigured }
+  return {
+    credentials: gateway.credentials,
+    revision: gateway.revision,
+    groq: groq.apiKeyConfigured,
+  }
 }
 export function StoredCredentials() {
   const { data, error, reload } = useAsyncData(load, [])
   const toast = useToast()
   const [label, setLabel] = useState("")
-  const [created, setCreated] = useState<string>()
-  const [lostKey, setLostKey] = useState<{ id: string; label: string }>()
+  const [credential, setCredential] = useState("")
+  const [revealGeneration, setRevealGeneration] = useState(0)
   const [groq, setGroq] = useState("")
   const [busy, setBusy] = useState(false)
   async function run(work: () => Promise<void>) {
     setBusy(true)
     try {
       await work()
-      reload()
     } catch (caught) {
       toast.error(
         caught instanceof Error ? caught.message : "Credential update failed",
       )
-      reload()
     } finally {
+      setRevealGeneration((value) => value + 1)
+      reload()
       setBusy(false)
     }
   }
@@ -61,8 +70,8 @@ export function StoredCredentials() {
         <VStack gap={3}>
           <Heading level={3}>Gateway credentials</Heading>
           <Text color="secondary">
-            Use these keys in API clients and dashboard sign-in. Newly created
-            keys are displayed once.
+            Use these keys in API clients and dashboard sign-in. Add your own
+            key or generate one, and reveal or copy stored keys whenever needed.
           </Text>
           <HStack gap={2} wrap="wrap" vAlign="end">
             <TextInput
@@ -71,83 +80,82 @@ export function StoredCredentials() {
               onChange={setLabel}
               placeholder="Laptop, automation…"
             />
+            <SecretInput
+              label="Key"
+              value={credential}
+              onChange={setCredential}
+              placeholder="Enter a custom API key"
+              isDisabled={busy}
+              isRequired
+            />
             <Button
-              label="Create key"
+              label="Generate"
               variant="secondary"
-              isDisabled={busy || !label.trim()}
+              isDisabled={busy}
+              onClick={() => setCredential(generateGatewayKey())}
+            />
+            <Button
+              label="Add key"
+              variant="primary"
+              isDisabled={busy || !data || !label.trim() || !credential.trim()}
               onClick={() =>
                 void run(async () => {
-                  const result = await post<{
-                    id: string
-                    label: string
-                    credential?: string
-                  }>(`${root}/gateway`, { label })
-                  const feedback = gatewayCreationFeedback(result)
-                  setCreated(feedback.credential)
-                  if (feedback.lost) setLostKey(feedback.lost)
+                  await api(
+                    "POST",
+                    `${root}/gateway`,
+                    { label, credential },
+                    {
+                      expectedRevision: data?.revision,
+                    },
+                  )
                   setLabel("")
+                  setCredential("")
+                  toast.success("Key added")
                 })
               }
             />
           </HStack>
-          {lostKey ?
-            <Banner
-              status="warning"
-              title="The key was created, but its value was not received"
-              description={`The value for "${lostKey.label}" cannot be recovered. Create and save a replacement, then revoke this unused key. Existing clients are unchanged.`}
-              endContent={
-                <ConfirmButton
-                  label="Revoke unused key"
-                  confirmTitle="Revoke the key whose value was lost"
-                  confirmDescription="Only this newly created key is revoked. Keep at least one other active gateway key."
-                  onConfirm={() =>
-                    run(async () => {
-                      await del(`${root}/gateway/${lostKey.id}`)
-                      setLostKey(undefined)
-                      toast.success("Unused key revoked")
-                    })
-                  }
-                />
-              }
-            />
-          : null}
-          {created ?
-            <VStack gap={2}>
-              <Banner
-                status="warning"
-                title="Save this key now"
-                description="It cannot be displayed again after you dismiss it."
-              />
-              <TextInput
-                label="New gateway key"
-                value={created}
-                onChange={() => {}}
-              />
-              <Button
-                label="I saved it"
-                variant="secondary"
-                onClick={() => setCreated(undefined)}
-              />
-            </VStack>
-          : null}
           {data?.credentials
             .filter((key) => key.revokedAt === null)
             .map((key) => (
-              <HStack key={key.id} gap={2} hAlign="between" wrap="wrap">
-                <Text>{key.label}</Text>
+              <HStack
+                key={`${key.id}:${data.revision}:${revealGeneration}`}
+                gap={3}
+                hAlign="between"
+                vAlign="center"
+                wrap="wrap"
+              >
+                <SecretValue
+                  label={key.label}
+                  maskedValue={key.maskedValue}
+                  revealPath={`${root}/gateway/${encodeURIComponent(key.id)}/reveal`}
+                />
                 <ConfirmButton
-                  label="Revoke"
-                  confirmTitle="Revoke gateway credential"
-                  confirmDescription="Clients using this key lose access. The last active gateway credential cannot be revoked."
+                  label="Delete"
+                  confirmTitle="Delete gateway key"
+                  confirmDescription="This permanently removes the key. API clients using it will lose access."
+                  isDisabled={busy || data.credentials.length <= 1}
                   onConfirm={() =>
                     run(async () => {
-                      await del(`${root}/gateway/${key.id}`)
-                      toast.success("Credential revoked")
+                      await api(
+                        "DELETE",
+                        `${root}/gateway/${encodeURIComponent(key.id)}`,
+                        undefined,
+                        {
+                          expectedRevision: data.revision,
+                        },
+                      )
+                      toast.success("Key deleted")
                     })
                   }
                 />
               </HStack>
             ))}
+          {data?.credentials.length === 1 ?
+            <Text type="supporting" color="secondary">
+              Create a replacement before deleting your last gateway key.
+            </Text>
+          : null}
         </VStack>
       </Card>
       <Card>

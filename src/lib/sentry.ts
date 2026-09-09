@@ -16,6 +16,7 @@ import {
 } from "~/lib/request-diagnostics"
 import { getRequestId } from "~/lib/request-session"
 import { getRoutingAffinity } from "~/lib/routing-affinity"
+import { isCredentialControlTelemetry } from "~/lib/sentry-credential-controls"
 import { scrubCodexPluginSearchData } from "~/lib/sentry-plugin-search"
 
 import packageJson from "../../package.json" with { type: "json" }
@@ -613,6 +614,7 @@ function scrubNestedHeaders(
 
 function scrubSensitiveData<T>(event: T): T | null {
   if (isRecord(event)) {
+    if (isCredentialControlTelemetry(event, ownDataValue)) return null
     if (scrubNestedHeaders(event) === UNCERTAIN_SCRUB_RESULT) return null
     if (
       scrubStatsigClientKeyDataSafely(event, {

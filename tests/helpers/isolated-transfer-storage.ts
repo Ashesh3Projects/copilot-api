@@ -1,18 +1,19 @@
-/* eslint-disable max-lines-per-function, complexity -- One test-only closure owns the exact namespace and cleanup capability. */
+/* eslint-disable max-lines-per-function -- One test-only closure owns the exact namespace and cleanup capability. */
 import { randomUUID } from "node:crypto"
 
 import type { SqlSession, SqlStatement, Storage } from "~/lib/storage/types"
 
 import { migrateStorage } from "~/lib/storage/migrations"
 import {
-  initialIndexes,
-  initialTables,
-} from "~/lib/storage/migrations/001-initial"
+  currentIndexes,
+  currentTables,
+  storageMigrations,
+} from "~/lib/storage/schema"
 
 const applicationObjectsSql =
   "SELECT name, type FROM sqlite_master WHERE substr(name, 1, 5) = 'capi_'"
-const tableNames = Object.keys(initialTables)
-const indexNames = Object.keys(initialIndexes)
+const tableNames = Object.keys(currentTables)
+const indexNames = Object.keys(currentIndexes)
 
 /** No unprefixed application SQL reaches the supplied backend. */
 export function isolatedNamespace(underlying: Storage) {
@@ -161,14 +162,17 @@ export function isolatedNamespace(underlying: Storage) {
       }
       const migrations = await storage.read((session) =>
         session.query({
-          sql: "SELECT version,name FROM capi_schema_migrations",
+          sql: "SELECT version,name FROM capi_schema_migrations ORDER BY version",
           args: [],
         }),
       )
       if (
-        migrations.length !== 1
-        || migrations[0]?.version !== 1
-        || migrations[0]?.name !== "initial"
+        migrations.length !== storageMigrations.length
+        || migrations.some(
+          (row, index) =>
+            row.version !== storageMigrations[index].version
+            || row.name !== storageMigrations[index].name,
+        )
       )
         throw new Error("Invalid test migration ownership")
       // Initial DDL is in dependency order; reverse order preserves FK enforcement.

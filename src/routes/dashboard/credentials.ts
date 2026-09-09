@@ -1,10 +1,12 @@
 import { Hono, type Context } from "hono"
 
+import { normalizeGatewayCredential } from "~/lib/credential-value"
 import { createCredentialsRepository } from "~/lib/storage/credentials-repository"
 import { getSettingsActorId } from "~/lib/storage/domain-settings"
 import {
   StorageCommitUnknownError,
   StorageConflictError,
+  StorageNotFoundError,
   StorageSchemaError,
   StorageUnavailableError,
 } from "~/lib/storage/errors"
@@ -68,6 +70,8 @@ function handleError(error: Error, c: Context) {
     )
   if (error instanceof StorageConflictError)
     return c.json({ error: error.message, code: error.code }, 409)
+  if (error instanceof StorageNotFoundError)
+    return c.json({ error: error.message, code: error.code }, 404)
   if (error instanceof TypeError || error instanceof SyntaxError)
     return c.json(
       { error: error instanceof SyntaxError ? "Invalid JSON" : error.message },
@@ -76,8 +80,7 @@ function handleError(error: Error, c: Context) {
   return c.json({ error: "Credential operation failed" }, 500)
 }
 
-/** Mounted after administrator session and CSRF validation. */
-export function createDashboardCredentialRoutes(): Hono {
+function administratorSecretRoutes(): Hono {
   const routes = new Hono()
   routes.use("*", async (c, next) => {
     c.header("Cache-Control", "no-store")
@@ -86,6 +89,12 @@ export function createDashboardCredentialRoutes(): Hono {
     await next()
   })
   routes.onError(handleError)
+  return routes
+}
+
+/** Mounted after administrator session and CSRF validation. */
+export function createDashboardCredentialRoutes(): Hono {
+  const routes = administratorSecretRoutes()
   routes.get("/gateway", async (c) => {
     const storage = getStorageRuntime().storage
     return c.json(await createCredentialsRepository(storage).listWithRevision())
@@ -98,21 +107,30 @@ export function createDashboardCredentialRoutes(): Hono {
       || input.label.length > 200
     )
       throw new TypeError("A gateway credential label is required")
-    const context = await mutation(c, "gateway.create", { label: input.label })
+    const value = {
+      label: input.label,
+      credential: normalizeGatewayCredential(input.credential),
+    }
+    const context = await mutation(c, "gateway.create", value)
     const result = await createCredentialsRepository(
       getStorageRuntime().storage,
-    ).create(input.label, context)
-    return c.json(
-      { ...result.value, revision: result.revision },
-      result.value.credential ? 201 : 200,
-    )
+    ).create(value, context)
+    return c.json({ ...result.value, revision: result.revision }, 201)
+  })
+  routes.post("/gateway/:id/reveal", async (c) => {
+    const result = await createCredentialsRepository(
+      getStorageRuntime().storage,
+    ).reveal(c.req.param("id"))
+    if (!result)
+      throw new StorageNotFoundError("Gateway credential does not exist")
+    return c.json(result)
   })
   routes.delete("/gateway/:id", async (c) => {
     const id = c.req.param("id")
-    const context = await mutation(c, "gateway.revoke", { id })
+    const context = await mutation(c, "gateway.delete", { id })
     const result = await createCredentialsRepository(
       getStorageRuntime().storage,
-    ).revoke(id, context)
+    ).remove(id, context)
     return c.json({ ...result.value, revision: result.revision })
   })
   routes.get("/groq", async (c) => c.json(await groqStatus()))
@@ -135,6 +153,19 @@ export function createDashboardCredentialRoutes(): Hono {
     )
     await runtime.snapshot.refreshIfChanged()
     return c.json(await groqStatus())
+  })
+  return routes
+}
+
+export function createDashboardProviderSecretRoutes(): Hono {
+  const routes = administratorSecretRoutes()
+  routes.post("/:id/reveal", async (c) => {
+    const result = await createProvidersRepository(
+      getStorageRuntime().storage,
+    ).reveal(c.req.param("id"))
+    if (!result)
+      throw new StorageNotFoundError("Custom provider does not exist")
+    return c.json(result)
   })
   return routes
 }

@@ -20,6 +20,14 @@ export interface ProviderInput extends CustomProviderConfig {
   enabled?: boolean
   clearApiKey?: boolean
   clearHeaders?: boolean
+  replaceHeaders?: boolean
+}
+
+export interface ProviderSecrets {
+  id: string
+  apiKey: string | null
+  headers: Record<string, string>
+  revision: number
 }
 
 export interface ProviderSummary
@@ -54,6 +62,7 @@ const providerInputSchema = metadataSchema.extend({
   enabled: z.boolean().optional(),
   clearApiKey: z.boolean().optional(),
   clearHeaders: z.boolean().optional(),
+  replaceHeaders: z.boolean().optional(),
 })
 
 function parseInput(input: unknown): ProviderInput {
@@ -63,6 +72,13 @@ function parseInput(input: unknown): ProviderInput {
       "Invalid custom provider configuration; use stored credentials instead of apiKeyEnv",
     )
   const value = result.data
+  if (
+    value.replaceHeaders
+    && (value.clearHeaders || value.headers === undefined)
+  )
+    throw new TypeError(
+      "Header replacement requires a header map and cannot also clear headers",
+    )
   if (
     (value.clearApiKey && value.apiKey?.trim())
     || (value.clearHeaders
@@ -238,9 +254,9 @@ function mergedProviderHeaders(
       throw new StorageSchemaError("Invalid provider headers")
     }
   }
-  if (input.clearHeaders) headers = {}
+  if (input.clearHeaders || input.replaceHeaders) headers = {}
   for (const [name, value] of Object.entries(input.headers ?? {})) {
-    if (!value.trim()) continue
+    if (!input.replaceHeaders && !value.trim()) continue
     const canonicalName = name.toLowerCase()
     headers = Object.fromEntries(
       Object.entries(headers).filter(
@@ -310,6 +326,22 @@ export function createProvidersRepository(storage: Storage) {
         providers: await listProviderSummaries(session),
         revision: await readStoreRevision(session),
       }))
+    },
+    async reveal(id: string): Promise<ProviderSecrets | null> {
+      return storage.read(async (session) => {
+        const rows = await session.query({
+          sql: `${providerSelect} AND p.id=?`,
+          args: [id],
+        })
+        if (!rows[0]) return null
+        const provider = decodeProvider(rows[0])
+        return {
+          id: provider.id,
+          apiKey: provider.apiKey ?? null,
+          headers: provider.headers ?? {},
+          revision: await readStoreRevision(session),
+        }
+      })
     },
     async upsert(input: ProviderInput, context: MutationContext) {
       const detached = parseInput(input)

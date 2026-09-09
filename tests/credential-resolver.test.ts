@@ -21,6 +21,7 @@ import { state } from "../src/lib/state"
 import {
   credentialDigest,
   createCredentialsRepository,
+  insertGatewayCredential,
 } from "../src/lib/storage/credentials-repository"
 import { getStoreRevision } from "../src/lib/storage/operations"
 import { createAuthStorageFixture } from "./helpers/auth-storage"
@@ -38,14 +39,11 @@ beforeEach(async () => {
   setOAuthStoreForTest(store)
   oldEnv = process.env.COPILOT_INFERENCE_CREDENTIAL_SHA256S
   await fixture.storage.transaction(async (sql) => {
-    await sql.execute({
-      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
-      args: [
-        "fixture-gateway",
-        credentialDigest("gateway-secret"),
-        "Gateway",
-        Date.now(),
-      ],
+    await insertGatewayCredential(sql, {
+      id: "fixture-gateway",
+      credential: "gateway-secret",
+      label: "Gateway",
+      createdAt: Date.now(),
     })
   })
 })
@@ -178,9 +176,11 @@ test("digest literals cannot authenticate even when they collide with gateway ra
   const literal = credentialDigest("inference-only-secret")
   await inference("inference-only-secret")
   await fixture.storage.transaction(async (sql) => {
-    await sql.execute({
-      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
-      args: ["literal-key", credentialDigest(literal), "Literal", Date.now()],
+    await insertGatewayCredential(sql, {
+      id: "literal-key",
+      credential: literal,
+      label: "Literal",
+      createdAt: Date.now(),
     })
   })
   expect(await resolveCredential(literal)).toBeNull()
@@ -210,7 +210,7 @@ test("preserves internal bearer whitespace for inference classification", async 
   expect(await resolveCredential("inference secret")).toBeNull()
 })
 
-test("gateway create returns its secret once, list redacts it and last-key revoke is rejected", async () => {
+test("custom gateway keys remain revealable across restart and last-key deletion is rejected", async () => {
   const repo = createCredentialsRepository(fixture.storage)
   const context = {
     actorId: "admin:fixture",
@@ -219,15 +219,16 @@ test("gateway create returns its secret once, list redacts it and last-key revok
     inputDigest: "create-key",
     expectedRevision: await getStoreRevision(fixture.storage),
   }
-  const created = await repo.create("Laptop", context)
-  expect(created.value.credential).toBeString()
-  const raw = created.value.credential
-  if (!raw) throw new Error("Gateway fixture did not issue credential")
+  const raw = "fixture-custom-laptop-gateway"
+  const input = { label: "Laptop", credential: raw }
+  const created = await repo.create(input, context)
+  expect(created.value.maskedValue).toBe("fixtu...teway")
   expect(await resolveCredential(raw)).toMatchObject({
     kind: "gateway",
   })
-  const replayed = await repo.create("Laptop", context)
-  expect(replayed.value.credential).toBeUndefined()
+  const replayed = await repo.create(input, context)
+  expect(replayed).toEqual(created)
+  expect(await repo.reveal(created.value.id)).toMatchObject({ credential: raw })
   expect(JSON.stringify(await repo.list())).not.toContain(raw)
   expect(JSON.stringify(await repo.list())).not.toContain("digest")
   const markers = await fixture.storage.read((sql) =>
@@ -237,23 +238,52 @@ test("gateway create returns its secret once, list redacts it and last-key revok
     }),
   )
   expect(JSON.stringify(markers)).not.toContain(raw)
-  await repo.revoke("fixture-gateway", {
+  await repo.remove("fixture-gateway", {
     ...context,
     operationId: randomUUID(),
-    kind: "gateway.revoke",
+    kind: "gateway.delete",
     expectedRevision: created.revision,
   })
   expect(await resolveCredential("gateway-secret")).toBeNull()
   await fixture.restart()
   expect(await resolveCredential(raw)).not.toBeNull()
   await expect(
-    repo.revoke(created.value.id, {
+    repo.remove(created.value.id, {
       ...context,
       operationId: randomUUID(),
-      kind: "gateway.revoke",
+      kind: "gateway.delete",
       expectedRevision: await getStoreRevision(fixture.storage),
     }),
   ).rejects.toThrow("last gateway")
+})
+
+test("digest-only gateway records never authenticate or appear as usable keys", async () => {
+  const raw = "fixture-digest-only-gateway"
+  await fixture.storage.atomicBatch([
+    {
+      sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES('digest-only',?,'Digest only',0)",
+      args: [credentialDigest(raw)],
+    },
+  ])
+  const repository = createCredentialsRepository(fixture.storage)
+  expect(await resolveGatewayCredential(raw)).toBeNull()
+  expect(await repository.reveal("digest-only")).toBeNull()
+  expect((await repository.list()).map((key) => key.id)).not.toContain(
+    "digest-only",
+  )
+})
+
+test("a gateway metadata/raw mismatch cannot authenticate", async () => {
+  await fixture.storage.atomicBatch([
+    {
+      sql: "UPDATE capi_gateway_secrets SET secret_value=? WHERE credential_id=?",
+      args: ["fixture-wrong-value", "fixture-gateway"],
+    },
+  ])
+  expect(await resolveGatewayCredential("gateway-secret")).toBeNull()
+  await expect(
+    createCredentialsRepository(fixture.storage).reveal("fixture-gateway"),
+  ).rejects.toMatchObject({ code: "storage_schema" })
 })
 
 test("fresh indexed reads observe revocation and lookup errors stay typed", async () => {

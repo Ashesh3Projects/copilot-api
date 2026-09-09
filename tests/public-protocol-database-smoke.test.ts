@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { mergeConfigWithDefaults } from "~/lib/config"
-import { credentialDigest } from "~/lib/storage/credentials-repository"
+import { insertGatewayCredential } from "~/lib/storage/credentials-repository"
 import { initializeStorageRuntime } from "~/lib/storage/runtime"
 import { createHistoryRuntime } from "~/lib/telemetry-writer"
 
@@ -14,17 +14,14 @@ test("real public protocols and WebSocket next-turn revocation use database stat
     await initializeStorageRuntime(fixture)
     await mergeConfigWithDefaults()
     history = await createHistoryRuntime(fixture.storage, { autoFlush: false })
-    await fixture.storage.atomicBatch([
-      {
-        sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES(?,?,?,?)",
-        args: [
-          "public-smoke",
-          credentialDigest("public-smoke-key"),
-          "fixture",
-          Date.now(),
-        ],
-      },
-    ])
+    await fixture.storage.transaction((session) =>
+      insertGatewayCredential(session, {
+        id: "public-smoke",
+        credential: "public-smoke-key",
+        label: "fixture",
+        createdAt: Date.now(),
+      }),
+    )
     const result = await smokePublicProtocols(
       fixture.storage,
       "public-smoke-key",

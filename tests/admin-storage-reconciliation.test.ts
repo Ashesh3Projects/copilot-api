@@ -20,7 +20,7 @@ import { createAuthStorageFixture } from "./helpers/auth-storage"
 
 let fixture: Awaited<ReturnType<typeof createAuthStorageFixture>>
 const password = "administrator password"
-const gateway = "initial gateway key"
+const gateway = "initial-gateway-key"
 beforeEach(async () => {
   fixture = await createAuthStorageFixture()
 })
@@ -80,7 +80,7 @@ test.each(["hex", "base64url"] as const)(
       ),
     ).toEqual([{ count: 0 }])
     const fresh = await setupAdminAuth(
-      "different initial gateway",
+      "different-initial-gateway",
       password,
       code,
     )

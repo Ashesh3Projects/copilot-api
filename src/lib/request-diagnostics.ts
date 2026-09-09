@@ -148,7 +148,17 @@ export function isGoogleModelActionRequest(
  * Unknown actions and paths that cannot reach the mounted Google handler must
  * be classified before debug logging considers cloning or reading the body.
  */
+export function isCredentialControlRequest(reference: string): boolean {
+  const path = reference
+    .replace(/^[A-Z]+\s+/, "")
+    .replace(/^https?:\/\/[^/]+/, "")
+  return /^\/dashboard\/(?:auth(?:[/?#]|$)|api\/(?:credentials|custom-providers)(?:[/?#]|$))/.test(
+    path,
+  )
+}
+
 export function shouldOmitRequestBodyFromDiagnostics(path: string): boolean {
+  if (isCredentialControlRequest(path)) return true
   if (/^\/v1\/audio\/transcriptions\/?(?:[?#]|$)/.test(path)) return true
   if (/^\/v1\/codex\/auth\/refresh\/?(?:[?#]|$)/.test(path)) return true
   if (!isGoogleModelActionPath(path)) return false

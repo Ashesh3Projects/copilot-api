@@ -28,7 +28,7 @@ export async function prepareSmokeDatabase(input: {
   )
   const { mergeConfigWithDefaults } = await import("~/lib/config")
   const { TokenPool } = await import("~/lib/token-pool")
-  const { credentialDigest, insertGatewayCredential } = await import(
+  const { insertGatewayCredential } = await import(
     "~/lib/storage/credentials-repository"
   )
   const runtime = await initializeStorageRuntime({
@@ -57,7 +57,7 @@ export async function prepareSmokeDatabase(input: {
     await runtime.storage.transaction((session) =>
       insertGatewayCredential(session, {
         id: randomUUID(),
-        digest: credentialDigest(input.gatewayKey),
+        credential: input.gatewayKey,
         label: "Nightly smoke",
         createdAt: Date.now(),
       }),

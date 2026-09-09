@@ -5,6 +5,7 @@ import {
   timingSafeEqual,
 } from "node:crypto"
 
+import { isStoredGatewayCredential } from "~/lib/credential-value"
 import {
   createAdminRepository,
   type AdminSessionRecord,
@@ -193,7 +194,7 @@ export async function setupAdminAuth(
     return { error: "Administrator authentication is already configured" }
   if (
     !setupCode
-    || !gatewayKey.trim()
+    || !isStoredGatewayCredential(gatewayKey.trim())
     || safeEqual(gatewayKey.trim(), setupCode)
     || (await isConfiguredInferenceCredential(gatewayKey.trim()))
   )

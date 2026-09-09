@@ -109,6 +109,49 @@ test("explicit clear deletes provider secrets without removing models", async ()
   expect(snapshot.providers[0]?.models[0]?.aliases).toEqual(["alias"])
 })
 
+test("explicit header replacement removes absent rows and permits empty stored values", async () => {
+  await repository.upsert(provider, await context(provider))
+  const replacement = {
+    ...provider,
+    apiKey: undefined,
+    replaceHeaders: true,
+    headers: { "X-New": "new-secret", "X-Empty": "" },
+  }
+  await repository.upsert(replacement, await context(replacement))
+  expect(
+    (await loadCustomProviderSnapshot(fixture.storage)).providers[0]?.headers,
+  ).toEqual(replacement.headers)
+  const cleared = { ...replacement, headers: {} }
+  await repository.upsert(cleared, await context(cleared))
+  expect(
+    (await loadCustomProviderSnapshot(fixture.storage)).providers[0]?.headers,
+  ).toBeUndefined()
+})
+
+test("explicit provider reveal returns stored secrets and one revision without changing metadata", async () => {
+  await repository.upsert(provider, await context(provider))
+  const before = await repository.listPage()
+  expect(await repository.reveal(provider.id)).toEqual({
+    id: provider.id,
+    apiKey: provider.apiKey,
+    headers: provider.headers,
+    revision: before.revision,
+  })
+  expect(await repository.listPage()).toEqual(before)
+  const disabled = { ...provider, enabled: false }
+  await repository.upsert(disabled, await context(disabled))
+  expect(await repository.reveal(provider.id)).toMatchObject({
+    apiKey: provider.apiKey,
+    headers: provider.headers,
+  })
+  await repository.remove(
+    provider.id,
+    await context(provider.id, "provider.remove"),
+  )
+  expect(await repository.reveal(provider.id)).toBeNull()
+  expect(await repository.reveal("missing-provider")).toBeNull()
+})
+
 test("invalid inputs and failed commits preserve metadata and secret", async () => {
   await repository.upsert(provider, await context(provider))
   const bad = { ...provider, apiKeyEnv: "FIXTURE_PROVIDER_ENV" }

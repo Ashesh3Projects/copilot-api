@@ -130,6 +130,10 @@ export async function registerGatewayCredential(key: string): Promise<void> {
       sql: "INSERT OR IGNORE INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
       args: [`integration:${digest}`, digest, "Integration test", Date.now()],
     })
+    await session.execute({
+      sql: "INSERT OR IGNORE INTO capi_gateway_secrets(credential_id,secret_value,updated_at) VALUES(?,?,?)",
+      args: [`integration:${digest}`, key, Date.now()],
+    })
   })
 }
 
