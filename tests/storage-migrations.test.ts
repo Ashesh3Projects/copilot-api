@@ -36,6 +36,7 @@ test("fresh schema includes auth, settings and history with revision zero", asyn
     "provider_secrets",
     "service_secrets",
     "gateway_credentials",
+    "gateway_secrets",
     "inference_credentials",
     "ip_allowlist",
     "admin",
@@ -91,12 +92,13 @@ test("repeated migration preserves store identity and committed data", async () 
 test.each([
   "UPDATE capi_schema_migrations SET checksum = 'altered'",
   "UPDATE capi_schema_migrations SET name = 'altered'",
-  "UPDATE capi_schema_migrations SET version = 999",
+  "UPDATE capi_schema_migrations SET version = 999 WHERE version = 2",
   "DELETE FROM capi_metadata WHERE key = 'config_revision'",
   "UPDATE capi_metadata SET value = '-1' WHERE key = 'config_revision'",
   "UPDATE capi_metadata SET value = '01' WHERE key = 'config_revision'",
   "DELETE FROM capi_usage_lifetime",
   "DROP TABLE capi_settings",
+  "DROP TABLE capi_gateway_secrets",
 ])(
   "incompatible or incomplete persisted schema fails closed: %s",
   async (sql) => {

@@ -14,12 +14,13 @@ import { Switch } from "@astryxdesign/core/Switch"
 import { pixel, proportional } from "@astryxdesign/core/Table"
 import { Heading, Text } from "@astryxdesign/core/Text"
 import { TextInput } from "@astryxdesign/core/TextInput"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 
 import type {
   CustomProvider,
   CustomProviderModel,
   CustomProviderModelKind,
+  CustomProviderSecrets,
 } from "../lib/types"
 
 import {
@@ -31,9 +32,11 @@ import {
   RowActions,
 } from "../components/common"
 import { Page } from "../components/Page"
+import { SecretInput } from "../components/SecretInput"
 import { PencilIcon, PlugIcon, PlusIcon, Trash2Icon } from "../icons"
 import { ApiError, api, get } from "../lib/api"
 import { providerSecretPatch } from "../lib/provider-form"
+import { createSecretRequestGuard } from "../lib/secret-request-guard"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
 
@@ -118,19 +121,22 @@ function modelToFormRow(model: CustomProviderModel): ModelFormRow {
   }
 }
 
-function formFromProvider(provider: CustomProvider): ProviderFormState {
+function formFromProvider(
+  provider: CustomProvider,
+  secrets?: CustomProviderSecrets,
+): ProviderFormState {
   return {
     id: provider.id,
     name: provider.name,
     baseUrl: provider.baseUrl,
-    apiKey: "",
+    apiKey: secrets?.apiKey ?? "",
     enabled: provider.enabled,
     clearApiKey: false,
     clearHeaders: false,
-    headers: provider.headerNames.map((key) => ({
+    headers: Object.entries(secrets?.headers ?? {}).map(([key, value]) => ({
       rowId: makeRowId(),
       key,
-      value: "",
+      value,
     })),
     passReasoningEffort: provider.passReasoningEffort ?? false,
     models:
@@ -184,23 +190,79 @@ export default function CustomProvidersScreen() {
   const [formRevision, setFormRevision] = useState<number>()
   const [editingId, setEditingId] = useState<string | null>(null)
   const [isSaving, setIsSaving] = useState(false)
+  const [secretLoading, setSecretLoading] = useState(false)
+  const [originalSecrets, setOriginalSecrets] =
+    useState<CustomProviderSecrets>()
+  const [formInstance, setFormInstance] = useState(0)
+  const [requestGuard] = useState(createSecretRequestGuard)
+  useEffect(() => () => requestGuard.invalidate(), [requestGuard])
 
   function openCreate() {
+    requestGuard.invalidate()
+    setOriginalSecrets(undefined)
+    setSecretLoading(false)
+    setIsSaving(false)
+    setFormInstance((value) => value + 1)
     setForm(emptyForm())
     setFormRevision(page?.revision)
     setEditingId(null)
     setIsFormOpen(true)
   }
 
-  function openEdit(provider: CustomProvider) {
+  async function openEdit(provider: CustomProvider) {
+    const isCurrent = requestGuard.begin()
+    const revision = page?.revision
+    setOriginalSecrets(undefined)
+    setSecretLoading(true)
+    setIsSaving(false)
+    setFormInstance((value) => value + 1)
     setForm(formFromProvider(provider))
-    setFormRevision(page?.revision)
+    setFormRevision(revision)
     setEditingId(provider.id)
     setIsFormOpen(true)
+    try {
+      const secrets = await api<CustomProviderSecrets>(
+        "POST",
+        `/dashboard/api/custom-providers/${encodeURIComponent(provider.id)}/reveal`,
+      )
+      if (!isCurrent()) return
+      if (secrets.id !== provider.id || secrets.revision !== revision)
+        throw new ApiError(
+          409,
+          "Provider configuration changed; reopen the editor",
+        )
+      setOriginalSecrets(secrets)
+      const loaded = formFromProvider(provider, secrets)
+      setForm((current) => ({
+        ...current,
+        apiKey: loaded.apiKey,
+        headers: loaded.headers,
+      }))
+    } catch (caught) {
+      if (isCurrent()) {
+        closeForm()
+        toast.error(errorMessage(caught, "Could not load provider credentials"))
+        reload()
+      }
+    } finally {
+      if (isCurrent()) setSecretLoading(false)
+    }
   }
 
   function closeForm() {
+    requestGuard.invalidate()
     setIsFormOpen(false)
+    setForm(emptyForm())
+    setOriginalSecrets(undefined)
+    setSecretLoading(false)
+    setIsSaving(false)
+    setEditingId(null)
+    setFormRevision(undefined)
+  }
+
+  function onFormOpenChange(open: boolean) {
+    if (open) setIsFormOpen(true)
+    else closeForm()
   }
 
   function updateModelRow(rowId: string, patch: Partial<ModelFormRow>) {
@@ -261,6 +323,10 @@ export default function CustomProvidersScreen() {
   }
 
   async function handleSave() {
+    if (secretLoading || (editingId !== null && !originalSecrets)) {
+      toast.error("Wait for the stored credentials to load before saving")
+      return
+    }
     if (!form.id.trim()) {
       toast.error("Provider ID is required")
       return
@@ -280,6 +346,17 @@ export default function CustomProvidersScreen() {
     for (const row of form.models) {
       if (!row.modelId.trim()) {
         toast.error("Every model needs an ID")
+        return
+      }
+      const headerNames = form.headers
+        .map((row) => row.key.trim().toLowerCase())
+        .filter(Boolean)
+      if (new Set(headerNames).size !== headerNames.length) {
+        toast.error("Header names must be unique")
+        return
+      }
+      if (form.headers.some((row) => row.value && !row.key.trim())) {
+        toast.error("Every header value needs a name")
         return
       }
     }
@@ -311,7 +388,7 @@ export default function CustomProvidersScreen() {
     }
 
     const payload: Record<string, unknown> = {
-      ...providerSecretPatch(form),
+      ...providerSecretPatch(form, originalSecrets),
       enabled: form.enabled,
       id: form.id.trim(),
       name: form.name.trim(),
@@ -321,20 +398,25 @@ export default function CustomProvidersScreen() {
       models,
     }
 
+    const isCurrent = requestGuard.begin()
     setIsSaving(true)
     try {
       await api("POST", "/dashboard/api/custom-providers", payload, {
         expectedRevision: formRevision,
       })
-      toast.success(editingId ? "Provider updated" : "Provider created")
-      closeForm()
       reload()
+      if (isCurrent()) {
+        toast.success(editingId ? "Provider updated" : "Provider created")
+        closeForm()
+      }
     } catch (caught) {
-      toast.error(errorMessage(caught, "Failed to save provider"))
-      if (caught instanceof ApiError && caught.status === 409) closeForm()
       reload()
+      if (isCurrent()) {
+        toast.error(errorMessage(caught, "Failed to save provider"))
+        if (caught instanceof ApiError && caught.status === 409) closeForm()
+      }
     } finally {
-      setIsSaving(false)
+      if (isCurrent()) setIsSaving(false)
     }
   }
 
@@ -457,16 +539,19 @@ export default function CustomProvidersScreen() {
 
       <Dialog
         isOpen={isFormOpen}
-        onOpenChange={setIsFormOpen}
+        onOpenChange={onFormOpenChange}
         purpose="form"
         width={640}
         maxHeight="85vh"
       >
         <DialogHeader
           title={editingId ? "Edit provider" : "Add custom provider"}
-          onOpenChange={setIsFormOpen}
+          onOpenChange={onFormOpenChange}
         />
-        <VStack gap={4} padding={4} isScrollable>
+        <VStack key={formInstance} gap={4} padding={4} isScrollable>
+          {secretLoading ?
+            <Banner status="info" title="Loading stored credentials" />
+          : null}
           <TextInput
             label="Provider ID"
             value={form.id}
@@ -496,17 +581,12 @@ export default function CustomProvidersScreen() {
           <Card variant="muted">
             <VStack gap={3}>
               <Heading level={4}>Authentication</Heading>
-              <TextInput
-                type="password"
+              <SecretInput
                 label="API key"
-                isDisabled={form.clearApiKey}
+                isDisabled={form.clearApiKey || secretLoading}
                 value={form.apiKey}
                 onChange={(value) => setForm((f) => ({ ...f, apiKey: value }))}
-                placeholder={
-                  editingId ?
-                    "Leave blank to keep the stored key"
-                  : "Provider API key"
-                }
+                placeholder="Provider API key"
               />
               {editingId ?
                 <Switch
@@ -518,8 +598,8 @@ export default function CustomProvidersScreen() {
                 />
               : null}
               <Text color="secondary">
-                The key is stored in your configured database and is never
-                returned in account listings.
+                Use the eye to reveal the stored key, or copy and edit it here.
+                Routine provider listings do not include secret values.
               </Text>
             </VStack>
           </Card>
@@ -534,6 +614,7 @@ export default function CustomProvidersScreen() {
                   size="sm"
                   icon={<PlusIcon />}
                   onClick={addHeaderRow}
+                  isDisabled={secretLoading}
                 />
               </HStack>
               {editingId ?
@@ -546,8 +627,8 @@ export default function CustomProvidersScreen() {
                 />
               : null}
               <Text color="secondary">
-                Blank values keep existing secrets. Clear all headers to remove
-                stored values before adding replacements.
+                Reveal, copy, or edit stored header values. Removing a row
+                deletes that header when you save.
               </Text>
               {form.headers.length === 0 ?
                 <Text type="supporting" color="secondary">
@@ -565,10 +646,9 @@ export default function CustomProvidersScreen() {
                     }
                     placeholder="Header name"
                   />
-                  <TextInput
-                    label="Header value"
-                    type="password"
-                    isDisabled={form.clearHeaders}
+                  <SecretInput
+                    label={`${row.key || "Custom header"} value`}
+                    isDisabled={form.clearHeaders || secretLoading}
                     isLabelHidden
                     value={row.value}
                     onChange={(value) => updateHeaderRow(row.rowId, { value })}
@@ -685,6 +765,9 @@ export default function CustomProvidersScreen() {
               label="Save provider"
               variant="primary"
               isLoading={isSaving}
+              isDisabled={
+                secretLoading || (editingId !== null && !originalSecrets)
+              }
               onClick={handleSave}
             />
           </HStack>

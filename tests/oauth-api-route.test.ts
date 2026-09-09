@@ -16,6 +16,7 @@ import {
   setOAuthStoreForTest,
 } from "../src/lib/oauth-store"
 import { state } from "../src/lib/state"
+import { insertGatewayCredential } from "../src/lib/storage/credentials-repository"
 import {
   removeFeatureFlag,
   setFeatureFlag,
@@ -77,9 +78,11 @@ beforeEach(async () => {
   resetIpSecurityForTest()
   consola.warn = mock(() => {}) as unknown as typeof consola.warn
   await authFixture.storage.transaction((session) =>
-    session.execute({
-      sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES(?,?,?,0)",
-      args: ["fixture-gateway", sha256Hex("test-secret-key"), "test"],
+    insertGatewayCredential(session, {
+      id: "fixture-gateway",
+      credential: "test-secret-key",
+      label: "test",
+      createdAt: 0,
     }),
   )
   setOAuthStoreForTest(new OAuthStore({ storage: authFixture.storage }))

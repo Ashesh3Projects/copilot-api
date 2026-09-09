@@ -100,6 +100,10 @@ export async function seedProtocolDatabase(
         sql: "INSERT OR IGNORE INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
         args: [digest, digest, "Protocol fixture", Date.now()],
       })
+      await session.execute({
+        sql: "INSERT OR IGNORE INTO capi_gateway_secrets(credential_id,secret_value,updated_at) VALUES(?,?,?)",
+        args: [digest, key, Date.now()],
+      })
     }
     for (const key of options.inferenceKeys ?? []) {
       const digest = credentialDigest(key)

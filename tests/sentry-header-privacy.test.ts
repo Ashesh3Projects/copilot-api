@@ -36,6 +36,26 @@ const SPAN_STRUCTURAL_FIELDS = {
   trace_id: "11111111111111111111111111111111",
 } as const
 
+test("credential-control telemetry drops raw request and response context in every send hook", () => {
+  for (const [name, hook] of sendHooks())
+    for (const url of [
+      "https://gateway.example/dashboard/api/credentials/gateway",
+      "https://gateway.example/dashboard/api/credentials/gateway/fixture/reveal",
+      "https://gateway.example/dashboard/api/custom-providers/fixture/reveal",
+      "https://gateway.example/dashboard/auth/login",
+    ])
+      expectFailClosed(name, hook, {
+        request: {
+          url,
+          data: JSON.stringify({
+            credential: "gateway-secret-private",
+            headers: { "X-Anything": "custom-header-private" },
+          }),
+        },
+        contexts: { response: { apiKey: "provider-key-private" } },
+      })
+})
+
 function sendHooks(): Array<[string, SendHook]> {
   const options = createSentryInitOptions(
     "https://public@example.ingest.sentry.io/1",

@@ -10,6 +10,7 @@ import { TextInput } from "@astryxdesign/core/TextInput"
 import { useEffect, useState } from "react"
 
 import { api, authProbe, clearLegacyCredentials } from "./lib/api"
+import { generateGatewayKey } from "./lib/gateway-creation"
 
 interface AdminAuthStatus {
   configured: boolean
@@ -140,17 +141,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
               <Button
                 label="Generate a random gateway key"
                 variant="secondary"
-                onClick={() =>
-                  setGatewayKey(
-                    crypto.randomUUID().replaceAll("-", "")
-                      + crypto.randomUUID().replaceAll("-", ""),
-                  )
-                }
+                onClick={() => setGatewayKey(generateGatewayKey())}
               />
               <Text color="secondary">
-                Save this key in your password manager before completing setup.
-                Use a long random API secret, not a memorable password. Imported
-                existing keys stay compatible.
+                Use a long random API secret, not a memorable password. You can
+                reveal and copy this key later in the administrator dashboard.
               </Text>
               {gatewayKey ?
                 <TextInput

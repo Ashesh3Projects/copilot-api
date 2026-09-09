@@ -8,7 +8,7 @@ import type {
 } from "~/lib/storage/types"
 
 import { StorageSchemaError } from "~/lib/storage/errors"
-import { initialTables } from "~/lib/storage/migrations/001-initial"
+import { currentTables } from "~/lib/storage/schema"
 import { validateTransferScopes } from "~/lib/storage/transfer-validation"
 
 export interface TransferManifest {
@@ -37,7 +37,7 @@ const excluded = new Set([
   "capi_setup_codes",
   "capi_device_login_intents",
 ])
-export const TRANSFER_TABLES = Object.keys(initialTables).filter(
+export const TRANSFER_TABLES = Object.keys(currentTables).filter(
   (table) => !excluded.has(table),
 )
 export const REQUIRED_TRANSFER_METADATA_KEYS = [
@@ -56,7 +56,7 @@ const metadataKeys = [
 function definition(table: string): string {
   if (!TRANSFER_TABLES.includes(table))
     throw new StorageSchemaError("Unknown transfer table")
-  return initialTables[table as keyof typeof initialTables]
+  return currentTables[table as keyof typeof currentTables]
 }
 export function transferColumns(
   table: string,
@@ -216,7 +216,7 @@ export async function insertTransferRecords(
 export async function assertEmptyTransferTarget(
   session: SqlSession,
 ): Promise<void> {
-  for (const table of Object.keys(initialTables)) {
+  for (const table of Object.keys(currentTables)) {
     if (table === "capi_metadata" || table === "capi_schema_migrations")
       continue
     const where =

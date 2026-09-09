@@ -20,8 +20,8 @@ import {
   StorageSchemaError,
 } from "~/lib/storage/errors"
 import { parseStorageCounter } from "~/lib/storage/migrations"
-import { initialTables } from "~/lib/storage/migrations/001-initial"
 import { readStoreRevision } from "~/lib/storage/operations"
+import { currentSchemaVersion, currentTables } from "~/lib/storage/schema"
 import {
   assertEmptyTransferTarget,
   insertTransferRecords,
@@ -53,7 +53,7 @@ export async function validateTransferredState(
   })
   const metadata = new Map(rows.map((row) => [row.key, row.value]))
   if (
-    metadata.get("schema_version") !== "1"
+    metadata.get("schema_version") !== String(currentSchemaVersion)
     || !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/.test(
       String(metadata.get("store_id")),
     )
@@ -180,7 +180,7 @@ class RecordDecoder {
         invalid()
       if (
         manifest.formatVersion !== 1
-        || manifest.schemaVersion !== 1
+        || manifest.schemaVersion !== currentSchemaVersion
         || typeof manifest.sourceStoreId !== "string"
         || manifest.recordsSha256 !== this.digest.digest("hex")
       )
@@ -420,7 +420,7 @@ export async function discardIncompleteTransfer(
     throw new StorageSchemaError("An exact incomplete transfer ID is required")
   await target.transaction(async (session) => {
     await requireMarker(session, operationId)
-    for (const table of Object.keys(initialTables).reverse()) {
+    for (const table of Object.keys(currentTables).reverse()) {
       if (table === "capi_metadata" || table === "capi_schema_migrations")
         continue
       await session.execute({ sql: `DELETE FROM ${table}`, args: [] })

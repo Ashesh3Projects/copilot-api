@@ -17,8 +17,11 @@ affected, include its exact version or digest.
   plus CSRF/Origin checks. Inference credentials cannot list or rewrite those
   rules (CS-02).
 - The gateway key protects normal inference traffic and bootstraps OAuth and
-  administrator login. Gateway credentials are stored as digests in the selected
-  database; legacy environment credentials are explicit import inputs only.
+  administrator login. Gateway credentials have indexed digests and raw values
+  in the separate `capi_gateway_secrets` table. Both records are required for
+  authentication; no digest-only fallback is accepted. Raw values are
+  recoverable by database readers and authorized administrators. Legacy
+  environment credentials are explicit import inputs only.
 - OAuth codes and tokens are opaque, scoped, stored as digests, bound to S256
   PKCE/client/redirect/state, reusable on refresh, and explicitly revocable. OAuth never
   returns the gateway key. Claude's `create_api_key` compatibility route mints a
@@ -47,9 +50,15 @@ affected, include its exact version or digest.
   sufficient for dashboard workflows; there is no second password prompt.
   Mutations still require the SameSite CSRF cookie, matching header, and
   approved Origin.
-- Provider keys and sensitive custom headers are write-only through dashboard
-  APIs. Configuration export and ordinary request logging redact recognized
-  request, header, and configuration secrets.
+- Gateway keys, provider keys, and custom-header values are excluded from
+  routine dashboard listings and returned only by explicit administrator-only
+  reveal endpoints, protected by session, CSRF and Origin checks with no-store
+  responses. Gateway hard deletion is transactional and protects the final
+  active key. Revealed gateway values are cleared on hide; provider values are
+  held only while the editor is open and cleared on close. Credential-control
+  request bodies are omitted from diagnostic
+  logging, and credential-control events are dropped from Sentry telemetry.
+  Configuration exports exclude credential tables and redact recognized secrets.
 - Final non-empty upstream error response bodies are intentionally replicated to
   the normal client, ordinary logs, and Sentry with status and content type.
   Custom-provider bodies are excluded from ordinary logs and Sentry but remain
@@ -100,7 +109,7 @@ affected, include its exact version or digest.
 | ID | Status | Current resolution |
 | --- | --- | --- |
 | F-01 | Resolved | OAuth refresh no longer returns the gateway key. Opaque scoped access/refresh tokens, PKCE-bound one-use codes, compatible reusable refresh, explicit revocation, and digested persistence replaced the simulated bearer exchange. |
-| F-02 | Resolved with intentional raw compatibility channels | Dashboard authority moved to gateway-plus-password cookie sessions. Gateway credentials alone cannot access dashboard APIs; provider secrets are write-only and configuration exports redact recognized secrets. Final non-empty upstream failure bodies intentionally pass through to normal clients, logs, and Sentry. Administrator-only LLM Debug persists bounded, scrubbed captures with retention and explicit collection gaps. |
+| F-02 | Resolved with intentional raw compatibility channels | Dashboard authority moved to gateway-plus-password cookie sessions. Gateway credentials alone cannot access dashboard APIs; stored gateway/provider secrets require explicit administrator-only reveal, while routine listings and configuration exports omit them. Final non-empty upstream failure bodies intentionally pass through to normal clients, logs, and Sentry. Administrator-only LLM Debug persists bounded, scrubbed captures with retention and explicit collection gaps. |
 | F-03 | Resolved | Remote Control requires short-lived, one-use, administrator/session-bound WebSocket tickets with Origin validation. |
 | F-04 | Resolved | Metadata-free liveness and database readiness remain public. Direct Connect is disabled by default and authenticated when explicitly enabled. |
 | F-05 | Resolved | Voice WebSockets authenticate before upgrade, enforce Origin when supplied, validate protocol messages, and cancel transcription when callers disconnect. |
@@ -182,10 +191,11 @@ passwords use scrypt with a per-backup random salt and AES-256-GCM authenticated
 encryption. SHA-256 elsewhere is used for opaque bearer credential lookup,
 standards-required PKCE S256, already-derived-verifier fingerprints, operation
 input binding, and transfer integrity—not administrator password storage.
-Gateway/API secrets must be long, random values; do not use a memorable password
-as an API key. Automatically issued keys use cryptographic randomness. A database
-reader can recover the upstream credentials that the gateway must forward; protect
-local files and remote database access accordingly.
+Gateway/API secrets should be long, unpredictable values; do not use a memorable
+password as an API key. Optional generation uses cryptographic randomness.
+Database readers can recover gateway keys, upstream credentials, provider keys,
+and custom-header values. These values are also included inside encrypted
+backups; protect local files, remote database access, and backup passwords.
 
 Code-session identifiers use cryptographic randomness while preserving their
 existing `cse_` prefix and 24-character alphabet. The optional `--insecure` flag is

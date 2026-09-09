@@ -3,12 +3,14 @@ import type { SqlSession } from "~/lib/storage/types"
 import { validateAdminPasswordHash } from "~/lib/admin-auth"
 import { validateStoredReplacements } from "~/lib/auto-replace"
 import { validateAppConfigJson } from "~/lib/config"
+import { isStoredGatewayCredential } from "~/lib/credential-value"
 import { normalizeGitHubDomain } from "~/lib/github-instance"
 import { normalizeIpAddress } from "~/lib/ip-allowlist"
 import { validateModelFallbackConfig } from "~/lib/model-fallback-config"
 import { validateStoredModelRedirects } from "~/lib/model-redirect"
 import { validateStoredModelRouting } from "~/lib/model-routing"
 import { validateStoredModelSettings } from "~/lib/model-settings"
+import { credentialDigest } from "~/lib/storage/credentials-repository"
 import { StorageSchemaError } from "~/lib/storage/errors"
 import { loadCustomProviderSnapshotFromSession } from "~/lib/storage/providers-repository"
 import { validateStoredFeatureFlags } from "~/routes/feature-flags/store"
@@ -97,6 +99,16 @@ export async function validateTransferDomains(
       String(row.namespace),
       JSON.parse(String(row.value_json)),
     )
+  const gateways = await session.query({
+    sql: "SELECT c.digest,s.secret_value FROM capi_gateway_credentials c LEFT JOIN capi_gateway_secrets s ON s.credential_id=c.id",
+    args: [],
+  })
+  for (const row of gateways)
+    if (
+      !isStoredGatewayCredential(row.secret_value)
+      || credentialDigest(row.secret_value) !== row.digest
+    )
+      throw new StorageSchemaError("Invalid imported gateway secret")
   const admin = await session.query({
     sql: "SELECT password_hash FROM capi_admin",
     args: [],

@@ -231,7 +231,7 @@ test("password transaction failure preserves the old password and sessions", asy
   expect(await loginAdmin(GATEWAY_KEY, "new password")).toBeNull()
 })
 
-test("sessions survive restart with no raw session, csrf, password or gateway in storage", async () => {
+test("sessions survive restart while auth metadata stays hashed and gateway secrets remain separate", async () => {
   const session = await setup()
   const stored = await fixture.storage.read((sql) =>
     sql.query({
@@ -243,6 +243,14 @@ test("sessions survive restart with no raw session, csrf, password or gateway in
   expect(serialized).not.toContain(GATEWAY_KEY)
   expect(serialized).not.toContain(PASSWORD)
   expect(serialized).not.toContain(session.csrf)
+  expect(
+    await fixture.storage.read((sql) =>
+      sql.query({
+        sql: "SELECT secret_value FROM capi_gateway_secrets",
+        args: [],
+      }),
+    ),
+  ).toEqual([{ secret_value: GATEWAY_KEY }])
   await fixture.restart()
   expect(
     (await app.request("/protected", { headers: { cookie: session.cookie } }))

@@ -396,7 +396,7 @@ function isPrivatePayloadField(key: string): boolean {
 }
 
 function isSensitiveBodyKey(key: string): boolean {
-  return /password|secret|api[_-]?key|authorization|cookie|access[_-]?token|refresh[_-]?token|code[_-]?verifier|client[_-]?secret/i.test(
+  return /password|secret|credential|gateway[_-]?key|headers|api[_-]?key|authorization|cookie|access[_-]?token|refresh[_-]?token|code[_-]?verifier|client[_-]?secret/i.test(
     key,
   )
 }

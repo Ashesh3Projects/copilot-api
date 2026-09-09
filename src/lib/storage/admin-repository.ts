@@ -3,7 +3,11 @@ import { createHash, randomUUID } from "node:crypto"
 import type { SqlSession, Storage } from "~/lib/storage/types"
 
 import { SerialQueue } from "~/lib/storage/adapter-utils"
-import { insertGatewayCredential } from "~/lib/storage/credentials-repository"
+import {
+  findGatewayCredential,
+  insertGatewayCredential,
+  isReservedGatewayCredential,
+} from "~/lib/storage/credentials-repository"
 import {
   StorageCommitUnknownError,
   StorageConflictError,
@@ -223,23 +227,6 @@ function sessionRecord(row: Record<string, unknown>): AdminSessionRecord {
   }
 }
 
-async function isReservedGateway(
-  session: SqlSession,
-  gatewayDigest: string,
-  gatewayLiteral: string,
-): Promise<boolean> {
-  const base64 = Buffer.from(gatewayDigest, "hex").toString("base64url")
-  const literal =
-    /^[a-f\d]{64}$/i.test(gatewayLiteral) ?
-      gatewayLiteral.toLowerCase()
-    : gatewayLiteral
-  const reserved = await session.query({
-    sql: "SELECT digest FROM capi_inference_credentials WHERE digest IN (?, ?, ?) UNION ALL SELECT digest FROM capi_gateway_credentials WHERE digest = ? LIMIT 1",
-    args: [gatewayDigest, base64, literal, literal],
-  })
-  return reserved.length > 0
-}
-
 // eslint-disable-next-line max-lines-per-function -- related transaction operations share one explicit storage dependency
 export function createAdminRepository(storage: Storage) {
   return {
@@ -282,13 +269,7 @@ export function createAdminRepository(storage: Storage) {
         { kind: "setup", actor: input.codeDigest, input },
         async (session) => {
           if (await readAdmin(session)) return "configured"
-          if (
-            await isReservedGateway(
-              session,
-              input.gateway.digest,
-              input.gatewayLiteral,
-            )
-          )
+          if (await isReservedGatewayCredential(session, input.gatewayLiteral))
             return "invalid"
           const consumed = await session.execute({
             sql: "UPDATE capi_setup_codes SET consumed_at = ? WHERE digest = ? AND expires_at > ? AND consumed_at IS NULL AND invalidated_at IS NULL",
@@ -307,7 +288,10 @@ export function createAdminRepository(storage: Storage) {
               input.session.createdAt,
             ],
           })
-          await insertGatewayCredential(session, input.gateway)
+          await insertGatewayCredential(session, {
+            ...input.gateway,
+            credential: input.gatewayLiteral,
+          })
           await insertSession(session, input.session)
           await session.execute({
             sql: "UPDATE capi_setup_codes SET invalidated_at = ? WHERE consumed_at IS NULL AND invalidated_at IS NULL",
@@ -336,18 +320,9 @@ export function createAdminRepository(storage: Storage) {
             || current.sessionVersion !== input.admin.sessionVersion
           )
             return false
-          const gateway = await session.query({
-            sql: "SELECT id FROM capi_gateway_credentials WHERE digest = ? AND revoked_at IS NULL",
-            args: [input.gatewayDigest],
-          })
-          if (gateway.length === 0) return false
-          if (
-            await isReservedGateway(
-              session,
-              input.gatewayDigest,
-              input.gatewayLiteral,
-            )
-          )
+          if (!(await findGatewayCredential(session, input.gatewayLiteral)))
+            return false
+          if (await isReservedGatewayCredential(session, input.gatewayLiteral))
             return false
           await session.execute({
             sql: "DELETE FROM capi_admin_sessions WHERE expires_at <= ? OR session_version <> ?",

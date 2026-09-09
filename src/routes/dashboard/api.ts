@@ -78,6 +78,7 @@ import {
   getClientEvents,
   listSessions,
 } from "~/routes/code-sessions/session-store"
+import { providerSecretInputError } from "~/routes/dashboard/provider-secrets-input"
 import {
   destroyDirectConnectSession,
   listDirectConnectSessions,
@@ -136,6 +137,7 @@ interface CustomProviderRequestBody {
   apiKeyEnv?: string
   clearApiKey?: boolean
   clearHeaders?: boolean
+  replaceHeaders?: boolean
   enabled?: boolean
   headers?: Record<string, string>
   passReasoningEffort?: boolean | null
@@ -161,6 +163,7 @@ interface ValidCustomProviderBody {
   apiKeyEnv?: string
   clearApiKey?: boolean
   clearHeaders?: boolean
+  replaceHeaders?: boolean
   enabled?: boolean
   headers?: Record<string, string>
   passReasoningEffort?: boolean
@@ -694,6 +697,9 @@ export async function handleUpsertCustomProvider(c: Context) {
       ...(body.clearHeaders !== undefined ?
         { clearHeaders: body.clearHeaders }
       : {}),
+      ...(body.replaceHeaders !== undefined ?
+        { replaceHeaders: body.replaceHeaders }
+      : {}),
       ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
       models: body.models,
       ...(body.passReasoningEffort !== undefined ?
@@ -711,8 +717,10 @@ export async function handleUpsertCustomProvider(c: Context) {
 }
 
 function parseCustomProviderBody(
-  body: CustomProviderRequestBody,
+  body: CustomProviderRequestBody | null | undefined,
 ): CustomProviderParseResult {
+  if (!body || typeof body !== "object" || Array.isArray(body))
+    return { ok: false, error: "Expected a JSON object" }
   const base = parseCustomProviderBase(body)
   if (!base.ok) return base
   const models = parseCustomProviderModels(body.models)
@@ -739,19 +747,8 @@ function parseCustomProviderBase(
   const baseUrl = getRequiredString(body.baseUrl, "baseUrl")
   if (!baseUrl.ok) return baseUrl
   const apiKey = getOptionalString(body.apiKey)
-  if (body.apiKeyEnv !== undefined)
-    return {
-      ok: false,
-      error:
-        "apiKeyEnv is no longer supported; store a provider key in the dashboard",
-    }
-  for (const value of [body.enabled, body.clearApiKey, body.clearHeaders])
-    if (value !== undefined && typeof value !== "boolean")
-      return { ok: false, error: "Provider flags must be boolean" }
-
-  if (body.headers !== undefined && !isStringRecord(body.headers)) {
-    return { ok: false, error: "headers must be an object of strings" }
-  }
+  const secretError = providerSecretInputError(body)
+  if (secretError) return { ok: false, error: secretError }
 
   return {
     ok: true,
@@ -766,6 +763,9 @@ function parseCustomProviderBase(
       : {}),
       ...(body.clearHeaders !== undefined ?
         { clearHeaders: body.clearHeaders }
+      : {}),
+      ...(body.replaceHeaders !== undefined ?
+        { replaceHeaders: body.replaceHeaders }
       : {}),
       ...(body.headers ? { headers: body.headers } : {}),
       ...(typeof body.passReasoningEffort === "boolean" ?
@@ -860,15 +860,6 @@ function isStringArray(value: unknown): boolean {
   return (
     value === undefined
     || (Array.isArray(value) && value.every((item) => typeof item === "string"))
-  )
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return (
-    typeof value === "object"
-    && value !== null
-    && !Array.isArray(value)
-    && Object.values(value).every((item) => typeof item === "string")
   )
 }
 

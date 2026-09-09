@@ -15,11 +15,15 @@ test("a copied gateway operation cannot report success for another credential", 
       { label: "one" },
       "owner:test",
     )
-    const first = await repository.create("one", context)
-    expect(first.value.credential).toBeString()
+    const input = { label: "one", credential: "fixture-one-secret" }
+    const first = await repository.create(input, context)
+    expect(first.value.maskedValue).toBe("fixtu...ecret")
     let rejected = false
     try {
-      await repository.create("different-label", context)
+      await repository.create(
+        { ...input, credential: "fixture-different-secret" },
+        context,
+      )
     } catch {
       rejected = true
     }

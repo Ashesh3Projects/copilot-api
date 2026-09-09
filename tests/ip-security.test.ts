@@ -37,7 +37,7 @@ import {
   unwhitelistIp,
 } from "~/lib/ip-blocker"
 import { createAuthMiddleware } from "~/lib/request-auth"
-import { credentialDigest } from "~/lib/storage/credentials-repository"
+import { insertGatewayCredential } from "~/lib/storage/credentials-repository"
 import { withSettingsActor } from "~/lib/storage/domain-settings"
 import { StorageUnavailableError } from "~/lib/storage/errors"
 import { getStoreRevision } from "~/lib/storage/operations"
@@ -57,14 +57,11 @@ let currentTime = 0
 beforeEach(async () => {
   authFixture = await createAuthStorageFixture()
   await authFixture.storage.transaction((session) =>
-    session.execute({
-      sql: "INSERT INTO capi_gateway_credentials (id,digest,label,created_at) VALUES (?,?,?,?)",
-      args: [
-        randomUUID(),
-        credentialDigest("gateway-secret"),
-        "Test gateway",
-        Date.now(),
-      ],
+    insertGatewayCredential(session, {
+      id: randomUUID(),
+      credential: "gateway-secret",
+      label: "Test gateway",
+      createdAt: Date.now(),
     }),
   )
   resetIpSecurityForTest()

@@ -157,6 +157,13 @@ export interface CustomProvider {
   passReasoningEffort?: boolean
 }
 
+export interface CustomProviderSecrets {
+  id: string
+  apiKey: string | null
+  headers: Record<string, string>
+  revision: number
+}
+
 export interface ModelRoutingAccount {
   id: number
   accountType: string

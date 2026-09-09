@@ -31,7 +31,7 @@ merge, or migrate data.
 The database is `copilot-api.sqlite` under `DATA_DIR`, defaulting to
 `~/.local/share/copilot-api`. Docker sets `DATA_DIR=/app/data`. Mount the whole
 directory for the database and SQLite's WAL and SHM sidecars. Use local storage
-suitable for SQLite WAL and restrict access: recoverable upstream and provider
+suitable for SQLite WAL and restrict access: recoverable gateway, upstream and provider
 credentials are sensitive database values. Do not remove sidecars while the
 database is open.
 
@@ -86,12 +86,29 @@ routing policy, includes disabled accounts without enabling them, and excludes
 accounts being removed. A failed refresh retains the previous catalog and
 does not prevent the remaining accounts from refreshing.
 
-Gateway and OAuth/inference secrets are stored as digests; administrator
-passwords use Argon2id. Upstream/provider credentials must remain recoverable
-for outbound authentication. Dashboard secret listings are write-only and show
-configured status. Initial setup stores the gateway key; later keys can be
-created and revoked through the dashboard. Inference credentials cannot become
+Gateway keys are stored as raw values in `capi_gateway_secrets`, alongside
+indexed digests in gateway metadata. OAuth/inference values remain digest-only;
+administrator passwords use Argon2id. Routine secret listings omit raw values.
+Administrators can add custom gateway keys, optionally generate one, reveal
+and copy values, and permanently delete keys except the last active key.
+Provider editors explicitly load existing API keys and custom-header values.
+All reveal endpoints require an administrator session, CSRF and Origin checks
+and return no-store responses. Inference credentials cannot become
 administrator or gateway credentials through a matching key or digest literal.
+
+### Gateway-key schema upgrade
+
+Migration `002` adds the separate gateway-secret table and removes all old
+digest-only gateway rows. It never reconstructs old keys, accepts a legacy
+digest as authentication, generates a replacement automatically, or relaxes
+dashboard login. Preserve a backup and arrange a replacement raw key before
+resuming service. An existing administrator session remains valid, but new
+sign-ins and API clients need a newly provisioned gateway key.
+
+The migration retains administrator passwords/sessions, accounts, provider
+credentials, OAuth/inference records, settings, and history. Applying it again
+does not remove new raw-backed keys. Provisioning the initial replacement is
+an explicit operator action; its value must not be committed to source or logs.
 
 `start` does not perform device authentication, load JSON credentials, or admit
 credentials from `GITHUB_TOKENS`, `GH_TOKEN`, `COPILOT_API_KEY_AUTH`,
@@ -199,6 +216,11 @@ validates its schema, records, and relationships, and refuses an occupied target
 Restore preserves account IDs and client credential state while invalidating
 administrator sessions. Active bridge jobs, sockets, and connection-local
 conversation state do not become resumable through backup/restore.
+
+Schema-2 encrypted backups include gateway raw-secret records and validate each
+raw value against its metadata digest. Old schema-1 backups are rejected rather
+than silently restoring digest-only gateway access. Legacy imports that supply
+actual raw keys write both gateway records; digest-only values are not recovered.
 
 An interrupted import or definitely rolled-back restore leaves an incomplete-transfer marker that
 blocks readiness. To abandon only that transfer, use its exact reported ID:

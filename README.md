@@ -287,8 +287,10 @@ Copilot API separates these credential boundaries:
    the selected database without printing the credential. `start` never runs
    a first-use device flow.
 2. **Gateway credentials** authenticate trusted data-plane clients and OAuth
-   authorization. Initial setup stores the chosen key as a digest; subsequent
-   keys are managed in the dashboard. Environment variables and the obsolete
+   authorization. Keys have an indexed digest and a recoverable raw value in
+   a separate database secret record. Administrators can add custom keys,
+   optionally generate one, reveal/copy stored values, and permanently delete
+   all but the last key. Environment variables and the obsolete
    `--api-key-auth` flag are not runtime credential sources.
 3. **OAuth and inference credentials** are independent, scoped database records.
    The OAuth flow never returns the gateway key. Operators can register the
@@ -297,8 +299,9 @@ Copilot API separates these credential boundaries:
    and cannot bootstrap OAuth or access administrator routes.
 4. **Administrator sessions** are established with a stored gateway key and an
    administrator password. The browser stores a Secure, HttpOnly session cookie
-   and a separate SameSite-strict CSRF cookie, not the gateway key. First setup
-   also requires a one-use code issued by `admin --setup-code`.
+   and a separate SameSite-strict CSRF cookie, not the gateway key. Explicitly
+   revealed values are held only in the open dashboard controls, not browser
+   storage. First setup also requires a one-use code issued by `admin --setup-code`.
 
 For non-loopback access, configure the exact external dashboard origin and
 trusted proxy peers, complete setup, and keep the API behind the intended
@@ -412,8 +415,11 @@ the dashboard and sanitized configuration export.
 ### Custom OpenAI-compatible providers
 
 Manage provider metadata, models, API keys, and custom headers through the
-dashboard. Credentials are stored in database secret records and remain
-write-only in dashboard listings. `apiKeyEnv` is a legacy import input, not a
+dashboard. Routine listings omit secret values. Opening the provider editor
+explicitly loads its stored API key and custom headers under the administrator
+session and CSRF/Origin checks, with eye/copy controls and editable values.
+Removing a header row removes that stored header when saved; unchanged
+credentials are retained. `apiKeyEnv` is a legacy import input, not a
 runtime reference; `storage import-legacy --from-env` resolves only the selected
 credential names referenced by imported providers.
 
@@ -745,6 +751,12 @@ database. Runtime JSON files are no longer read or written. Existing JSON
 files and selected environment credentials require `storage import-legacy`;
 source files remain untouched. See the [storage runbook](docs/turso-storage.md)
 for preview, apply, backup, restore, readiness, and storage-switch procedures.
+
+**Gateway credential upgrade (schema 2):** old digest-only gateway keys are
+deleted rather than recovered or accepted through a compatibility fallback.
+Coordinate an operator-provisioned replacement key before serving the upgraded
+database. Administrator passwords/sessions and unrelated database state are
+retained. Clients must use a new stored gateway key after the upgrade.
 
 ### Environment variables
 

@@ -64,7 +64,10 @@ import {
   dashboardAuthRoutes,
   getRefreshedSessionCookieHeaders,
 } from "./auth-route"
-import { createDashboardCredentialRoutes } from "./credentials"
+import {
+  createDashboardCredentialRoutes,
+  createDashboardProviderSecretRoutes,
+} from "./credentials"
 import {
   handleClearFallbackCache,
   handleGetFallbacks,
@@ -175,6 +178,10 @@ dashboardRoutes.post("/api/model-settings", handleSetModelSettings)
 dashboardRoutes.delete("/api/model-settings/:model", handleDeleteModelSettings)
 
 // Custom Providers
+dashboardRoutes.route(
+  "/api/custom-providers",
+  createDashboardProviderSecretRoutes(),
+)
 dashboardRoutes.get("/api/custom-providers", handleListCustomProviders)
 dashboardRoutes.post("/api/custom-providers", handleUpsertCustomProvider)
 dashboardRoutes.post(

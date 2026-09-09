@@ -263,6 +263,10 @@ export async function smokePublicProtocols(
           Date.now(),
         ],
       },
+      {
+        sql: "INSERT INTO capi_gateway_secrets(credential_id,secret_value,updated_at) VALUES(?,?,?)",
+        args: ["smoke-websocket", wsKey, Date.now()],
+      },
     ])
     socket = new WebSocket(`ws://127.0.0.1:${http.port}/responses`, {
       headers: { authorization: `Bearer ${wsKey}` },

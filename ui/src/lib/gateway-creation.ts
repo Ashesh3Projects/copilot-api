@@ -1,11 +1,6 @@
-export function gatewayCreationFeedback(result: {
-  id: string
-  label: string
-  credential?: string
-}):
-  | { credential: string; lost?: undefined }
-  | { credential?: undefined; lost: { id: string; label: string } } {
-  return result.credential ?
-      { credential: result.credential }
-    : { lost: { id: result.id, label: result.label } }
+export function generateGatewayKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  return `cop-${Array.from(bytes, (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("")}`
 }

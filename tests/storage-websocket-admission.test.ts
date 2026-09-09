@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test"
 import { randomUUID } from "node:crypto"
 
-import { credentialDigest } from "~/lib/storage/credentials-repository"
+import {
+  credentialDigest,
+  insertGatewayCredential,
+} from "~/lib/storage/credentials-repository"
 import { initializeStorageRuntime } from "~/lib/storage/runtime"
 import { admitWebSocketTurn } from "~/lib/storage/websocket-admission"
 
@@ -13,9 +16,11 @@ test("existing socket cannot admit a new turn after revocation or storage outage
     const runtime = await initializeStorageRuntime(fixture)
     const key = "fixture-websocket-key"
     await runtime.storage.transaction((s) =>
-      s.execute({
-        sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES(?,?,?,?)",
-        args: [randomUUID(), credentialDigest(key), "test", Date.now()],
+      insertGatewayCredential(s, {
+        id: randomUUID(),
+        credential: key,
+        label: "test",
+        createdAt: Date.now(),
       }),
     )
     const request = new Request("http://localhost/responses", {

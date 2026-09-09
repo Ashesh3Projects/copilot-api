@@ -12,6 +12,7 @@ import type { SqlSession, Storage } from "~/lib/storage/types"
 import { validateAdminPasswordHash } from "~/lib/admin-auth"
 import { validateStoredReplacements } from "~/lib/auto-replace"
 import { validateAppConfigJson } from "~/lib/config"
+import { normalizeGatewayCredential } from "~/lib/credential-value"
 import {
   normalizeGitHubDomain,
   parseGitHubCredentials,
@@ -22,10 +23,10 @@ import { validateStoredModelRedirects } from "~/lib/model-redirect"
 import { validateStoredModelRouting } from "~/lib/model-routing"
 import { validateStoredModelSettings } from "~/lib/model-settings"
 import { StorageConflictError, StorageSchemaError } from "~/lib/storage/errors"
-import { initialMigration } from "~/lib/storage/migrations/001-initial"
 import { readStoreRevision } from "~/lib/storage/operations"
 import { validateTransferredState } from "~/lib/storage/restore"
 import { getStorageRuntime } from "~/lib/storage/runtime"
+import { storageMigrations } from "~/lib/storage/schema"
 import {
   assertEmptyTransferTarget,
   completeTransferRecord,
@@ -241,7 +242,8 @@ async function prepare(input: LegacyImportInput) {
   const db = new Database(":memory:", { strict: true })
   try {
     db.run("PRAGMA foreign_keys=ON")
-    for (const sql of initialMigration.statements) db.run(sql)
+    for (const migration of storageMigrations)
+      for (const sql of migration.statements) db.run(sql)
     const session: SqlSession = {
       query: (statement) =>
         Promise.resolve(
@@ -326,13 +328,20 @@ function addConfigCredentials(
         .map((value) => value.trim())
         .filter(Boolean)
   const keys = environmentGatewayKey ? [environmentGatewayKey] : jsonKeys
-  for (const key of new Set(keys))
+  for (const raw of new Set(keys)) {
+    const key = normalizeGatewayCredential(raw)
     add("capi_gateway_credentials", {
       id: `legacy:${sha256(key)}`,
       digest: sha256(key),
       label: "Imported gateway key",
       created_at: 0,
     })
+    add("capi_gateway_secrets", {
+      credential_id: `legacy:${sha256(key)}`,
+      secret_value: key,
+      updated_at: 0,
+    })
+  }
   delete config.auth
   const groq = env("GROQ_API_KEY") ?? config.groqApiKey
   if (groq)
