@@ -99,8 +99,18 @@ export interface ModelFallbackConfig {
 }
 
 export interface ModelFallbackSettings {
+  safety?: ModelRoutingSafety
   config: ModelFallbackConfig
   cache: { entries: number }
+}
+
+export interface ModelRoutingSafety {
+  safe: boolean
+  loop?: {
+    kind: "redirect" | "fallback" | "combined"
+    models: Array<string>
+    ruleIds: Array<string>
+  }
 }
 
 export interface ModelRedirectConflict {

@@ -4,11 +4,7 @@ import type { JsonValue } from "~/lib/storage/types"
 import type { HistoryRuntime } from "~/lib/telemetry-writer"
 
 import {
-  debugCredentialLiterals,
-  sanitizeDebugCapture,
-  sanitizeDebugHeaders,
-  sanitizeDebugText,
-  sanitizeDebugUrl,
+  rawDebugCapture,
   reserveDebugCaptureMemory,
   releaseDebugCaptureMemory,
   type CapturedBody,
@@ -123,7 +119,6 @@ interface StartLlmDebugLogInput {
 interface LiveCapture {
   entry: LlmDebugLogEntry
   controller: AbortController
-  credentials: Array<string>
   runtime: HistoryRuntime
   generation: number
   bytes: number
@@ -136,7 +131,6 @@ function releaseCapture(id: string): void {
   if (!capture) return
   releaseDebugCaptureMemory(capture.bytes)
   capture.controller.abort()
-  capture.credentials.length = 0
   liveCaptures.delete(id)
 }
 
@@ -159,14 +153,63 @@ export function getLlmDebugCaptureSignal(id: string): AbortSignal {
   return liveCaptures.get(id)?.controller.signal ?? AbortSignal.abort()
 }
 
+function unavailableBody(body: CapturedBody): CapturedBody {
+  return {
+    ...body,
+    body: null,
+    truncated: true,
+    omittedReason: "queue-pressure",
+  }
+}
+
 function queueCapture(capture: LiveCapture): void {
-  capture.runtime.writer.enqueue({
+  const record = {
     id: capture.entry.id,
-    kind: "debug",
+    kind: "debug" as const,
     recordedAt: capture.entry.startedAtMs,
     generation: capture.generation,
     payload: capture.entry as unknown as JsonValue,
+  }
+  if (capture.runtime.writer.enqueue(record)) return
+  // Report admission loss explicitly without presenting a missing body as an
+  // exact capture. The writer separately records the dropped bytes/records.
+  capture.runtime.writer.enqueue({
+    ...record,
+    payload: {
+      ...capture.entry,
+      status: "error",
+      replayable: false,
+      request: {
+        ...capture.entry.request,
+        ...unavailableBody(capture.entry.request),
+      },
+      ...(capture.entry.response ?
+        {
+          response: {
+            ...capture.entry.response,
+            ...unavailableBody(capture.entry.response),
+          },
+        }
+      : {}),
+    } as unknown as JsonValue,
   })
+}
+
+function interruptCapture(id: string, now: number): void {
+  const capture = liveCaptures.get(id)
+  if (!capture) return
+  capture.entry.status = "interrupted"
+  capture.entry.replayable = false
+  capture.entry.endedAt = new Date(now).toISOString()
+  capture.entry.updatedAt = now
+  capture.entry.durationMs = now - capture.entry.startedAtMs
+  capture.entry.error = {
+    name: "DebugCaptureInterrupted",
+    message:
+      "Capture stopped because the active diagnostic collection budget was exhausted.",
+  }
+  queueCapture(capture)
+  releaseCapture(id)
 }
 
 function compactWhitespace(value: string): string {
@@ -442,17 +485,9 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
   if (!runtime) return id
   const startedAtMs = input.startedAtMs ?? Date.now()
   pruneLive(startedAtMs)
-  const customProvider = input.upstream?.kind === "custom"
-  const credentials = debugCredentialLiterals(
-    input.requestHeaders,
-    input.url,
-    customProvider,
-  )
-  const body = sanitizeDebugCapture({
+  const body = rawDebugCapture({
     ...input.requestCapture,
     body: input.requestBody,
-    contentType: findHeader(input.requestHeaders, "content-type"),
-    knownCredentials: credentials,
   })
   const entry: LlmDebugLogEntry = {
     id,
@@ -460,72 +495,69 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
     model: inferModel(body.body),
     request: {
       ...body,
-      headers: sanitizeDebugHeaders(
-        input.requestHeaders,
-        credentials,
-        customProvider,
-      ),
-      method: sanitizeDebugText(input.method, credentials),
-      path: sanitizeDebugUrl(sanitizeDebugText(input.path, credentials)),
-      url: sanitizeDebugUrl(sanitizeDebugText(input.url, credentials)),
+      headers: { ...input.requestHeaders },
+      method: input.method,
+      path: input.path,
+      url: input.url,
     },
-    requestId:
-      input.requestId ?
-        sanitizeDebugText(input.requestId, credentials)
-      : undefined,
+    requestId: input.requestId,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
     updatedAt: startedAtMs,
     status: "pending",
-    replayable: body.body !== null && !body.redacted && !body.omittedReason,
+    replayable:
+      body.body !== null
+      && !body.truncated
+      && !body.omittedReason
+      && body.bodyBytesComplete !== false,
     stream: inferStream(body.body),
   }
   const capture: LiveCapture = {
     entry,
     controller: new AbortController(),
-    credentials,
     runtime,
     generation: runtime.generations.debug,
+    // Strings are immutable; account for their storage without copying or
+    // serializing the raw body again before the upstream fetch starts.
     bytes:
-      Buffer.byteLength(JSON.stringify(entry))
-      + credentials.reduce(
-        (total, value) => total + Buffer.byteLength(value),
-        0,
-      ),
+      (body.body?.length ?? 0) * 2
+      + JSON.stringify({ ...entry, request: { ...entry.request, body: null } })
+        .length
+        * 2,
   }
   while (liveCaptures.size >= MAX_LIVE_REQUESTS) {
     const oldest = liveCaptures.keys().next().value
     if (!oldest) break
-    releaseCapture(oldest)
+    interruptCapture(oldest, startedAtMs)
   }
-  let reserved = reserveDebugCaptureMemory(capture.bytes)
+  let reserved = reserveDebugCaptureMemory(capture.bytes, true)
   while (!reserved && liveCaptures.size > 0) {
     const oldest = liveCaptures.keys().next().value
     if (!oldest) break
-    releaseCapture(oldest)
-    reserved = reserveDebugCaptureMemory(capture.bytes)
+    interruptCapture(oldest, startedAtMs)
+    reserved = reserveDebugCaptureMemory(capture.bytes, true)
   }
   if (reserved) {
     liveCaptures.set(id, capture)
     queueCapture(capture)
   } else {
-    capture.credentials.length = 0
+    queueCapture({
+      ...capture,
+      entry: {
+        ...entry,
+        status: "error",
+        replayable: false,
+        request: {
+          ...entry.request,
+          body: null,
+          truncated: true,
+          omittedReason: "queue-pressure",
+        },
+      },
+    })
     capture.controller.abort()
   }
   return id
-}
-
-function sanitizedError(
-  error: unknown,
-  credentials: ReadonlyArray<string>,
-): LlmDebugLogError {
-  const normalized = normalizeError(error)
-  return Object.fromEntries(
-    Object.entries(normalized).map(([key, value]) => [
-      key,
-      typeof value === "string" ? sanitizeDebugText(value, credentials) : value,
-    ]),
-  ) as unknown as LlmDebugLogError
 }
 
 function terminalCapture(
@@ -541,30 +573,28 @@ function terminalCapture(
   return capture
 }
 
-function sanitizeResponse(
+function captureResponse(
   response: Omit<LlmDebugLogResponse, "bodyBytes"> & { bodyBytes?: number },
   capture: LiveCapture,
 ): LlmDebugLogResponse {
-  const credentials = [
-    ...capture.credentials,
-    ...debugCredentialLiterals(response.headers),
-  ]
-  const body = sanitizeDebugCapture({
-    ...response,
-    contentType: findHeader(response.headers, "content-type"),
-    knownCredentials: credentials,
-  })
-  if (body.redacted || body.omittedReason || response.bodyReadError)
+  const body = rawDebugCapture(response)
+  if (incompleteBody(body) || response.bodyReadError)
     capture.entry.replayable = false
   return {
     ...body,
     ...(response.bodyReadError ?
-      { bodyReadError: sanitizedError(response.bodyReadError, credentials) }
+      { bodyReadError: normalizeError(response.bodyReadError) }
     : {}),
-    headers: sanitizeDebugHeaders(response.headers, credentials),
+    headers: { ...response.headers },
     status: response.status,
-    statusText: sanitizeDebugText(response.statusText, credentials),
+    statusText: response.statusText,
   }
+}
+
+function incompleteBody(body: CapturedBody): boolean {
+  return Boolean(
+    body.truncated || body.omittedReason || body.bodyBytesComplete === false,
+  )
 }
 
 export function finishLlmDebugLog(
@@ -574,9 +604,15 @@ export function finishLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, endedAtMs)
   if (!capture) return
-  capture.entry.response = sanitizeResponse(response, capture)
+  capture.entry.response = captureResponse(response, capture)
   capture.entry.status =
-    response.bodyReadError || response.status < 200 || response.status >= 300 ?
+    (
+      response.bodyReadError
+      || incompleteBody(capture.entry.request)
+      || incompleteBody(capture.entry.response)
+      || response.status < 200
+      || response.status >= 300
+    ) ?
       "error"
     : "complete"
   queueCapture(capture)
@@ -590,7 +626,7 @@ export function failLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, endedAtMs)
   if (!capture) return
-  capture.entry.error = sanitizedError(error, capture.credentials)
+  capture.entry.error = normalizeError(error)
   capture.entry.status = "error"
   queueCapture(capture)
   releaseCapture(id)
@@ -602,9 +638,9 @@ export function abortLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, options.endedAtMs ?? Date.now())
   if (!capture) return
-  capture.entry.error = sanitizedError(options.error, capture.credentials)
+  capture.entry.error = normalizeError(options.error)
   if (options.response)
-    capture.entry.response = sanitizeResponse(options.response, capture)
+    capture.entry.response = captureResponse(options.response, capture)
   capture.entry.status = "aborted"
   queueCapture(capture)
   releaseCapture(id)

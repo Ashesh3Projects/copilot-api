@@ -285,7 +285,7 @@ test("Responses stops after three fallback hops and never tries a fifth model", 
   ])
 })
 
-test("Responses stops a cycle before attempting the original model twice", async () => {
+test("Responses bypasses all fallbacks when a source cycle is configured", async () => {
   configure([
     ["chain-a", "chain-b"],
     ["chain-b", "chain-a"],
@@ -294,15 +294,10 @@ test("Responses stops a cycle before attempting the original model twice", async
     const response = await post({}, "cycle")
     expect(response.status).toBe(422)
   }
-  expect(calls.map((call) => call.body.model)).toEqual([
-    "chain-a",
-    "chain-b",
-    "chain-a",
-    "chain-b",
-  ])
+  expect(calls.map((call) => call.body.model)).toEqual(["chain-a", "chain-a"])
 })
 
-test("Responses stops an intermediate cycle before attempting B twice", async () => {
+test("Responses bypasses all fallbacks when an intermediate cycle is configured", async () => {
   configure([
     ["chain-a", "chain-b"],
     ["chain-b", "chain-c"],
@@ -310,11 +305,7 @@ test("Responses stops an intermediate cycle before attempting B twice", async ()
   ])
   statuses.set("chain-c", 422)
   expect((await post()).status).toBe(422)
-  expect(calls.map((call) => call.body.model)).toEqual([
-    "chain-a",
-    "chain-b",
-    "chain-c",
-  ])
+  expect(calls.map((call) => call.body.model)).toEqual(["chain-a"])
 })
 
 test.each([200, 422])(
@@ -338,18 +329,19 @@ test.each([200, 422])(
   },
 )
 
-test("a cached B cycle cannot return to the original A", async () => {
+test("adding a cycle bypasses a previously remembered fallback", async () => {
+  configure([["chain-a", "chain-b"]])
+  statuses.delete("chain-b")
+  expect((await post({}, "cached-source-cycle")).status).toBe(200)
+  calls.length = 0
   configure([
     ["chain-a", "chain-b"],
     ["chain-b", "chain-a"],
   ])
-  statuses.delete("chain-b")
-  expect((await post({}, "cached-source-cycle")).status).toBe(200)
-  calls.length = 0
   statuses.set("chain-b", 422)
 
   expect((await post({}, "cached-source-cycle")).status).toBe(422)
-  expect(calls.map((call) => call.body.model)).toEqual(["chain-b"])
+  expect(calls.map((call) => call.body.model)).toEqual(["chain-a"])
 })
 
 test("cached B can advance to C while full history retains only C signatures on later turns", async () => {

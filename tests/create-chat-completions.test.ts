@@ -365,7 +365,7 @@ test("forwards only matching model-scoped session tokens on Chat inference", asy
     (await listLlmDebugLogs()).entries[0]?.id ?? "",
   )
   expect(matchingDebug?.request.headers["Copilot-Session-Token"]).toBe(
-    "[REDACTED]",
+    matchingToken,
   )
 
   const longMatchingToken = sessionToken({
@@ -562,10 +562,9 @@ test("preserves an upstream body even when it contains request metadata", async 
       (await listLlmDebugLogs()).entries[0]?.id ?? "",
     )
     expect(rawDebug?.request.headers["Copilot-Session-Token"]).toBe(
-      "[REDACTED]",
+      privateToken,
     )
-    expect(rawDebug?.response?.body).not.toContain(privateToken)
-    expect(rawDebug?.response?.body).toContain("[REDACTED]")
+    expect(rawDebug?.response?.body).toContain(privateToken)
   } finally {
     errorSpy.mockRestore()
     captureException.mockRestore()

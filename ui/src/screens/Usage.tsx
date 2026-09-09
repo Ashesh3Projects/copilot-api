@@ -606,13 +606,6 @@ function AccountBalance({ data }: { data: RoutingTelemetrySnapshot }) {
               />
             ))}
         </HStack>
-        <Text type="supporting" color="secondary">
-          Session affinity deliberately keeps a client session on one account.
-          {` ${data.selectionModes.sticky.toLocaleString()} sticky · ${data.selectionModes.default.toLocaleString()} without session · ${data.selectionModes.single.toLocaleString()} single-token selections.`}
-          {
-            " Source counts describe independent account selections, not client requests."
-          }
-        </Text>
       </VStack>
     </Card>
   )
@@ -677,10 +670,6 @@ function RoutingSurface({
         <AccountBalance data={data} />
         <RouteBreakdown data={data} />
       </ResponsivePair>
-      <Text type="supporting" color="secondary">
-        Routing telemetry started {fmtRelative(data.telemetryStartedAt)} ·
-        process memory only · resets on server restart
-      </Text>
     </VStack>
   )
 }

@@ -87,6 +87,7 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
         run: |
           docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
             --env TURSO_DATABASE_URL --env TURSO_AUTH_TOKEN \
             --env CAP_STORAGE_REMOTE_SMOKE=1 --env DATA_DIR=/smoke-must-remain-absent \
             copilot-api:turso-storage-smoke

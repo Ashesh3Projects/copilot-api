@@ -152,17 +152,13 @@ test("serves LLM debug logs through dashboard API", async () => {
     }
   }
   expect(detailBody.request).toMatchObject({
-    body: JSON.stringify({
-      input: "dashboard lookup",
-      api_key: "[REDACTED]",
-      model: "gpt-ui",
-    }),
-    headers: { authorization: "[REDACTED]", cookie: "[REDACTED]" },
-    url: "https://example.test/responses?api_key=%5BREDACTED%5D",
+    body: requestBody,
+    headers: requestHeaders,
+    url,
   })
   expect(detailBody.response).toMatchObject({
-    body: JSON.stringify({ access_token: "[REDACTED]", ok: true }),
-    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
+    body: responseBody,
+    headers: responseHeaders,
   })
 
   const clearResponse = await server.request("/dashboard/api/llm-debug", {
@@ -176,6 +172,29 @@ test("serves LLM debug logs through dashboard API", async () => {
   })
   const afterClearBody = (await afterClearResponse.json()) as { count: number }
   expect(afterClearBody.count).toBe(0)
+})
+
+test("replays a raw JSON string verbatim including duplicate keys and credentials", async () => {
+  const raw =
+    ' { "model":"claude-fable-5", "model":"claude-fable-5", "messages":[], "api_key":"synthetic-key", "input":"[REDACTED]" }\r\n'
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/chat/completions",
+    requestBody: raw,
+    requestHeaders: { authorization: "Bearer synthetic-key" },
+    url: "https://api.githubcopilot.com/chat/completions",
+  })
+  const response = await server.request(
+    `/dashboard/api/llm-debug/${id}/replay`,
+    {
+      method: "POST",
+      headers: adminHeaders(adminSession),
+      body: JSON.stringify({ body: raw }),
+    },
+  )
+  expect(response.status).toBe(200)
+  const upstream = fetchMock.mock.calls[0]?.[1]
+  expect(upstream?.body).toBe(raw)
 })
 
 test("dashboard bundle ships the LLM debug UI", () => {

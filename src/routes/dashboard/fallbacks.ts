@@ -11,11 +11,13 @@ import {
   setModelFallbackConfig,
   validateModelFallbackConfig,
 } from "~/lib/model-fallback-config"
+import { getModelRoutingSafety } from "~/lib/model-routing-safety"
 
 export async function handleGetFallbacks(c: Context) {
   return c.json({
     config: await getModelFallbackConfig(),
     cache: getModelFallbackCacheStats(),
+    safety: getModelRoutingSafety(),
   })
 }
 
@@ -47,9 +49,11 @@ export async function handleSetFallbacks(c: Context) {
     )
   }
 
+  const committed = await setModelFallbackConfig(config)
   return c.json({
-    config: await setModelFallbackConfig(config),
+    config: committed,
     cache: getModelFallbackCacheStats(),
+    safety: getModelRoutingSafety(committed),
   })
 }
 

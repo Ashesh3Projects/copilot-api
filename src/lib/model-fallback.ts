@@ -18,6 +18,19 @@ import {
   mergeForeignThinking,
   type ForeignThinkingState,
 } from "~/lib/model-fallback-thinking"
+import {
+  getLoadedModelRedirects,
+  getModelRedirectRevision,
+  type ModelRedirectRequest,
+  type ModelRedirectResult,
+  type ModelRedirectRule,
+} from "~/lib/model-redirect"
+import { resolveModelRedirectRules } from "~/lib/model-redirect-resolver"
+import { getModelRoutingSafety } from "~/lib/model-routing-safety"
+import {
+  normalizeReasoningEffortForModel,
+  type ReasoningEffort,
+} from "~/lib/model-suffix"
 import { setCopilotResponseHeader } from "~/lib/request-session"
 import {
   normalizeRoutingAffinityKey,
@@ -35,6 +48,7 @@ export interface ModelFallbackRequestOptions {
 
 interface FallbackEntry {
   targetModel: string
+  route: Array<{ source: string; target: string; resolved: string }>
   requestSequence: number
   expiresAt: number
   foreignThinking: ForeignThinkingState
@@ -43,6 +57,11 @@ interface FallbackEntry {
 interface FallbackAttempt {
   config: ModelFallbackConfig
   configRevision: number
+  redirectRevision: number
+  redirects: Array<ModelRedirectRule>
+  routingRequest?: ModelRedirectRequest
+  targetRedirect?: ModelRedirectResult
+  route: FallbackEntry["route"]
   cacheEpoch: number
   requestSequence: number
   key?: string
@@ -63,6 +82,7 @@ export const MAX_MODEL_FALLBACK_HOPS = 3
 const attemptStorage = new AsyncLocalStorage<FallbackAttempt>()
 const conversationFallbacks = new Map<string, FallbackEntry>()
 let cacheRevision = -1
+let cacheRedirectRevision = -1
 let cacheEpoch = 0
 let nextRequestSequence = 0
 
@@ -130,9 +150,14 @@ function getConversationIdentity(
 
 function refreshCache(): void {
   const revision = getModelFallbackConfigRevision()
-  if (revision !== cacheRevision) {
+  const redirectRevision = getModelRedirectRevision(true)
+  if (
+    revision !== cacheRevision
+    || redirectRevision !== cacheRedirectRevision
+  ) {
     conversationFallbacks.clear()
     cacheRevision = revision
+    cacheRedirectRevision = redirectRevision
   }
   const now = Date.now()
   for (const [key, entry] of conversationFallbacks) {
@@ -244,7 +269,7 @@ function rememberAcceptedFallback(attempt: FallbackAttempt): void {
     !attempt.targetModel
     || !attempt.retry
     || !attempt.config.conversationAffinity
-    || attempt.configRevision !== getModelFallbackConfigRevision()
+    || !attemptConfigurationIsCurrent(attempt)
     || attempt.cacheEpoch !== cacheEpoch
   )
     return
@@ -267,6 +292,7 @@ function rememberAcceptedFallback(attempt: FallbackAttempt): void {
   if (!foreignThinking.complete) return
   conversationFallbacks.set(key, {
     targetModel: attempt.targetModel,
+    route: attempt.route,
     requestSequence: Math.max(
       previous?.requestSequence ?? 0,
       attempt.requestSequence,
@@ -279,6 +305,13 @@ function rememberAcceptedFallback(attempt: FallbackAttempt): void {
     if (oldest === undefined) break
     conversationFallbacks.delete(oldest)
   }
+}
+
+function attemptConfigurationIsCurrent(attempt: FallbackAttempt): boolean {
+  return (
+    attempt.configRevision === getModelFallbackConfigRevision()
+    && attempt.redirectRevision === getModelRedirectRevision(true)
+  )
 }
 
 function isSupersededFallback(
@@ -301,6 +334,51 @@ export function shouldAwaitModelFallbackBeforePreflush(): boolean {
 export function isModelFallbackActive(): boolean {
   const attempt = attemptStorage.getStore()
   return Boolean(attempt?.targetModel && (attempt.retry || attempt.cached))
+}
+
+/** The effective redirect metadata is consumed by protocol-specific preparation. */
+export function getModelFallbackRedirect(): ModelRedirectResult | undefined {
+  const attempt = attemptStorage.getStore()
+  return attempt?.retry || attempt?.cached ? attempt.targetRedirect : undefined
+}
+
+export function getModelFallbackEffort(
+  fallback?: ReasoningEffort,
+): ReasoningEffort | undefined {
+  return getModelFallbackRedirect()?.effort ?? fallback
+}
+
+function payloadRoutingRequest(payload: {
+  model: string
+}): ModelRedirectRequest {
+  const record = payload as Record<string, unknown>
+  const reasoning = isRecord(record.reasoning) ? record.reasoning : {}
+  const output = isRecord(record.output_config) ? record.output_config : {}
+  const text = isRecord(record.text) ? record.text : {}
+  const rawEffort = reasoning.effort ?? record.reasoning_effort ?? output.effort
+  const effort =
+    (
+      typeof rawEffort === "string"
+      && ["high", "low", "max", "medium", "minimal", "none", "xhigh"].includes(
+        rawEffort,
+      )
+    ) ?
+      (rawEffort as ReasoningEffort)
+    : undefined
+  const verbosity =
+    (
+      text.verbosity === "low"
+      || text.verbosity === "medium"
+      || text.verbosity === "high"
+    ) ?
+      text.verbosity
+    : undefined
+  return {
+    model: payload.model,
+    effort,
+    verbosity,
+    modelOnly: typeof rawEffort === "number",
+  }
 }
 
 function stripMessageThinking(message: Record<string, unknown>): boolean {
@@ -376,6 +454,7 @@ export function stripModelTransitionThinking(payload: unknown): void {
 /** Invoke after normal routing, before endpoint/account-specific preparation. */
 export function applyModelFallbackToPayload<T extends { model: string }>(
   payload: T,
+  routing?: Omit<ModelRedirectRequest, "model">,
 ): T {
   const attempt = attemptStorage.getStore()
   if (!attempt?.config.enabled) return payload
@@ -391,29 +470,72 @@ export function applyModelFallbackToPayload<T extends { model: string }>(
     filterForeignThinking(payload, attempt.foreignThinking)
     return payload
   }
-  if (!attempt.retry) {
-    captureForeignThinking(payload, attempt.foreignThinking)
-    attempt.sourceModel = payload.model
-    const rule = attempt.config.rules.find(
-      (entry) => entry.enabled && entry.sourceModel === payload.model,
-    )
-    attempt.targetModel = undefined
-    if (!rule) return payload
-    const key = cacheKey(attempt)
-    const cached =
-      attempt.config.conversationAffinity && key ?
-        conversationFallbacks.get(key)
-      : undefined
-    if (!cached) return payload
-    attempt.cached = true
-    attempt.targetModel = cached.targetModel
-    attempt.visitedModels.add(getModelFallbackIdentity(attempt.sourceModel))
-    attempt.foreignThinking = cached.foreignThinking
-    payload.model = cached.targetModel
-    filterForeignThinking(payload, attempt.foreignThinking)
-    return payload
+  if (attempt.retry) return payload
+  captureForeignThinking(payload, attempt.foreignThinking)
+  attempt.sourceModel = payload.model
+  attempt.routingRequest = {
+    ...payloadRoutingRequest(payload),
+    ...routing,
+    model: payload.model,
   }
+  const rule = attempt.config.rules.find(
+    (entry) => entry.enabled && entry.sourceModel === payload.model,
+  )
+  attempt.targetModel = undefined
+  if (!rule) return payload
+  const key = cacheKey(attempt)
+  const cached =
+    attempt.config.conversationAffinity && key ?
+      conversationFallbacks.get(key)
+    : undefined
+  if (!cached) return payload
+  const currentRedirect = resolveCachedFallback(attempt, cached)
+  // An effort change may select a different redirect. Re-evaluate the source
+  // normally so the transition strips thinking from the previous target.
+  if (!currentRedirect) return payload
+  attempt.cached = true
+  attempt.targetModel = cached.targetModel
+  attempt.targetRedirect = currentRedirect
+  attempt.route = cached.route
+  attempt.routingRequest = {
+    model: currentRedirect.model,
+    effort: normalizeReasoningEffortForModel(
+      currentRedirect.model,
+      currentRedirect.effort,
+    ),
+    verbosity: currentRedirect.verbosity,
+    modelOnly: attempt.routingRequest.modelOnly,
+  }
+  attempt.visitedModels.add(getModelFallbackIdentity(attempt.sourceModel))
+  attempt.foreignThinking = cached.foreignThinking
+  payload.model = cached.targetModel
+  filterForeignThinking(payload, attempt.foreignThinking)
   return payload
+}
+
+function resolveCachedFallback(
+  attempt: FallbackAttempt,
+  cached: FallbackEntry,
+): ModelRedirectResult | undefined {
+  let request = attempt.routingRequest
+  let result: ModelRedirectResult | undefined
+  if (!request) return undefined
+  for (const hop of cached.route) {
+    if (request.model !== hop.source) return undefined
+    const redirect = resolveModelRedirectRules(attempt.redirects, {
+      ...request,
+      model: hop.target,
+    })
+    if (redirect.loop || redirect.model !== hop.resolved) return undefined
+    result = redirect
+    request = {
+      model: redirect.model,
+      effort: normalizeReasoningEffortForModel(redirect.model, redirect.effort),
+      verbosity: redirect.verbosity,
+      modelOnly: request.modelOnly,
+    }
+  }
+  return result
 }
 
 export async function runWithModelFallback<T>(
@@ -424,7 +546,7 @@ export async function runWithModelFallback<T>(
   await getModelFallbackConfig()
   const config = getLoadedModelFallbackConfig()
   const configRevision = getCapturedModelFallbackConfigRevision()
-  if (!config.enabled) return await execute()
+  if (!config.enabled || !getModelRoutingSafety().safe) return await execute()
   refreshCache()
   const identity = getConversationIdentity(options)
   const credential =
@@ -434,6 +556,9 @@ export async function runWithModelFallback<T>(
   let attempt: FallbackAttempt = {
     config,
     configRevision,
+    redirectRevision: getModelRedirectRevision(),
+    redirects: getLoadedModelRedirects(),
+    route: [],
     cacheEpoch,
     requestSequence: ++nextRequestSequence,
     key:
@@ -454,9 +579,9 @@ export async function runWithModelFallback<T>(
     try {
       return await attemptStorage.run(attempt, execute)
     } catch (error) {
-      const targetModel = nextFallbackModel(attempt)
+      const targetRedirect = nextFallbackRedirect(attempt)
       if (
-        !targetModel
+        !targetRedirect
         || !canRetryFallback(attempt, error)
         || options.canRetry?.() === false
       )
@@ -464,7 +589,18 @@ export async function runWithModelFallback<T>(
       options.signal?.throwIfAborted()
       attempt = {
         ...attempt,
-        targetModel,
+        targetModel: targetRedirect.model,
+        targetRedirect,
+        route: [...attempt.route, fallbackRouteHop(attempt, targetRedirect)],
+        routingRequest: {
+          model: targetRedirect.model,
+          effort: normalizeReasoningEffortForModel(
+            targetRedirect.model,
+            targetRedirect.effort,
+          ),
+          verbosity: targetRedirect.verbosity,
+          modelOnly: attempt.routingRequest?.modelOnly,
+        },
         retry: true,
         cached: false,
         hops: attempt.hops + 1,
@@ -485,23 +621,43 @@ function activeModel(attempt: FallbackAttempt): string | undefined {
     : attempt.sourceModel
 }
 
+function fallbackRouteHop(
+  attempt: FallbackAttempt,
+  redirect: ModelRedirectResult,
+): FallbackEntry["route"][number] {
+  return {
+    source: activeModel(attempt) ?? "",
+    target: redirect.originalModel ?? redirect.model,
+    resolved: redirect.model,
+  }
+}
+
 function nextFallbackModel(attempt: FallbackAttempt): string | undefined {
+  return nextFallbackRedirect(attempt)?.model
+}
+
+function nextFallbackRedirect(
+  attempt: FallbackAttempt,
+): ModelRedirectResult | undefined {
   if (attempt.hops >= MAX_MODEL_FALLBACK_HOPS) return undefined
   const currentModel = activeModel(attempt)
   if (!currentModel) return undefined
   const rule = attempt.config.rules.find(
     (entry) => entry.enabled && entry.sourceModel === currentModel,
   )
-  return (
-      rule
-        && !attempt.visitedModels.has(
-          getModelFallbackIdentity(rule.targetModel),
-        )
-        && getModelFallbackIdentity(rule.targetModel)
-          !== getModelFallbackIdentity(currentModel)
-    ) ?
-      rule.targetModel
-    : undefined
+  if (!rule) return undefined
+  const redirect = resolveModelRedirectRules(attempt.redirects, {
+    ...attempt.routingRequest,
+    model: rule.targetModel,
+  })
+  if (
+    redirect.loop
+    || attempt.visitedModels.has(getModelFallbackIdentity(redirect.model))
+    || getModelFallbackIdentity(redirect.model)
+      === getModelFallbackIdentity(currentModel)
+  )
+    return undefined
+  return redirect
 }
 
 function canRetryFallback(attempt: FallbackAttempt, error: unknown): boolean {

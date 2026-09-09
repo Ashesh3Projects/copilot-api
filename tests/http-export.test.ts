@@ -131,14 +131,13 @@ describe("HTTP artifact formatting", () => {
         "Host: example.test",
         "content-type: application/json",
         "x-debug: true",
-        `Content-Length: ${new TextEncoder().encode(requestBody).byteLength}`,
         "",
         requestBody,
       ].join("\r\n"),
     )
   })
 
-  test("reframes a Unicode request body and strips stale body headers", () => {
+  test("exports the captured headers verbatim alongside the exact Unicode body", () => {
     const body = "Hello, 世界 🌍"
     const exported = buildRawHttpRequest({
       ...request,
@@ -159,15 +158,19 @@ describe("HTTP artifact formatting", () => {
         "POST /responses?mode=debug HTTP/1.1",
         "Host: example.test",
         "X-Before: one",
+        "cOnTeNt-LeNgTh: 999",
+        "Content-Encoding: gzip",
+        "TRANSFER-ENCODING: chunked",
+        "content-md5: stale",
+        "Digest: sha-256=stale",
         "X-After: two",
-        `Content-Length: ${new TextEncoder().encode(body).byteLength}`,
         "",
         body,
       ].join("\r\n"),
     )
   })
 
-  test("does not synthesize a content length for an empty body", () => {
+  test("preserves captured content length even when the body is empty", () => {
     const exported = buildRawHttpRequest({
       ...request,
       body: "",
@@ -181,12 +184,13 @@ describe("HTTP artifact formatting", () => {
       [
         "POST /responses?mode=debug HTTP/1.1",
         "Host: example.test",
+        "Content-Length: 999",
         "X-Debug: true",
         "",
         "",
       ].join("\r\n"),
     )
-    expect(exported).not.toContain("Content-Length")
+    expect(exported).toContain("Content-Length: 999")
   })
 })
 
@@ -297,12 +301,12 @@ describe("Assistant and response formatting", () => {
         statusText: "OK   ",
       }),
     ).toBe(
-      "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-request-id: req_1\r\nContent-Length: 23\r\n\r\n"
+      "HTTP/1.1 200 OK   \r\ncontent-type: text/event-stream\r\nContent-Length: 999\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nDigest: stale\r\nx-request-id: req_1\r\n\r\n"
         + body,
     )
   })
 
-  test("reframes a Unicode response body with its exact UTF-8 length", () => {
+  test("preserves response headers and Unicode body without synthesizing framing", () => {
     const body = "Result 🌍\n"
 
     expect(
@@ -321,8 +325,9 @@ describe("Assistant and response formatting", () => {
       [
         "HTTP/1.1 201 Created",
         "X-Before: one",
+        "CONTENT-MD5: stale",
+        "content-length: 1",
         "X-After: two",
-        `Content-Length: ${new TextEncoder().encode(body).byteLength}`,
         "",
         body,
       ].join("\r\n"),

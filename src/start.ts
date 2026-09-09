@@ -29,6 +29,7 @@ import {
 import {
   initializeStorageRuntime,
   peekStorageRuntime,
+  closeStorageRuntime,
 } from "./lib/storage/runtime"
 import { createHistoryRuntime } from "./lib/telemetry-writer"
 import { tokenPool } from "./lib/token-pool"
@@ -403,9 +404,17 @@ const combinedWebSocket = {
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
+  try {
+    await startServer(options)
+  } catch (error) {
+    await closeStorageRuntime()
+    throw error
+  }
+}
+
+async function startServer(options: RunServerOptions): Promise<void> {
   const storageRuntime = await initializeStorageRuntime()
   await mergeConfigWithDefaults()
-  await createHistoryRuntime(storageRuntime.storage)
   await initializeAdminAuth()
   initSentry()
 
@@ -468,6 +477,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   consola.box(`🌐 Operator Dashboard: ${serverUrl}/dashboard`)
 
+  await createHistoryRuntime(storageRuntime.storage)
   const runningServer = Bun.serve({
     port: options.port,
     hostname: options.host,
@@ -479,9 +489,10 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   const host = options.host ?? "localhost"
   consola.info(`Listening on: http://${host}:${options.port}/`)
 
-  installShutdown(() => {
-    void runningServer.stop(false)
-  })
+  installShutdown(
+    () => runningServer.stop(false),
+    () => runningServer.stop(true),
+  )
 }
 
 function resolveStartupApiKeyAuth(

@@ -45,6 +45,8 @@ import {
 import { createHandlerLogger } from "~/lib/logger"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
+  isModelFallbackActive,
   captureModelFallbackNotice,
   runWithModelFallback,
 } from "~/lib/model-fallback"
@@ -414,10 +416,13 @@ async function handleCompletionInner(
   }
 
   const beforeModelFallback = anthropicPayload.model
-  applyModelFallbackToPayload(anthropicPayload)
+  applyModelFallbackToPayload(anthropicPayload, {
+    effort: redirectEffort,
+    verbosity: redirect.verbosity,
+  })
   redirectEffort = normalizeReasoningEffortForModel(
     anthropicPayload.model,
-    redirectEffort,
+    getModelFallbackRedirect()?.effort ?? redirectEffort,
   )
   const customReference = resolveCustomChatModel(anthropicPayload.model)
   if (customReference) {
@@ -491,8 +496,11 @@ async function handleCompletionInner(
     selectedModel: routingModel,
     effortOverride: redirectEffort,
     preserveNativeBodyEffort:
-      suffixEffort === undefined && !redirect.redirected,
-    responsesVerbosity: redirect.verbosity,
+      suffixEffort === undefined
+      && !redirect.redirected
+      && !isModelFallbackActive(),
+    responsesVerbosity:
+      getModelFallbackRedirect()?.verbosity ?? redirect.verbosity,
     isCompact,
     signal: c.req.raw.signal,
   })

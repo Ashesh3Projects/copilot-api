@@ -63,6 +63,20 @@ export function resolveCopilotIntegrationId(value: string | undefined): string {
   return sanitized
 }
 
+/** Account overrides are nullable, trimmed HTTP field values, never global settings. */
+export function normalizeAccountIntegrationId(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  if (
+    typeof value !== "string"
+    || !/^[\x20-\x7e]*$/.test(value)
+    || value.trim().length > MAX_INTEGRATION_ID_LENGTH
+  )
+    throw new TypeError(
+      "Integration ID must contain only printable ASCII characters and be 128 characters or fewer",
+    )
+  return value.trim() || null
+}
+
 export function collectSafeCopilotResponseHeaders(
   headers: Headers,
 ): Record<string, string> {

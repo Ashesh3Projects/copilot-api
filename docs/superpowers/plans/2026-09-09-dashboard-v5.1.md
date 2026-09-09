@@ -26,15 +26,15 @@ Files: src/lib/debug-capture.ts, src/lib/llm-debug-log.ts, debug capture call si
 - [ ] Remove Latest; Refresh resets the cursor. Keep true capture failure states and retention.
 - [ ] Run each affected test file and report needed shared queue/storage changes to the coordinator.
 
-## Task 2: Activity collection and lifecycle
+## Task 2: Remove Activity (user revision)
 
 Files: src/lib/logger.ts, src/lib/telemetry-writer.ts, src/lib/storage/history-repository.ts, history lifecycle call sites, ui/src/screens/Activity.tsx, activity/history tests.
 
-- [ ] Reproduce absent normal activity and spurious unclean-run accounting with real public/logging paths.
-- [ ] Correct collection/lifecycle behavior and prove clean restart/concurrent runtime behavior.
-- [ ] Add loading/polling states and trash action in Page.actions; Refresh resets pagination.
-- [ ] Preserve real loss evidence with bounded relevant warnings and clear semantics.
-- [ ] Run affected test files, including telemetry and storage regressions.
+- [ ] Remove Activity screen, sidebar/registry, dashboard routes and event recording.
+- [ ] Add migration004 dropping capi_activity; preserve applied migrations and older backup restore compatibility.
+- [ ] Remove obsolete Activity tests; retain debug/history cursor, queue and lifecycle regressions.
+- [ ] Preserve generic raw debug queue/storage improvements and real process lifecycle accounting.
+- [ ] Run affected tests and report migration acceptance.
 
 ## Task 3: Account integration overrides and compact rows
 
@@ -79,3 +79,13 @@ Initial state: clean c8f28dd on origin/master. Worktree: ../copilot-api-v5.1, br
 Task boundaries: debug owns debug UI, activity owns shared history writer/repository, accounts owns Accounts UI and account storage, coordinator owns redirect/fallback and remaining UI. Generated dashboard is coordinator-only.
 Ruling: capture-specific shared writer/storage changes must be coordinated with Activity worker to avoid overlapping edits.
 Ruling: the user's explicit request to get all changes done and release authorizes implementation and publication; optional Settings layout preference can arrive while independent tasks proceed.
+User revision: remove Activity entirely, including existing Activity storage; replace the initial Activity repair deliverable. Keep every other 5.1.0 item active.
+Task 3 complete: per-account integration overrides, compact rows and migration003. Independent review found selection-to-dispatch pin gap during catalog refresh; scoped fix assigned to account reviewer.
+Task 5 complete: grouped single-page Settings, favicon and requested copy/preset removals. Browser checked 1600 and 390 CSS pixel widths, both themes, no page or input overflow.
+Task 1 implementation complete: raw payload/header/URL capture and exports, large-body spool, physical TTL review followup and bounded stream tap assigned to reviewer.
+Task 2 complete: Activity removed via migration004; schema2/3 backups preserve other data and discard Activity. Generic debug queue/lifecycle fixes retained.
+Task 4 review fixes: native Messages effort, custom-provider fallback target effort, Google target normalization and full cached multi-hop transformation path reproduced and repaired. Analyzer alias memoization and normalization assigned to reviewer. Snapshot and committed-save safety regressions pass.
+Review followups: idle-WebSocket shutdown now reserves finalization time and can force-close remaining connections; old already-redacted captures explicitly marked incomplete. Deprecated capture assertions and compatibility docs updated to raw contract.
+Validation in progress: 260 root test files in fresh processes; first failures were old redaction/string-copy expectations, corrected in targeted reruns. Docker build and 23 Nginx checks passed; production dependency audit checked 77 packages, no vulnerabilities. Repeat relevant/full acceptance after stream/router review changes before release.
+All independent review findings resolved: alias/raw-name traversal and effort-normalization cache invalidation (13 regressions); native/custom/compact/WS fallback effort and full cached paths; account pin held during refresh (6 regressions, 24 legacy endpoint authority checks); bounded downstream-driven raw capture tap (3 regressions); idle physical pruning; bounded shutdown with real idle WebSocket; legacy filtered data notice. Raw, routing and account reviewers report scope ready.
+Container acceptance passed with network disabled and read-only root plus tmpfs: administrator settings/version, Activity table absence, real local HTTP+WebSocket protocol paths and 3145797-byte exact raw capture/database equality. No production credentials or data used.

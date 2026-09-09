@@ -9,22 +9,20 @@ import {
 import {
   initialMigration,
   initialTables,
+  initialIndexes,
 } from "~/lib/storage/migrations/001-initial"
 import {
   currentIndexes,
   currentSchemaVersion,
   currentTables,
+  schemaThreeTables,
   storageMigrations,
 } from "~/lib/storage/schema"
 
 const checksums = storageMigrations.map((migration) =>
   createHash("sha256").update(JSON.stringify(migration)).digest("hex"),
 )
-const counterKeys = [
-  "config_revision",
-  "history_activity_generation",
-  "history_debug_generation",
-] as const
+const counterKeys = ["config_revision", "history_debug_generation"] as const
 
 export function parseStorageCounter(value: unknown): number {
   if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/.test(value)) {
@@ -76,11 +74,14 @@ async function validateSchema(
   const indexes = new Set(
     objects.filter((row) => row.type === "index").map((row) => row.name),
   )
+  let expectedTables: object = currentTables
+  if (version === 1) expectedTables = initialTables
+  else if (version < 4) expectedTables = schemaThreeTables
   if (
-    Object.keys(version === 1 ? initialTables : currentTables).some(
-      (name) => !tables.has(name),
+    Object.keys(expectedTables).some((name) => !tables.has(name))
+    || Object.keys(version < 4 ? initialIndexes : currentIndexes).some(
+      (name) => !indexes.has(name),
     )
-    || Object.keys(currentIndexes).some((name) => !indexes.has(name))
   ) {
     throw new StorageSchemaError("Application schema is incomplete")
   }
@@ -102,6 +103,8 @@ async function validateSchema(
     throw new StorageSchemaError("Required storage metadata is invalid")
   }
   for (const key of counterKeys) parseStorageCounter(metadata.get(key))
+  if (version < 4)
+    parseStorageCounter(metadata.get("history_activity_generation"))
   const lifetime = await session.query({
     sql: "SELECT id FROM capi_usage_lifetime",
     args: [],
@@ -123,6 +126,7 @@ export async function migrateStorage(storage: Storage): Promise<void> {
         const metadata: Array<[string, string]> = [
           ["schema_version", String(initialMigration.version)],
           ["store_id", randomUUID()],
+          ["history_activity_generation", "0"],
           ...counterKeys.map((key): [string, string] => [key, "0"]),
         ]
         for (const [key, value] of metadata) {

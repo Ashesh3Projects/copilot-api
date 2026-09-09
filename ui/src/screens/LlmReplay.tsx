@@ -20,6 +20,7 @@ import { CopyIcon, PlayIcon, RefreshCwIcon } from "../icons"
 import { ApiError, get, post } from "../lib/api"
 import {
   canEditReplayCapture,
+  canReplayCapture,
   hasReplacementReplayBody,
 } from "../lib/capture-state"
 import {
@@ -144,7 +145,8 @@ function LlmReplayView({ id }: { id: string }) {
   )
   const validationPending = deferredBody !== body
   const replacementReady =
-    data?.replayable === true || hasReplacementReplayBody(originalBody, body)
+    Boolean(data && canReplayCapture(data))
+    || hasReplacementReplayBody(originalBody, body)
   const canRun =
     validation.ok
     && !validationPending
@@ -296,11 +298,11 @@ function LlmReplayView({ id }: { id: string }) {
 
       {data ?
         <VStack gap={4}>
-          {!data.replayable ?
+          {!canReplayCapture(data) ?
             <Banner
               status="warning"
               title="Supply a replacement request"
-              description="The captured body was redacted, omitted, or interrupted. Review the full request, replace any redacted values, and edit it before running a replay."
+              description="The request body was not fully captured. Supply a complete request before running a replay."
             />
           : null}
           <HStack

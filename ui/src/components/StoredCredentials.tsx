@@ -1,3 +1,4 @@
+import { Badge } from "@astryxdesign/core/Badge"
 import { Banner } from "@astryxdesign/core/Banner"
 import { Button } from "@astryxdesign/core/Button"
 import { Card } from "@astryxdesign/core/Card"
@@ -64,7 +65,7 @@ export function StoredCredentials() {
     }
   }
   return (
-    <VStack gap={4}>
+    <>
       {error ?
         <Banner
           status="error"
@@ -72,28 +73,37 @@ export function StoredCredentials() {
           description={error.message}
         />
       : null}
-      <Card>
+      <Card className="settings-card">
         <VStack gap={3}>
-          <Heading level={3}>Gateway credentials</Heading>
-          <Text color="secondary">
+          <HStack gap={2} wrap="wrap" vAlign="center">
+            <Heading level={3}>Gateway credentials</Heading>
+            {data ?
+              <Badge
+                variant="neutral"
+                label={`${data.credentials.filter((key) => key.revokedAt === null).length} active`}
+              />
+            : null}
+          </HStack>
+          <Text type="supporting" color="secondary">
             Use these keys in API clients and dashboard sign-in. Add your own
             key or generate one, and reveal or copy stored keys whenever needed.
           </Text>
-          <HStack gap={2} wrap="wrap" vAlign="end">
-            <TextInput
-              label="Key label"
-              value={label}
-              onChange={setLabel}
-              placeholder="Laptop, automation…"
-            />
-            <SecretInput
-              label="Key"
-              value={credential}
-              onChange={setCredential}
-              placeholder="Enter a custom API key"
-              isDisabled={busy}
-              isRequired
-            />
+          <TextInput
+            label="Key label"
+            value={label}
+            onChange={setLabel}
+            placeholder="Laptop, automation…"
+            width="100%"
+          />
+          <SecretInput
+            label="Key"
+            value={credential}
+            onChange={setCredential}
+            placeholder="Enter a custom API key"
+            isDisabled={busy}
+            isRequired
+          />
+          <HStack gap={2} wrap="wrap">
             <Button
               label="Generate"
               variant="secondary"
@@ -121,41 +131,43 @@ export function StoredCredentials() {
               }
             />
           </HStack>
-          {data?.credentials
-            .filter((key) => key.revokedAt === null)
-            .map((key) => (
-              <SecretValue
-                key={`${key.id}:${data.revision}:${revealGeneration}`}
-                label={key.label}
-                maskedValue={key.maskedValue}
-                revealPath={`${root}/gateway/${encodeURIComponent(key.id)}/reveal`}
-                actions={
-                  <ConfirmButton
-                    label={`Delete ${key.label}`}
-                    isIconOnly
-                    icon={<Trash2Icon />}
-                    size="sm"
-                    confirmActionLabel="Delete key"
-                    confirmTitle="Delete gateway key"
-                    confirmDescription="This permanently removes the key. API clients using it will lose access."
-                    isDisabled={busy || data.credentials.length <= 1}
-                    onConfirm={() =>
-                      run(async () => {
-                        await api(
-                          "DELETE",
-                          `${root}/gateway/${encodeURIComponent(key.id)}`,
-                          undefined,
-                          {
-                            expectedRevision: data.revision,
-                          },
-                        )
-                        toast.success("Key deleted")
-                      })
-                    }
-                  />
-                }
-              />
-            ))}
+          <div className="settings-stored-keys">
+            {data?.credentials
+              .filter((key) => key.revokedAt === null)
+              .map((key) => (
+                <SecretValue
+                  key={`${key.id}:${data.revision}:${revealGeneration}`}
+                  label={key.label}
+                  maskedValue={key.maskedValue}
+                  revealPath={`${root}/gateway/${encodeURIComponent(key.id)}/reveal`}
+                  actions={
+                    <ConfirmButton
+                      label={`Delete ${key.label}`}
+                      isIconOnly
+                      icon={<Trash2Icon />}
+                      size="sm"
+                      confirmActionLabel="Delete key"
+                      confirmTitle="Delete gateway key"
+                      confirmDescription="This permanently removes the key. API clients using it will lose access."
+                      isDisabled={busy || data.credentials.length <= 1}
+                      onConfirm={() =>
+                        run(async () => {
+                          await api(
+                            "DELETE",
+                            `${root}/gateway/${encodeURIComponent(key.id)}`,
+                            undefined,
+                            {
+                              expectedRevision: data.revision,
+                            },
+                          )
+                          toast.success("Key deleted")
+                        })
+                      }
+                    />
+                  }
+                />
+              ))}
+          </div>
           {data?.credentials.length === 1 ?
             <Text type="supporting" color="secondary">
               Create a replacement before deleting your last gateway key.
@@ -163,10 +175,10 @@ export function StoredCredentials() {
           : null}
         </VStack>
       </Card>
-      <Card>
+      <Card className="settings-card">
         <VStack gap={3}>
           <Heading level={3}>Speech transcription</Heading>
-          <Text color="secondary">
+          <Text type="supporting" color="secondary">
             {data?.groq.apiKeyConfigured ?
               "Reveal or copy the current key below. Enter a replacement only when you want to change it."
             : "Add a Groq API key to enable transcription."}
@@ -236,6 +248,6 @@ export function StoredCredentials() {
           </HStack>
         </VStack>
       </Card>
-    </VStack>
+    </>
   )
 }

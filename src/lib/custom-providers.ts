@@ -17,7 +17,11 @@ import type {
 } from "~/services/copilot/create-embeddings"
 
 import { getConfigForTest } from "~/lib/config"
-import { captureDebugResponseBody } from "~/lib/debug-capture"
+import {
+  tapDebugResponse,
+  type CapturedBody,
+  DebugCaptureError,
+} from "~/lib/debug-capture"
 import { CustomProviderHTTPError, LocalHTTPError } from "~/lib/error"
 import {
   abortLlmDebugLog,
@@ -95,6 +99,7 @@ interface CustomProviderFetchRequest {
   reference: CustomProviderModelReference
   path: "/chat/completions" | "/embeddings"
   payload: Record<string, unknown>
+  rawBody?: string
   options?: CustomProviderRequestOptions
 }
 
@@ -455,7 +460,7 @@ async function fetchCustomProvider(
   const { reference, path, payload, options } = request
   const url = providerUrl(reference.provider, path)
   const headers = buildHeaders(reference.provider)
-  const body = JSON.stringify(payload)
+  const body = request.rawBody ?? JSON.stringify(payload)
   consola.info(
     `Custom provider request: ${reference.provider.name}/${reference.provider.id}/${reference.upstreamModel} POST ${path}`,
   )
@@ -468,14 +473,22 @@ async function fetchCustomProvider(
     url,
   })
   try {
-    const response = await fetch(url, {
+    const upstreamResponse = await fetch(url, {
       method: "POST",
       headers,
       body,
       signal: options?.signal,
     })
+    const captureSignal = getLlmDebugCaptureSignal(logId)
+    const tapped = tapDebugResponse(
+      upstreamResponse,
+      options?.signal ?
+        AbortSignal.any([options.signal, captureSignal])
+      : captureSignal,
+    )
+    const response = tapped.response
     if (path === "/chat/completions") recordModelFallbackResponse(response)
-    void captureCustomProviderDebugResponse(logId, response, options?.signal)
+    void captureCustomProviderDebugResponse(logId, response, tapped.capture)
     recordCustomProviderCall({
       outcome: customProviderOutcome(response),
       path,
@@ -500,15 +513,11 @@ async function fetchCustomProvider(
 async function captureCustomProviderDebugResponse(
   logId: string,
   response: Response,
-  signal?: AbortSignal,
+  captured: Promise<CapturedBody>,
 ): Promise<void> {
   const headers = Object.fromEntries(response.headers.entries())
   try {
-    const captureSignal = getLlmDebugCaptureSignal(logId)
-    const body = await captureDebugResponseBody(
-      response,
-      signal ? AbortSignal.any([signal, captureSignal]) : captureSignal,
-    )
+    const body = await captured
     finishLlmDebugLog(logId, {
       ...body,
       headers,
@@ -518,14 +527,20 @@ async function captureCustomProviderDebugResponse(
   } catch (error) {
     const debugResponse = {
       body: null,
+      bodyBytes: 0,
+      bodyBytesComplete: false,
       omittedReason: "read-error" as const,
-      bodyReadError: toLlmDebugLogError(error),
+      ...(error instanceof DebugCaptureError ? error.capture : {}),
+      bodyReadError: toLlmDebugLogError(
+        error instanceof DebugCaptureError ? error.cause : error,
+      ),
       headers,
       status: response.status,
       statusText: response.statusText,
     }
-    if (isAbortLikeError(error)) {
-      abortLlmDebugLog(logId, { error, response: debugResponse })
+    const cause = error instanceof DebugCaptureError ? error.cause : error
+    if (isAbortLikeError(cause) || isAbortLikeError(error)) {
+      abortLlmDebugLog(logId, { error: cause, response: debugResponse })
       return
     }
     finishLlmDebugLog(logId, debugResponse)
@@ -688,6 +703,7 @@ export async function replayCustomProviderRequest(options: {
   providerId: string
   originalUrl: string
   payload: Record<string, unknown>
+  rawBody?: string
   signal?: AbortSignal
 }): Promise<Response> {
   const provider = getCustomProviders().find(
@@ -725,6 +741,7 @@ export async function replayCustomProviderRequest(options: {
     },
     path: "/chat/completions",
     payload: options.payload,
+    rawBody: options.rawBody,
     options: { signal: options.signal },
   })
 }

@@ -15,6 +15,7 @@ import { StorageSchemaError } from "~/lib/storage/errors"
 import { loadCustomProviderSnapshotFromSession } from "~/lib/storage/providers-repository"
 import { validateStoredFeatureFlags } from "~/routes/feature-flags/store"
 import { validateStatsigOverrides } from "~/routes/statsig-overrides/store"
+import { normalizeAccountIntegrationId } from "~/services/copilot/copilot-contract"
 
 const validators: Record<string, (value: unknown) => unknown> = {
   app: validateAppConfigJson,
@@ -115,12 +116,21 @@ export async function validateTransferDomains(
   })
   for (const row of admin) validateAdminPasswordHash(String(row.password_hash))
   const accounts = await session.query({
-    sql: "SELECT id,domain FROM capi_accounts",
+    sql: "SELECT id,domain,integration_id FROM capi_accounts",
     args: [],
   })
-  for (const row of accounts)
+  for (const row of accounts) {
     if (normalizeGitHubDomain(String(row.domain)) !== row.domain)
       throw new StorageSchemaError("Invalid imported account domain")
+    try {
+      if (
+        normalizeAccountIntegrationId(row.integration_id) !== row.integration_id
+      )
+        throw new TypeError()
+    } catch {
+      throw new StorageSchemaError("Invalid imported account integration ID")
+    }
+  }
   const missing = await session.query({
     sql: "SELECT a.id FROM capi_accounts a LEFT JOIN capi_account_credentials c ON a.id=c.account_id WHERE a.deleted_at IS NULL AND a.enabled=1 AND c.account_id IS NULL LIMIT 1",
     args: [],

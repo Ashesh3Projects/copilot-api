@@ -16,6 +16,7 @@ import { useState } from "react"
 
 import type {
   ModelRedirect,
+  ModelRoutingSafety,
   RedirectSourceEffort,
   RedirectTargetEffort,
   RedirectTargetVerbosity,
@@ -30,6 +31,7 @@ import {
   RowActions,
   TogglePill,
 } from "../components/common"
+import { ModelRoutingWarning } from "../components/ModelRoutingWarning"
 import { Page } from "../components/Page"
 import {
   AlertTriangleIcon,
@@ -132,8 +134,12 @@ function toRequestBody(form: RedirectFormState) {
   }
 }
 
-function loadRedirects(): Promise<Array<ModelRedirect>> {
-  return get<Array<ModelRedirect>>("/dashboard/api/model-redirects")
+async function loadRedirects() {
+  const [redirects, safety] = await Promise.all([
+    get<Array<ModelRedirect>>("/dashboard/api/model-redirects"),
+    get<ModelRoutingSafety>("/dashboard/api/model-routing-safety"),
+  ])
+  return { redirects, safety }
 }
 
 export default function ModelRedirectsScreen() {
@@ -144,7 +150,7 @@ export default function ModelRedirectsScreen() {
   const [form, setForm] = useState<RedirectFormState>(EMPTY_FORM)
   const [isSaving, setIsSaving] = useState(false)
 
-  const redirects = data ?? []
+  const redirects = data?.redirects ?? []
 
   function startEdit(row: ModelRedirect) {
     setEditingId(row.id)
@@ -367,6 +373,7 @@ export default function ModelRedirectsScreen() {
       onRefresh={reload}
       isRefreshing={loading}
     >
+      <ModelRoutingWarning safety={data?.safety} />
       <Text type="supporting" color="secondary">
         Silent — clients see the original model
       </Text>

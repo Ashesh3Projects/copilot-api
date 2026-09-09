@@ -1,7 +1,6 @@
 import type { ComponentType, LazyExoticComponent } from "react"
 
 import AccountsScreen from "./Accounts"
-import ActivityScreen from "./Activity"
 import CustomProvidersScreen from "./CustomProviders"
 import EnvironmentsScreen from "./Environments"
 import FallbacksScreen from "./Fallbacks"
@@ -24,7 +23,6 @@ export interface ScreenEntry {
 }
 
 export const SCREENS: Record<string, ScreenEntry> = {
-  activity: { kicker: "Monitor", title: "Activity", component: ActivityScreen },
   accounts: {
     kicker: "Control",
     title: "GitHub accounts",

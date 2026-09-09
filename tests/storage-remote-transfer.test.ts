@@ -221,13 +221,6 @@ async function seedSource(storage: Storage) {
       payload: { requestCount: 3, timestamp: now },
     },
     {
-      id: "transfer-activity",
-      kind: "activity",
-      recordedAt: now,
-      generation: 0,
-      payload: { type: "info", message: "transfer activity" },
-    },
-    {
       id: "transfer-debug",
       kind: "debug",
       recordedAt: now,
@@ -333,10 +326,6 @@ async function verifyRepositories(
       firstRequestAt: 60_000,
     },
   })
-  expect(
-    (await history.get("activity", "transfer-activity", [], fixture.now))
-      ?.payload,
-  ).toMatchObject({ message: "transfer activity" })
   expect(
     (await history.get("debug", "transfer-debug", [], fixture.now))?.payload,
   ).toMatchObject({ status: "completed" })

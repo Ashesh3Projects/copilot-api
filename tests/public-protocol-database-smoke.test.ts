@@ -27,6 +27,18 @@ test("real public protocols and WebSocket next-turn revocation use database stat
       "public-smoke-key",
     )
     expect(result.requests).toBe(6)
+    await history.writer.flush()
+    expect(
+      (await history.repository.readUsage(0)).lifetime.requestCount,
+    ).toBeGreaterThan(0)
+    expect(
+      await fixture.storage.read((session) =>
+        session.query({
+          sql: "SELECT name FROM sqlite_master WHERE name = 'capi_activity'",
+          args: [],
+        }),
+      ),
+    ).toEqual([])
   } finally {
     await history?.close(5000)
     await fixture.close()

@@ -48,7 +48,7 @@ test("backup payload pages avoid combining large fields and preserve continuatio
         args: [JSON.stringify({ extraPrompts: { large } })],
       },
       ...Array.from({ length: 6 }, (_, i) => ({
-        sql: "INSERT INTO capi_activity(id,generation,created_at,expires_at,kind,payload_json,payload_bytes) VALUES(?,0,0,1,'info',?,?)",
+        sql: "INSERT INTO capi_debug(id,generation,created_at,updated_at,expires_at,status,payload_json,payload_bytes) VALUES(?,0,0,0,1,'pending',?,?)",
         args: [
           `large-${i}`,
           JSON.stringify({ message: "x".repeat(600000) }),
@@ -95,7 +95,7 @@ test("backup payload pages avoid combining large fields and preserve continuatio
       }
       expect(restored.extraPrompts.large).toBe(large)
       expect(
-        records.filter((record) => record.table === "capi_activity"),
+        records.filter((record) => record.table === "capi_debug"),
       ).toHaveLength(6)
     })
     expect(payloadQueries).toBeGreaterThan(1)

@@ -55,6 +55,7 @@ import {
 import { ApiError, del, get } from "../lib/api"
 import {
   canEditReplayCapture,
+  canReplayCapture,
   captureOmissionMessage,
 } from "../lib/capture-state"
 import { formatDuration } from "../lib/duration-format"
@@ -182,9 +183,14 @@ function LlmDebugListView() {
   })
   const sortPlugin = useTableSortable<DebugRow>(sortConfig)
 
+  function refreshLatest() {
+    setCursor(undefined)
+    reload()
+  }
+
   async function handleClearAll() {
     await del("/dashboard/api/llm-debug")
-    reload()
+    refreshLatest()
   }
 
   async function handleExport() {
@@ -308,7 +314,7 @@ function LlmDebugListView() {
     <Page
       kicker="Monitor"
       title="LLM Debug"
-      onRefresh={reload}
+      onRefresh={refreshLatest}
       isRefreshing={loading}
       actions={
         entries.length > 0 ?
@@ -352,14 +358,6 @@ function LlmDebugListView() {
       : null}
 
       <HStack gap={2}>
-        <Button
-          label="Latest"
-          variant="secondary"
-          onClick={() => {
-            setCursor(undefined)
-            reload()
-          }}
-        />
         {data?.cursor ?
           <Button
             label="Older captures"
@@ -594,7 +592,9 @@ function LlmDebugDetailView({ id }: { id: string }) {
             onClick={() => copy(globalThis.location.href)}
           />
           <Button
-            label={data?.replayable ? "Replay" : "Edit and replay"}
+            label={
+              data && canReplayCapture(data) ? "Replay" : "Edit and replay"
+            }
             variant="primary"
             icon={<PlayIcon />}
             isDisabled={!showReplay}

@@ -14,9 +14,9 @@ Settings remains one page unless the user chooses tabs. Group compact credential
 
 Retain original request/response body strings, headers and URLs without secret filtering or JSON/SSE reconstruction. Keep successful retention at ten minutes and unsuccessful retention at one hour. Capture must not alter or delay the client stream. Preserve true read/transport failure reporting; do not claim an incomplete capture is complete. Remove replay denial and warnings caused solely by redaction. Old already-redacted entries cannot be reconstructed. Other logs and sanitized configuration export keep their existing behavior.
 
-## Activity
+## Activity removal (user revision)
 
-Trace actual runtime logging through the writer, repository and UI. Record useful gateway request/lifecycle activity during normal operation and show loading, empty and error states. Auto-refresh current events and retain older pagination. Move clear history to a trash icon next to Refresh with existing confirmation. Correct process-run accounting so normal lifecycle/admin commands and concurrent healthy runs do not create spurious gaps. Historical gaps must not perpetually dominate new history; clear semantics and retention must be coherent without inventing recovered records.
+The user explicitly removed Activity from scope as a feature and authorized deleting its storage. Remove the page, sidebar/registry entry, dashboard API, event recording and current database table. An additive migration drops existing activity history. Preserve unrelated usage/routing telemetry and LLM debug storage, capture, retention and generic process-run/shutdown correctness. Support older encrypted backups by discarding obsolete activity on restore while preserving all remaining data. Applied migrations stay immutable.
 
 ## Redirects and fallback composition
 

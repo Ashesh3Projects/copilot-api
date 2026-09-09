@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 
 import type { Model } from "~/services/copilot/get-models"
 
+import { setConfigForTest } from "~/lib/config"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -46,6 +47,37 @@ function model(id: string, endpoint = "/responses"): Model {
     },
   }
 }
+
+test("native Responses applies fallback target redirects, effort and verbosity on consecutive turns", async () => {
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "high",
+      targetVerbosity: "low",
+      enabled: true,
+    },
+  ])
+  for (let i = 0; i < 2; i++) {
+    const response = await post(
+      { reasoning: { effort: "low" }, text: { verbosity: "high" } },
+      { "thread-id": "redirect-thread" },
+    )
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(calls.at(-1)?.body.model).toBe("fast-target")
+    expect(calls.at(-1)?.body.reasoning).toMatchObject({ effort: "high" })
+    expect(calls.at(-1)?.body.text).toMatchObject({ verbosity: "low" })
+  }
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "source-model",
+    "fast-target",
+    "fast-target",
+  ])
+})
 
 function configure(extra: Record<string, unknown> = {}): void {
   setModelFallbackConfigForTest(
@@ -160,6 +192,73 @@ afterEach(() => {
   setModelSettingsForTest([])
   setModelFallbackConfigForTest(null)
   clearModelFallbackCache()
+  setConfigForTest(null)
+})
+
+test("custom-provider source retries native Responses with redirected effort", async () => {
+  setConfigForTest({
+    customProviders: [
+      {
+        id: "custom",
+        name: "Custom",
+        type: "openai-compatible",
+        baseUrl: "https://custom.example/v1",
+        apiKey: "synthetic",
+        models: [{ id: "custom-source", kind: "chat" }],
+      },
+    ],
+  })
+  configure({
+    rules: [
+      {
+        id: "cross-provider",
+        sourceModel: "custom-source",
+        targetModel: "target-model",
+        enabled: true,
+      },
+    ],
+  })
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "high",
+      enabled: true,
+    },
+  ])
+  const original = globalThis.fetch
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    if (
+      typeof init?.body === "string"
+      && (JSON.parse(init.body) as Record<string, unknown>).model
+        === "custom-source"
+    ) {
+      calls.push({
+        path: "/chat/completions",
+        body: JSON.parse(init.body) as Record<string, unknown>,
+      })
+      return new Response("unprocessable", { status: 422 })
+    }
+    return await original(input, init)
+  }) as typeof fetch
+  const response = await post({
+    model: "custom-source",
+    reasoning: { effort: "low" },
+  })
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "custom-source",
+    "fast-target",
+  ])
+  expect(calls[1].path).toBe("/responses")
+  expect(calls[1].body.reasoning).toMatchObject({ effort: "high" })
 })
 
 function post(

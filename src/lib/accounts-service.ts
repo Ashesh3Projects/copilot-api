@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto"
 
 import type {
   AccountRecord,
+  AccountUpdate,
   ValidatedAccount,
 } from "~/lib/storage/accounts-repository"
 import type { Committed, MutationContext, Storage } from "~/lib/storage/types"
@@ -39,6 +40,10 @@ import {
 } from "~/lib/storage/operations"
 import { getStorageRuntime, peekStorageRuntime } from "~/lib/storage/runtime"
 import { TokenPool, tokenPool } from "~/lib/token-pool"
+import {
+  DEFAULT_COPILOT_INTEGRATION_ID,
+  normalizeAccountIntegrationId,
+} from "~/services/copilot/copilot-contract"
 import { getGitHubUser } from "~/services/github/get-user"
 import { resolveCopilotOAuth } from "~/services/github/resolve-copilot-oauth"
 
@@ -47,6 +52,7 @@ export interface CreateAccountInput {
   instanceDomain?: string
   label?: string | null
   accountType?: string
+  integrationId?: string | null
 }
 
 export interface AccountValidation {
@@ -71,10 +77,16 @@ export async function validateAccount(
     input.instanceDomain ?? DEFAULT_GITHUB_DOMAIN,
   )
   const accountType = input.accountType ?? "individual"
+  const integrationId = normalizeAccountIntegrationId(input.integrationId)
   // GET /user.id is immutable; Copilot analytics_tracking_id is a different identity.
   const [user, resolved] = await Promise.all([
     getGitHubUser(token, instanceDomain),
-    resolveCopilotOAuth({ githubToken: token, instanceDomain, accountType }),
+    resolveCopilotOAuth({
+      githubToken: token,
+      instanceDomain,
+      accountType,
+      integrationId,
+    }),
   ])
   if (
     !Number.isSafeInteger(user.id)
@@ -88,6 +100,7 @@ export async function validateAccount(
       token,
       instanceDomain,
       accountType,
+      integrationId,
       upstreamUserId: String(user.id),
       login: user.login,
       label: input.label?.trim() || null,
@@ -160,18 +173,29 @@ export class AccountsService {
     const page = await this.repository.listWithRevision()
     const accounts = page.accounts
       .filter((record) => record.removedAt === null)
-      .map((record) => ({
-        ...record,
-        healthy: runtime.get(record.id)?.healthy ?? false,
-        modelCount: runtime.get(record.id)?.models.size ?? 0,
-      }))
-    return { revision: page.revision, accounts }
+      .map((record) => {
+        const account = runtime.get(record.id)
+        const matches =
+          account?.credentialRevision === record.credentialRevision
+          && (account.integrationId ?? null) === record.integrationId
+        return {
+          ...record,
+          healthy: matches ? account.healthy : false,
+          modelCount: matches ? account.models.size : 0,
+        }
+      })
+    return {
+      revision: page.revision,
+      accounts,
+      defaultIntegrationId: DEFAULT_COPILOT_INTEGRATION_ID,
+    }
   }
 
   async create(
     input: CreateAccountInput,
     context: MutationContext,
   ): Promise<Committed<AccountRecord>> {
+    const integrationId = normalizeAccountIntegrationId(input.integrationId)
     const replay = await this.repository.replayCreate(
       {
         token: input.token.trim(),
@@ -180,6 +204,7 @@ export class AccountsService {
         ),
         label: input.label?.trim() || null,
         accountType: input.accountType ?? "individual",
+        ...(integrationId ? { integrationId } : {}),
       },
       context,
     )
@@ -225,7 +250,7 @@ export class AccountsService {
 
   async update(
     id: number,
-    input: { enabled?: boolean; label?: string | null },
+    input: AccountUpdate,
     context: MutationContext,
   ): Promise<Committed<AccountRecord>> {
     const committed = await this.repository.update(id, input, context)
@@ -259,6 +284,7 @@ export class AccountsService {
           instanceDomain: before.record.instanceDomain,
           label: before.record.label,
           accountType: before.record.accountType,
+          integrationId: before.record.integrationId,
         })
         return async () => {
           const committed = await this.repository.replace(
@@ -414,6 +440,7 @@ export class AccountsService {
             instanceDomain: before.record.instanceDomain,
             label: before.record.label,
             accountType: before.record.accountType,
+            integrationId: before.record.integrationId,
           }),
           getStorageDeadline() ?? Date.now() + 30_000,
         )
@@ -465,6 +492,7 @@ export class AccountsService {
     const current = await this.repository.get(record.id)
     if (
       current.record.credentialRevision !== record.credentialRevision
+      || current.record.integrationId !== record.integrationId
       || current.token !== validated.persisted.token
       || current.record.removedAt !== null
     )
@@ -490,6 +518,7 @@ export class AccountsService {
       githubInstanceDomain: record.instanceDomain,
       githubUsername: record.login ?? undefined,
       accountType: record.accountType,
+      integrationId: record.integrationId,
       credentialRevision: record.credentialRevision,
       enabled: record.enabled,
       deleting: record.deleting,
@@ -530,6 +559,20 @@ export class AccountsService {
     }
   }
 
+  private matchesRuntimeAccount(
+    previous: Account | undefined,
+    record: AccountRecord,
+    token: string,
+  ): previous is Account {
+    return (
+      previous !== undefined
+      && previous.credentialRevision === record.credentialRevision
+      && previous.githubToken === token
+      && previous.githubInstanceDomain === record.instanceDomain
+      && (previous.integrationId ?? null) === record.integrationId
+    )
+  }
+
   private async loadRuntime(): Promise<void> {
     if ((await getStoreRevision(this.repository.storage)) === this.revision)
       return
@@ -551,10 +594,7 @@ export class AccountsService {
       const previous = this.pool
         .getAllAccounts()
         .find((account) => account.id === record.id)
-      const unchanged =
-        previous?.credentialRevision === record.credentialRevision
-        && previous.githubToken === token
-        && previous.githubInstanceDomain === record.instanceDomain
+      const unchanged = this.matchesRuntimeAccount(previous, record, token)
       this.pool.publishAccount(
         unchanged ?
           {
@@ -596,6 +636,7 @@ export class AccountsService {
           instanceDomain: record.instanceDomain,
           label: record.label,
           accountType: record.accountType,
+          integrationId: record.integrationId,
         })
         if (
           record.upstreamUserId !== null

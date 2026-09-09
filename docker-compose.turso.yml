@@ -6,6 +6,8 @@ services:
     container_name: copilot-api
     restart: unless-stopped
     read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
     ports:
       - "127.0.0.1:4141:4141"
     environment:

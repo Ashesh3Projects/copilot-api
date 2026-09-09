@@ -43,6 +43,7 @@ import {
 } from "~/lib/error"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
   runWithModelFallback,
 } from "~/lib/model-fallback"
 import {
@@ -195,7 +196,7 @@ async function handleCompletionInner(
   })
 
   if (customReferenceBeforeCopilot) {
-    applyModelFallbackToPayload(replacedPayload)
+    applyModelFallbackToPayload(replacedPayload, { effort: requestedEffort })
     normalizedModel = normalizeModelName(replacedPayload.model)
     customReferenceBeforeCopilot = resolveCustomProviderModel({
       model: replacedPayload.model,
@@ -208,6 +209,9 @@ async function handleCompletionInner(
       replacedPayload,
     ) as unknown as PreparedChatCompletionsSource
     customSource.model = replacedPayload.model
+    const fallbackEffort = getModelFallbackRedirect()?.effort
+    if (fallbackEffort !== undefined)
+      customSource.reasoning_effort = fallbackEffort
     const customCandidate = await prepareCustomProviderChatCandidate({
       source: customSource,
       signal: c.req.raw.signal,
@@ -221,7 +225,7 @@ async function handleCompletionInner(
       payload: customPayload,
       requestedModel,
       appliedRules,
-      reasoningEffort: requestedEffort,
+      reasoningEffort: getModelFallbackRedirect()?.effort ?? requestedEffort,
       webSearchMaxUses: customCandidate.webSearchMaxUses,
     })
   }
@@ -254,11 +258,14 @@ async function handleCompletionInner(
     redirectedSource as unknown as ChatCompletionsPayload & { model: string },
   )
   redirectedSource.model = fallbackPayload.model
-  applyModelFallbackToPayload(redirectedSource)
-  if (redirectedSource.model !== targetModel) {
+  applyModelFallbackToPayload(redirectedSource, {
+    effort: reasoningEffort,
+    verbosity,
+  })
+  if (redirectedSource.model !== targetModel || getModelFallbackRedirect()) {
     reasoningEffort = normalizeReasoningEffortForModel(
       redirectedSource.model,
-      reasoningEffort,
+      getModelFallbackRedirect()?.effort ?? reasoningEffort,
     )
     applyRedirectedReasoningEffort({
       c,
@@ -330,7 +337,7 @@ async function handleCompletionInner(
   const candidates = await prepareChatCandidates({
     nativeMessagesOptions: { ...nativeOptions },
     reasoningEffort,
-    responsesVerbosity: verbosity,
+    responsesVerbosity: getModelFallbackRedirect()?.verbosity ?? verbosity,
     selectedModel,
     signal: c.req.raw.signal,
     source: routableSource,

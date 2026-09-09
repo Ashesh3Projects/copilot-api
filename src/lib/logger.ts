@@ -1,8 +1,5 @@
 import consola, { type ConsolaInstance } from "consola"
-import { randomUUID } from "node:crypto"
 import util from "node:util"
-
-import { peekHistoryRuntime } from "~/lib/telemetry-writer"
 
 import {
   readDescriptorSnapshotValue,
@@ -279,14 +276,6 @@ function createHandlerLogReporter(name: string) {
           process.stderr
         : process.stdout
       output.write(`${line}\n`)
-      const runtime = peekHistoryRuntime()
-      runtime?.writer.enqueue({
-        id: randomUUID(),
-        kind: "activity",
-        generation: runtime.generations.activity,
-        recordedAt: logObj.date.getTime(),
-        payload: { type: logObj.type, handler: name, message: line },
-      })
     },
   }
 }

@@ -348,7 +348,7 @@ replay is possible.
 <!-- compatibility-contract:session-token-privacy:start -->
 | Surface | Behavior |
 | --- | --- |
-| Administrator-only LLM Debug | session token value is redacted |
+| Administrator-only LLM Debug | session token value is retained in raw capture |
 | Ordinary handler logs | session token value is redacted |
 | Configuration export | token-keyed values are redacted |
 | Inference forwarding | multi-account mode also requires issuer proof for the selected account |
@@ -429,12 +429,12 @@ and configuration exports keep their established ordinary client/log/Sentry
 controls. Header allowlisting and recursive scrubbing remain independent of
 body forwarding.
 
-Administrator-only LLM Debug stores bounded, sanitized request and response
-attempts in the selected database. Credentials and secret-bearing fields are
-redacted before enqueue. Successful captures expire after ten minutes; failed
+Administrator-only LLM Debug stores raw request and response attempts in the
+selected database, including credentials and secret-bearing fields. Captured
+body text and headers are not filtered. Successful captures expire after ten minutes; failed
 or interrupted captures after one hour, with earlier capacity eviction possible.
 Replay requires a complete eligible capture and obtains fresh credentials.
-Prompts and non-secret response content can still be sensitive. Final upstream
+Raw captures can contain sensitive values. Final upstream
 HTTP failure bodies retain their separate passthrough contract above.
 
 ## Verification matrix and last-audited date

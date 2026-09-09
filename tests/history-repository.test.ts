@@ -47,9 +47,9 @@ test("uncertain clear blocks new diagnostics with visible loss until generation 
   )
   const diagnostic = (id: string): HistoryRecord => ({
     id,
-    kind: "activity",
+    kind: "debug",
     recordedAt: Date.now(),
-    generation: runtime.generations.activity,
+    generation: runtime.generations.debug,
     payload: { type: "info", message: "safe" },
   })
   const preClear = diagnostic("old-capture")
@@ -57,7 +57,7 @@ test("uncertain clear blocks new diagnostics with visible loss until generation 
     loseClear = true
     let rejected = false
     try {
-      await runtime.clear("activity")
+      await runtime.clear("debug")
     } catch {
       rejected = true
     }
@@ -69,12 +69,12 @@ test("uncertain clear blocks new diagnostics with visible loss until generation 
     expect(runtime.writer.status().degraded).toBe(true)
     unavailable = false
     await runtime.writer.flush()
-    expect(runtime.generations.activity).toBe(1)
+    expect(runtime.generations.debug).toBe(1)
     runtime.writer.enqueue(preClear)
     expect(runtime.writer.enqueue(diagnostic("after-recovery"))).toBe(true)
     await runtime.writer.flush()
     expect(
-      (await runtime.repository.list("activity")).records.map(
+      (await runtime.repository.list("debug")).records.map(
         (record) => record.id,
       ),
     ).toEqual(["after-recovery"])
@@ -115,15 +115,15 @@ test("concurrent clear response delays cannot move the cached generation backwar
   try {
     const initialTransactions = transactions
     delay = true
-    const first = runtime.clear("activity")
+    const first = runtime.clear("debug")
     await committed.promise
-    const second = runtime.clear("activity")
+    const second = runtime.clear("debug")
     await Bun.sleep(20)
     expect(transactions).toBe(initialTransactions + 1)
     release.resolve(undefined)
     expect(await first).toBe(1)
     expect(await second).toBe(2)
-    expect(runtime.generations.activity).toBe(2)
+    expect(runtime.generations.debug).toBe(2)
   } finally {
     release.resolve(undefined)
     await runtime.close(500)
@@ -176,8 +176,8 @@ test("clear reconciles its receipt after a lost commit response", async () => {
       return value
     },
   })
-  expect(await repository.clear("activity")).toBe(1)
-  expect(await repository.generations()).toMatchObject({ activity: 1 })
+  expect(await repository.clear("debug")).toBe(1)
+  expect(await repository.generations()).toMatchObject({ debug: 1 })
 })
 
 async function fixture() {
@@ -238,32 +238,157 @@ test("pruning retains old usage minutes and lifetime totals", async () => {
   expect((await repository.readUsage(now)).lifetime.requestCount).toBe(1)
 })
 
-test("clear generation prevents queued activity from resurrecting", async () => {
+test("clear generation prevents queued debug from resurrecting", async () => {
   const { repository } = await fixture()
   const record: HistoryRecord = {
     id: "a",
-    kind: "activity",
+    kind: "debug",
     generation: 0,
     recordedAt: Date.now(),
     payload: { type: "info", message: "safe" },
   }
   await repository.applyBatch("first", [record])
-  expect((await repository.list("activity")).records).toHaveLength(1)
-  expect(await repository.clear("activity")).toBe(1)
+  expect((await repository.list("debug")).records).toHaveLength(1)
+  expect(await repository.clear("debug")).toBe(1)
   await repository.applyBatch("delayed", [{ ...record, id: "b" }])
-  expect((await repository.list("activity")).records).toHaveLength(0)
+  expect((await repository.list("debug")).records).toHaveLength(0)
 })
 
-test("unclean prior runs create an unknown gap once; clean runs do not", async () => {
-  const { repository } = await fixture()
-  await repository.startRun("first", Date.now())
-  await repository.startRun("second", Date.now())
-  await repository.endRun("second", Date.now())
-  await repository.startRun("third", Date.now())
+test("only stale unclosed runs create one unknown gap, not concurrently healthy or clean runs", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const repository = createHistoryRepository(storage, { now: () => now })
+  await repository.startRun("first", now)
+  await repository.startRun("second", now)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(0)
+  await repository.endRun("second", now)
+  now += 300_001
+  await repository.startRun("third", now)
+  await repository.startRun("fourth", now)
   expect(await repository.collectionStatus()).toMatchObject({
     knownLostRecords: 0,
     unknownGaps: 1,
   })
+})
+
+test("idle runtimes renew their lease and closing only interrupts their own unfinished captures", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const first = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  const capture = (id: string): HistoryRecord => ({
+    id,
+    kind: "debug",
+    generation: 0,
+    recordedAt: now,
+    payload: {
+      status: "streaming",
+      replayable: true,
+      request: { body: "exact fixture" },
+    },
+  })
+  first.writer.enqueue(capture("first-capture"))
+  await first.writer.flush()
+  now += 290_000
+  await first.writer.flush()
+  now += 20_000
+  const second = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  try {
+    second.writer.enqueue(capture("second-capture"))
+    await second.writer.flush()
+    expect((await second.repository.collectionStatus()).unknownGaps).toBe(0)
+    expect(
+      (await second.repository.get("debug", "first-capture"))?.payload,
+    ).toMatchObject({ status: "streaming" })
+    await second.close(1000)
+    expect(
+      (await first.repository.get("debug", "first-capture"))?.payload,
+    ).toMatchObject({ status: "streaming" })
+    expect(
+      (await first.repository.get("debug", "second-capture"))?.payload,
+    ).toMatchObject({ status: "interrupted", replayable: false })
+  } finally {
+    await second.close(1000)
+    await first.close(1000)
+  }
+  const restarted = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  expect((await restarted.repository.collectionStatus()).unknownGaps).toBe(0)
+  await restarted.close(1000)
+})
+
+test("debug gaps follow retention and clear generations while usage loss stays visible", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const repository = createHistoryRepository(storage, { now: () => now })
+  const gap = (
+    id: string,
+    historyKind: string,
+    generation: number,
+  ): HistoryRecord => ({
+    id,
+    kind: "collection-gap",
+    generation,
+    recordedAt: now,
+    payload: { historyKind, generation, lostRecords: 2, lostBytes: 100 },
+  })
+  await repository.applyBatch("losses", [
+    { ...gap("expired", "debug", 0), recordedAt: now - 2 * 3600_000 },
+    gap("debug", "debug", 0),
+    gap("usage", "usage", 0),
+  ])
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).knownLostRecords,
+  ).toBe(2)
+  now++
+  await repository.clear("debug")
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).knownLostRecords,
+  ).toBe(0)
+  expect((await repository.collectionStatus()).knownLostRecords).toBe(6)
+  await repository.applyBatch("late-cleared-loss", [gap("delayed", "debug", 0)])
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).knownLostRecords,
+  ).toBe(0)
+  await repository.applyBatch("new-loss", [gap("new", "debug", 1)])
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).knownLostRecords,
+  ).toBe(2)
+})
+
+test("legacy unknown gaps are bounded, clearable, and repaired only with evidence of a clean run", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const repository = createHistoryRepository(storage, { now: () => now })
+  await storage.atomicBatch([
+    {
+      sql: "INSERT INTO capi_process_runs(id,started_at,ended_at,clean) VALUES('clean-legacy',?,?,1),('old-legacy',?,NULL,0),('recent-legacy',?,NULL,0)",
+      args: [now - 1000, now - 500, now - 8 * 86400_000, now - 600_000],
+    },
+    {
+      sql: "INSERT INTO capi_collection_gaps(id,process_run_id,started_at,kind) VALUES('unclean-clean-legacy','clean-legacy',?,'unknown'),('unclean-old-legacy','old-legacy',?,'unknown'),('unclean-recent-legacy','recent-legacy',?,'unknown')",
+      args: [now - 1000, now - 8 * 86400_000, now - 600_000],
+    },
+  ])
+  await repository.startRun("current", now)
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).unknownGaps,
+  ).toBe(1)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(2)
+  now++
+  await repository.clear("debug")
+  await repository.startRun("next", now)
+  expect(
+    (await repository.collectionStatus({ kind: "debug" })).unknownGaps,
+  ).toBe(0)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(2)
 })
 
 test("routing aggregation preserves prototype-like route keys as data", async () => {
@@ -349,25 +474,25 @@ test("expired pending completion suppresses the older unfinished diagnostic", as
   expect(await repository.get("debug", record.id, pending)).toBeNull()
 })
 
-test("activity expiry and row caps are applied while usage remains intact", async () => {
+test("debug expiry and row caps are applied while usage remains intact", async () => {
   const { repository, storage } = await fixture()
   const now = Date.now()
   await storage.transaction(async (s) => {
     await s.execute({
-      sql: `WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ids WHERE n < 50002) INSERT INTO capi_activity (id, generation, created_at, expires_at, kind, payload_json, payload_bytes) SELECT printf('%06d', n), 0, ?, ?, 'info', '{}', 2 FROM ids`,
+      sql: `WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ids WHERE n < 2002) INSERT INTO capi_debug (id, generation, created_at, updated_at, expires_at, status, payload_json, payload_bytes) SELECT printf('%06d', n), 0, ?, 0, ?, 'pending', '{}', 2 FROM ids`,
       args: [now, now + 86400_000],
     })
   })
   await repository.prune(now)
   const rows = await storage.read((s) =>
     s.query({
-      sql: "SELECT COUNT(*) AS count, MIN(id) AS oldest FROM capi_activity",
+      sql: "SELECT COUNT(*) AS count, MIN(id) AS oldest FROM capi_debug",
       args: [],
     }),
   )
-  expect(rows[0]).toEqual({ count: 50000, oldest: "000003" })
+  expect(rows[0]).toEqual({ count: 2000, oldest: "000003" })
   await repository.prune(now + 2 * 86400_000)
-  expect((await repository.list("activity")).records).toHaveLength(0)
+  expect((await repository.list("debug")).records).toHaveLength(0)
 })
 
 test("batched debug updates keep newest completion, respect clear generations, and deduplicate receipts", async () => {

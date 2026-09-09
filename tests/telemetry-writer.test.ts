@@ -111,7 +111,7 @@ test("a committed batch with a lost response retries with the same id once", asy
 test("queue owns immutable snapshots and evicts diagnostics before counters", async () => {
   const f = await fixture({ fail: true })
   for (let i = 0; i < 2000; i++)
-    f.writer.enqueue(record(`a-${i}`, f.now, "activity"))
+    f.writer.enqueue(record(`a-${i}`, f.now, "debug"))
   const value = record("usage", f.now)
   expect(f.writer.enqueue(value)).toBe(true)
   value.payload = null
@@ -164,11 +164,11 @@ test("byte cap rejects oversized diagnostics without losing counters", async () 
   f.writer.enqueue(record("counter", f.now))
   expect(
     f.writer.enqueue({
-      ...record("huge", f.now, "activity"),
-      payload: { body: "x".repeat(16 * 1024 * 1024) },
+      ...record("huge", f.now, "debug"),
+      payload: { body: "x".repeat(128 * 1024 * 1024) },
     }),
   ).toBe(false)
-  expect(f.writer.status().pendingBytes).toBeLessThan(16 * 1024 * 1024)
+  expect(f.writer.status().pendingBytes).toBeLessThan(128 * 1024 * 1024)
   await f.writer.flush()
   expect((await f.repository.readUsage(0)).lifetime.requestCount).toBe(1)
   expect((await f.repository.collectionStatus()).knownLostRecords).toBe(1)
@@ -208,7 +208,7 @@ test("expiring a batch with unknown commit outcome never claims exact loss", asy
 test("a failed diagnostic batch leaves queue capacity for priority counters", async () => {
   const f = await fixture({ fail: true })
   for (let i = 0; i < 2000; i++)
-    f.writer.enqueue(record(`debug-${i}`, f.now, "activity"))
+    f.writer.enqueue(record(`debug-${i}`, f.now, "debug"))
   await f.writer.flush()
   expect(f.writer.enqueue(record("priority", f.now))).toBe(true)
   f.recover()
@@ -216,27 +216,140 @@ test("a failed diagnostic batch leaves queue capacity for priority counters", as
   expect((await f.repository.readUsage(0)).lifetime.requestCount).toBe(1)
 })
 
-test("byte pressure omits debug bodies before evicting diagnostic metadata", async () => {
+test("byte pressure evicts whole debug records and reports loss without rewriting retained bodies", async () => {
   const f = await fixture()
   for (let i = 0; i < 5; i++)
     f.writer.enqueue({
       ...record(`body-${i}`, f.now, "debug"),
       payload: {
         request: {
-          body: "x".repeat(4 * 1024 * 1024),
-          bodyBytes: 4 * 1024 * 1024,
+          body: "x".repeat(32 * 1024 * 1024),
+          bodyBytes: 32 * 1024 * 1024,
         },
         replayable: true,
       },
     })
   expect(f.writer.status()).toMatchObject({
-    pendingRecords: 5,
-    droppedRecords: 0,
+    pendingRecords: 3,
+    droppedRecords: 2,
   })
   const page = await f.writer.read((pending) =>
     f.repository.list("debug", {}, pending),
   )
-  expect(JSON.stringify(page)).toContain('"omittedReason":"queue-pressure"')
+  expect(page.records.map((entry) => entry.id).sort()).toEqual([
+    "body-2",
+    "body-3",
+    "body-4",
+  ])
+  for (const entry of page.records) {
+    const payload = entry.payload as {
+      request: { body: string; bodyBytes: number }
+      replayable: boolean
+    }
+    expect(payload.request.body.length).toBe(32 * 1024 * 1024)
+    expect(payload.request.bodyBytes).toBe(32 * 1024 * 1024)
+    expect(payload.replayable).toBe(true)
+  }
+  await f.writer.flush()
+  expect((await f.repository.collectionStatus()).knownLostRecords).toBe(2)
+})
+
+test("one oversized debug record is admitted intact and flushed as its own batch", async () => {
+  const f = await fixture()
+  const length = 128 * 1024 * 1024 + 1
+  expect(
+    f.writer.enqueue({
+      ...record("oversized", f.now, "debug"),
+      payload: {
+        status: "complete",
+        request: { body: "z".repeat(length) },
+        replayable: true,
+      },
+    }),
+  ).toBe(true)
+  expect(f.writer.status()).toMatchObject({
+    pendingRecords: 1,
+    droppedRecords: 0,
+  })
+  await f.writer.flush()
+  expect(f.writer.status()).toMatchObject({
+    pendingRecords: 0,
+    droppedRecords: 0,
+    degraded: false,
+  })
+  const stored = await f.repository.get("debug", "oversized")
+  expect(
+    (stored?.payload as { request: { body: string } }).request.body.length,
+  ).toBe(length)
+  expect((await f.repository.collectionStatus()).knownLostRecords).toBe(0)
+})
+
+test("an oversized terminal replaces only its own queued debug snapshot without a false loss", async () => {
+  const f = await fixture()
+  const length = 128 * 1024 * 1024 + 1
+  const pending = {
+    ...record("same-debug", f.now, "debug"),
+    payload: {
+      status: "pending",
+      updatedAt: f.now,
+      request: { body: "raw request fixture" },
+    },
+  }
+  expect(f.writer.enqueue(pending)).toBe(true)
+  expect(
+    f.writer.enqueue({
+      ...pending,
+      payload: {
+        ...pending.payload,
+        status: "complete",
+        updatedAt: f.now + 1,
+        response: { body: "z".repeat(length) },
+        replayable: true,
+      },
+    }),
+  ).toBe(true)
+  expect(f.writer.status()).toMatchObject({
+    pendingRecords: 1,
+    droppedRecords: 0,
+    degraded: false,
+  })
+  expect(f.writer.enqueue(pending)).toBe(true)
+  expect(f.writer.status().pendingRecords).toBe(1)
+  await f.writer.flush()
+  const saved = (await f.repository.get("debug", "same-debug"))?.payload as {
+    status: string
+    request: { body: string }
+    response: { body: string }
+  }
+  expect(saved.status).toBe("complete")
+  expect(saved.request.body).toBe("raw request fixture")
+  expect(saved.response.body.length).toBe(length)
+  expect((await f.repository.collectionStatus()).knownLostRecords).toBe(0)
+})
+
+test("debug supersession does not mutate an unconfirmed active batch", async () => {
+  const f = await fixture({ lose: true })
+  const pending = {
+    ...record("same-active", f.now, "debug"),
+    payload: {
+      status: "pending",
+      updatedAt: f.now,
+      request: { body: "raw fixture" },
+    },
+  }
+  f.writer.enqueue(pending)
+  await f.writer.flush()
+  f.writer.enqueue({
+    ...pending,
+    payload: { ...pending.payload, status: "complete", updatedAt: f.now + 1 },
+  })
+  expect(f.writer.status().pendingRecords).toBe(2)
+  await f.writer.flush()
+  expect(f.ids[0]).toBe(f.ids[1])
+  expect(
+    (await f.repository.get("debug", "same-active"))?.payload,
+  ).toMatchObject({ status: "complete" })
+  expect((await f.repository.collectionStatus()).knownLostRecords).toBe(0)
 })
 
 test("one hundred diagnostic records flush at 30ms SQL latency within the unchanged deadline", async () => {
@@ -277,14 +390,14 @@ test("one hundred diagnostic records flush at 30ms SQL latency within the unchan
   })
   const now = Date.now()
   for (let i = 0; i < 100; i++)
-    writer.enqueue(record(`latency-${i}`, now, "activity"))
+    writer.enqueue(record(`latency-${i}`, now, "debug"))
   await writer.flush()
   expect(writer.status()).toMatchObject({ pendingRecords: 0, degraded: false })
   expect(queries).toBeLessThan(20)
   expect(
     await storage.read((session) =>
       session.query({
-        sql: "SELECT count(*) AS total FROM capi_activity",
+        sql: "SELECT count(*) AS total FROM capi_debug",
         args: [],
       }),
     ),

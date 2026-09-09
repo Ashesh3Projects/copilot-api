@@ -676,27 +676,23 @@ test("does not retry aborted upstream fetches", async () => {
   expect((await listLlmDebugLogs()).entries[0]?.status).toBe("aborted")
 })
 
-test("marks an aborted debug clone-body read as aborted", async () => {
+test("marks an aborted upstream response body as aborted without changing the client error", async () => {
   const abortError = new Error("response body was aborted")
   abortError.name = "AbortError"
-  const response = new Response("stream body", {
-    headers: { "content-type": "text/event-stream" },
-    status: 200,
-  })
-  Object.defineProperty(response, "clone", {
-    configurable: true,
-    value: () =>
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            controller.error(abortError)
-          },
-        }),
-      ),
-  })
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(abortError)
+      },
+    }),
+    {
+      headers: { "content-type": "text/event-stream" },
+      status: 200,
+    },
+  )
   queuedResults.push(response)
 
-  await copilotFetch("/responses", {
+  const capturedResponse = await copilotFetch("/responses", {
     body: JSON.stringify({ model: "gpt-aborted-stream", stream: true }),
     headers: {
       Authorization: "Bearer expired-copilot-token",
@@ -704,6 +700,9 @@ test("marks an aborted debug clone-body read as aborted", async () => {
     },
     method: "POST",
   })
+  expect(await capturedResponse.text().catch((error: unknown) => error)).toBe(
+    abortError,
+  )
   await new Promise((resolve) => setTimeout(resolve, 0))
 
   const entry = (await listLlmDebugLogs()).entries[0]
@@ -746,8 +745,67 @@ test("captures raw LLM request and response attempts for dashboard debugging", a
   expect(logs.entries[0]?.responsePreview).toContain("choices")
   const detail = await getLlmDebugLog(logs.entries[0]?.id ?? "")
   expect(detail?.request.body).toBe(requestBody)
-  expect(detail?.request.headers.Authorization).toBe("[REDACTED]")
+  expect(detail?.request.headers.Authorization).toBe(
+    "Bearer expired-copilot-token",
+  )
   expect(detail?.response?.body).toBe('{"choices":[]}')
+})
+
+test("drains superseded retry responses into raw capture without buffering a second full body", async () => {
+  const body = "synthetic retry body\r\n".repeat(70_000)
+  queuedResults.push(
+    new Response(body, { status: 503, headers: { "retry-after": "0" } }),
+    new Response("accepted", { status: 200 }),
+  )
+  const response = await copilotFetch("/responses", {
+    body: '{"model":"retry-capture"}',
+    method: "POST",
+    headers: AUTH_HEADERS,
+  })
+  expect(await response.text()).toBe("accepted")
+  let retryBody: string | null | undefined
+  for (let attempt = 0; attempt < 100; attempt++) {
+    for (const entry of (await listLlmDebugLogs()).entries) {
+      if (entry.responseStatus === 503)
+        retryBody = (await getLlmDebugLog(entry.id))?.response?.body
+    }
+    if (retryBody === body) break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(retryBody === body).toBe(true)
+})
+
+test("captures large raw Copilot request bytes and CRLF response without reconstruction", async () => {
+  const requestBody =
+    '\uFEFF{ "model":"gpt-debug", "input":"'
+    + "x".repeat(2 * 1024 * 1024)
+    + '", "api_key":"synthetic-key" }\r\n'
+  const responseBody =
+    ': keepalive\r\nevent: delta\r\ndata:{"token":"synthetic-response"}\r\n\r\n'
+  queuedResults.push(
+    new Response(responseBody, {
+      headers: {
+        "content-type": "text/event-stream",
+        "set-cookie": "synthetic=cookie",
+      },
+    }),
+  )
+  const response = await copilotFetch("/responses", {
+    body: new TextEncoder().encode(requestBody),
+    headers: {
+      Authorization: "Bearer synthetic-key",
+      "content-type": "application/json",
+    },
+    method: "POST",
+  })
+  expect(await response.text()).toBe(responseBody)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const summary = (await listLlmDebugLogs()).entries[0]
+  const detail = await getLlmDebugLog(summary.id)
+  expect(detail?.request.body === requestBody).toBe(true)
+  expect(detail?.request.bodyBytes).toBe(Buffer.byteLength(requestBody))
+  expect(detail?.response?.body).toBe(responseBody)
+  expect(detail?.response?.headers["set-cookie"]).toBe("synthetic=cookie")
 })
 
 test("keeps raw native Responses terminal bodies exact in LLM Debug", async () => {

@@ -5,13 +5,13 @@ import {
   captureOmissionMessage,
 } from "../ui/src/lib/capture-state"
 
-test("replay requires an intact captured body and supported endpoint", () => {
+test("replay uses the captured body state and supported endpoint", () => {
   const detail = {
     replayable: true,
     request: { method: "POST", path: "/responses", body: "{}" },
   }
   expect(canReplayCapture(detail)).toBe(true)
-  expect(canReplayCapture({ ...detail, replayable: false })).toBe(false)
+  expect(canReplayCapture({ ...detail, replayable: false })).toBe(true)
   expect(
     canReplayCapture({ ...detail, request: { ...detail.request, body: null } }),
   ).toBe(false)
@@ -23,10 +23,21 @@ test("replay requires an intact captured body and supported endpoint", () => {
   ).toBe(false)
 })
 
-test("capture omissions distinguish redaction, size limits and interruption", () => {
+test("legacy redacted captures disclose missing originals while new raw captures are complete", () => {
   expect(captureOmissionMessage({ redacted: true }, "complete")).toContain(
-    "redacted",
+    "older version",
   )
+  expect(
+    canReplayCapture({
+      replayable: false,
+      request: {
+        method: "POST",
+        path: "/responses",
+        body: '{"token":"[REDACTED]"}',
+        redacted: true,
+      },
+    }),
+  ).toBe(false)
   expect(
     captureOmissionMessage({ omittedReason: "size-limit" }, "complete"),
   ).toContain("capture limit")
@@ -34,7 +45,7 @@ test("capture omissions distinguish redaction, size limits and interruption", ()
   expect(captureOmissionMessage({}, "complete")).toBeUndefined()
 })
 
-test("redacted and omitted captures remain editable but require a deliberate replacement body", async () => {
+test("replay does not treat a literal redaction marker as a prohibited value", async () => {
   const { canEditReplayCapture, hasReplacementReplayBody } = await import(
     "../ui/src/lib/capture-state"
   )
@@ -60,7 +71,7 @@ test("redacted and omitted captures remain editable but require a deliberate rep
       '{"input":"[REDACTED]"}',
       '{"input":"[REDACTED]","model":"other"}',
     ),
-  ).toBe(false)
+  ).toBe(true)
   expect(
     hasReplacementReplayBody(
       '{"input":"[REDACTED]"}',

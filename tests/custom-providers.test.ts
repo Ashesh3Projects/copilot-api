@@ -580,8 +580,8 @@ test("chat request routes to custom provider by model id", async () => {
         path: "/chat/completions",
         url: "https://custom.example/v1/chat/completions",
         headers: {
-          Authorization: "[REDACTED]",
-          "X-Custom-Trace": "[REDACTED]",
+          Authorization: "Bearer custom-key",
+          "X-Custom-Trace": CUSTOM_HEADER_VALUE,
           "content-type": "application/json",
           accept: "application/json",
         },
@@ -1467,8 +1467,8 @@ test("Anthropic messages request routes to custom chat provider by model id", as
     request: {
       body: JSON.stringify(requests[0]?.body),
       headers: {
-        Authorization: "[REDACTED]",
-        "X-Custom-Trace": "[REDACTED]",
+        Authorization: "Bearer custom-key",
+        "X-Custom-Trace": CUSTOM_HEADER_VALUE,
       },
       path: "/chat/completions",
       url: "https://custom.example/v1/chat/completions",
@@ -2355,11 +2355,11 @@ test("embeddings request routes to Nebius config by alias", async () => {
     request: {
       body: JSON.stringify(requests[0]?.body),
       headers: {
-        Authorization: "[REDACTED]",
-        "X-Provider": "[REDACTED]",
+        Authorization: "Bearer nebius-key",
+        "X-Provider": "nebius",
       },
       path: "/embeddings",
-      url: "[unavailable URL]",
+      url: "https://api.studio.nebius.com/v1/embeddings",
     },
   })
 
@@ -2396,7 +2396,7 @@ test("records custom-provider transport failures without swallowing them", async
   })
 })
 
-test("preserves custom-provider chat identity while sanitizing failures", async () => {
+test("preserves custom-provider chat response metadata and bytes while sanitizing failures", async () => {
   const statusMarker = "custom-private-status"
   const bodyMarker = "custom-private-body"
   const body = new TextEncoder().encode(` ${bodyMarker}\r\n`)
@@ -2420,8 +2420,16 @@ test("preserves custom-provider chat identity while sanitizing failures", async 
       messages: [{ role: "user", content: "hello" }],
     }).catch((caught: unknown) => caught)
     expect(error).toBeInstanceOf(HTTPError)
-    expect((error as HTTPError).response).toBe(upstream)
-    expect(upstream.bodyUsed).toBe(false)
+    const errorResponse = (error as HTTPError).response
+    expect(errorResponse.status).toBe(400)
+    expect(errorResponse.statusText).toBe(statusMarker)
+    expect(errorResponse.headers.get("content-type")).toBe(
+      "application/problem+json",
+    )
+    expect(errorResponse.bodyUsed).toBe(false)
+    expect(
+      Array.from(new Uint8Array(await errorResponse.arrayBuffer())),
+    ).toEqual(Array.from(body))
 
     const directOutput = JSON.stringify(errorSpy.mock.calls)
     expect(directOutput).not.toContain(statusMarker)
@@ -2464,8 +2472,8 @@ test("preserves custom-provider chat identity while sanitizing failures", async 
         statusText: statusMarker,
       },
     })
-    expect(debug?.response?.body).toBeNull()
-    expect(debug?.response?.omittedReason).toBe("unsupported")
+    expect(debug?.response?.body).toBe(` ${bodyMarker}\r\n`)
+    expect(debug?.response?.omittedReason).toBeUndefined()
     expect(response.headers.get("content-type")).toContain("application/json")
   } finally {
     errorSpy.mockRestore()
@@ -2515,7 +2523,7 @@ test("records custom-provider transport and aborted lifecycles in raw LLM Debug"
   })
 })
 
-test("preserves custom-provider embedding identity while sanitizing failures", async () => {
+test("preserves custom-provider embedding response metadata and bytes while sanitizing failures", async () => {
   const body = Uint8Array.from([0, 255, 13, 10, 65])
   const upstream = new Response(body.slice(), {
     status: 422,
@@ -2534,8 +2542,15 @@ test("preserves custom-provider embedding identity while sanitizing failures", a
     input: "hello",
   }).catch((caught: unknown) => caught)
   expect(error).toBeInstanceOf(HTTPError)
-  expect((error as HTTPError).response).toBe(upstream)
-  expect(upstream.bodyUsed).toBe(false)
+  const errorResponse = (error as HTTPError).response
+  expect(errorResponse.status).toBe(422)
+  expect(errorResponse.headers.get("content-type")).toBe(
+    "application/octet-stream",
+  )
+  expect(errorResponse.bodyUsed).toBe(false)
+  expect(Array.from(new Uint8Array(await errorResponse.arrayBuffer()))).toEqual(
+    Array.from(body),
+  )
 
   fetchMock.mockImplementationOnce(
     () =>

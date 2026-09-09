@@ -16,7 +16,7 @@ import { withStorageDeadline } from "~/lib/storage/operation-budget"
 
 export interface HistoryRecord {
   id: string
-  kind: "usage" | "routing" | "activity" | "debug" | "collection-gap"
+  kind: "usage" | "routing" | "debug" | "collection-gap"
   recordedAt: number
   generation: number
   payload: JsonValue
@@ -35,13 +35,14 @@ export interface TelemetryStatus {
 export interface TelemetryWriter {
   enqueue(record: HistoryRecord): boolean
   flush(): Promise<void>
-  status(): TelemetryStatus
+  status(kind?: DiagnosticKind): TelemetryStatus
   close(deadlineMs: number): Promise<TelemetryStatus>
   read<T>(
     work: (pending: ReadonlyArray<PendingHistoryRecord>) => Promise<T>,
   ): Promise<T>
 }
 export interface HistoryRuntime {
+  storage: Storage
   repository: HistoryRepository
   writer: TelemetryWriter
   generations: Record<DiagnosticKind, number>
@@ -57,15 +58,17 @@ interface Batch {
   id: string
   items: Array<Queued>
   records: Array<HistoryRecord>
+  createdAt: number
 }
 interface TelemetryWriterOptions {
+  runId?: string
   autoFlush?: boolean
   beforeFlush?: () => Promise<void>
   acceptDiagnostic?(kind: DiagnosticKind): boolean
   generationDegraded?(): boolean
 }
 const MAX_RECORDS = 2000,
-  MAX_BYTES = 16 * 1024 * 1024,
+  MAX_BYTES = 128 * 1024 * 1024,
   MAX_AGE = 300_000
 let lastWarning = -Infinity
 export function reportTelemetryFailure(): void {
@@ -106,24 +109,6 @@ function coalesce(records: ReadonlyArray<HistoryRecord>): Array<HistoryRecord> {
   return [...counters.values(), ...diagnostics]
 }
 
-function omitDiagnosticBodies(item: Queued): number {
-  if (item.record.kind !== "debug") return 0
-  const payload = historyObject(item.record.payload)
-  let changed = false
-  for (const key of ["request", "response"]) {
-    const body = historyObject(payload[key] ?? null)
-    if (typeof body.body !== "string" || body.body.length === 0) continue
-    body.body = null
-    body.omittedReason = "queue-pressure"
-    changed = true
-  }
-  if (!changed) return 0
-  payload.replayable = false
-  const prior = item.bytes
-  item.bytes = Buffer.byteLength(JSON.stringify(item.record))
-  return prior - item.bytes
-}
-
 // eslint-disable-next-line max-lines-per-function -- One closure owns queue, retry batch and admission state.
 export function createTelemetryWriter(
   repository: HistoryRepository,
@@ -131,13 +116,10 @@ export function createTelemetryWriter(
   options: TelemetryWriterOptions = {},
 ): TelemetryWriter {
   const queue: Array<Queued> = []
-  let uncertainGap = false
+  const gaps = new Map<string, HistoryRecord>()
   let active: Batch | undefined,
     pendingBytes = 0,
     droppedRecords = 0
-  let gapRecords = 0,
-    gapBytes = 0,
-    gapStart = 0
   let lastSuccessfulFlush: number | null = null,
     failed = false,
     closed = false
@@ -151,42 +133,90 @@ export function createTelemetryWriter(
     return result
   }
   const count = () => queue.length + (active?.items.length ?? 0)
+  const loss = (item: Queued, unknown = false, generationUncertain = false) => {
+    const key = JSON.stringify([
+      item.record.kind,
+      generationUncertain ? null : item.record.generation,
+      unknown,
+    ])
+    const prior = gaps.get(key)
+    const payload =
+      prior ?
+        historyObject(prior.payload)
+      : {
+          historyKind: item.record.kind,
+          ...(generationUncertain ?
+            {}
+          : { generation: item.record.generation }),
+          startedAt: item.enqueuedAt,
+          ...(unknown ?
+            { unknown: true, reason: "expired-unconfirmed-batch" }
+          : { lostRecords: 0, lostBytes: 0 }),
+        }
+    if (!unknown) {
+      payload.lostRecords = Number(payload.lostRecords) + 1
+      payload.lostBytes = Number(payload.lostBytes) + item.bytes
+    }
+    gaps.set(key, {
+      id: prior?.id ?? randomUUID(),
+      kind: "collection-gap",
+      generation: item.record.generation,
+      recordedAt: clock.now(),
+      payload,
+    })
+    failed = true
+  }
   const drop = (item: Queued) => {
     pendingBytes -= item.bytes
     droppedRecords++
-    gapRecords++
-    gapBytes += item.bytes
-    gapStart ||= item.enqueuedAt
-    failed = true
+    loss(item)
   }
   const expire = () => {
     for (let i = queue.length - 1; i >= 0; i--)
       if (clock.now() - queue[i].enqueuedAt > MAX_AGE)
         drop(queue.splice(i, 1)[0])
-    if (
-      active
-      && clock.now() - (active.items[0]?.enqueuedAt ?? clock.now()) > MAX_AGE
-    ) {
+    if (active && clock.now() - active.createdAt > MAX_AGE) {
       for (const item of active.items) {
         pendingBytes -= item.bytes
         droppedRecords++
+        loss(item, true)
       }
       // A response may have been lost after commit. Never assert an exact loss.
-      uncertainGap = true
+      for (const record of active.records)
+        if (record.kind === "collection-gap") {
+          const payload = historyObject(record.payload)
+          gaps.set(record.id, {
+            ...record,
+            id: randomUUID(),
+            recordedAt: clock.now(),
+            payload: {
+              ...payload,
+              unknown: true,
+              reason: "expired-unconfirmed-batch",
+            },
+          })
+        }
       failed = true
       active = undefined
     }
   }
-  const snapshot = (): TelemetryStatus => ({
-    pendingRecords: count(),
-    pendingBytes,
+  const snapshot = (kind?: DiagnosticKind): TelemetryStatus => ({
+    pendingRecords:
+      kind ?
+        [...queue, ...(active?.items ?? [])].filter(
+          (item) => item.record.kind === kind,
+        ).length
+      : count(),
+    pendingBytes:
+      kind ?
+        [...queue, ...(active?.items ?? [])]
+          .filter((item) => item.record.kind === kind)
+          .reduce((sum, item) => sum + item.bytes, 0)
+      : pendingBytes,
     droppedRecords,
     lastSuccessfulFlush,
     degraded:
-      failed
-      || gapRecords > 0
-      || uncertainGap
-      || (options.generationDegraded?.() ?? false),
+      failed || gaps.size > 0 || (options.generationDegraded?.() ?? false),
   })
   const flushOnce = async () => {
     try {
@@ -214,38 +244,18 @@ export function createTelemetryWriter(
         items.push(item)
         batchBytes += item.bytes
       }
-      if (items.length === 0 && !gapRecords && !uncertainGap) {
+      if (items.length === 0 && gaps.size === 0) {
         failed = false
         return
       }
       const records = coalesce(items.map((item) => item.record))
-      if (gapRecords) {
-        records.push({
-          id: randomUUID(),
-          kind: "collection-gap",
-          generation: 0,
-          recordedAt: clock.now(),
-          payload: {
-            startedAt: gapStart,
-            lostRecords: gapRecords,
-            lostBytes: gapBytes,
-          },
-        })
-        gapRecords = 0
-        gapBytes = 0
-        gapStart = 0
+      // A large debug entry is committed by itself. Preserve small loss reports
+      // for the next batch instead of appending to an already oversized write.
+      if (batchBytes <= 1024 * 1024) {
+        records.push(...gaps.values())
+        gaps.clear()
       }
-      if (uncertainGap) {
-        records.push({
-          id: randomUUID(),
-          kind: "collection-gap",
-          generation: 0,
-          recordedAt: clock.now(),
-          payload: { unknown: true, reason: "expired-unconfirmed-batch" },
-        })
-        uncertainGap = false
-      }
-      active = { id: randomUUID(), items, records }
+      active = { id: randomUUID(), items, records, createdAt: clock.now() }
     }
     try {
       const batch = active
@@ -262,17 +272,6 @@ export function createTelemetryWriter(
       reportTelemetryFailure()
     }
   }
-  const discardBody = (): boolean => {
-    const diagnostic = queue.find(
-      (value) =>
-        value.record.kind === "debug" && omitDiagnosticBodies(value) > 0,
-    )
-    if (!diagnostic) return false
-    pendingBytes =
-      queue.reduce((sum, value) => sum + value.bytes, 0)
-      + (active?.items.reduce((sum, value) => sum + value.bytes, 0) ?? 0)
-    return count() < MAX_RECORDS
-  }
   const timer =
     options.autoFlush === false ?
       undefined
@@ -281,34 +280,78 @@ export function createTelemetryWriter(
       }, 1000)
   timer?.unref()
   const writer: TelemetryWriter = {
-    // eslint-disable-next-line complexity -- Admission accounts independently for record, byte, priority and diagnostic-body limits.
+    // eslint-disable-next-line complexity -- Admission accounts for record, byte and priority limits without changing captured payloads.
     enqueue(record) {
       if (closed) return false
       try {
-        const serialized = JSON.stringify(record)
+        const owned =
+          record.kind === "debug" && options.runId ?
+            {
+              ...record,
+              payload: {
+                ...historyObject(record.payload),
+                _historyRunId: options.runId,
+              },
+            }
+          : record
+        const serialized = JSON.stringify(owned)
         const bytes = Buffer.byteLength(serialized),
           item = {
             record: JSON.parse(serialized) as HistoryRecord,
             bytes,
             enqueuedAt: clock.now(),
           }
+        if (record.kind === "debug") {
+          const updatedAt = Number(
+            historyObject(item.record.payload).updatedAt
+              ?? item.record.recordedAt,
+          )
+          const prior = queue.find(
+            (queued) =>
+              queued.record.kind === "debug"
+              && queued.record.id === record.id
+              && queued.record.generation === record.generation,
+          )
+          if (
+            prior
+            && Number(
+              historyObject(prior.record.payload).updatedAt
+                ?? prior.record.recordedAt,
+            ) > updatedAt
+          )
+            return true
+          for (let index = queue.length - 1; index >= 0; index--) {
+            const queued = queue[index]
+            if (
+              queued.record.kind === "debug"
+              && queued.record.id === record.id
+              && queued.record.generation === record.generation
+            ) {
+              pendingBytes -= queued.bytes
+              queue.splice(index, 1)
+            }
+          }
+        }
         const generationBlocked =
-          (record.kind === "activity" || record.kind === "debug")
+          record.kind === "debug"
           && options.acceptDiagnostic?.(record.kind) === false
-        if (bytes > MAX_BYTES || generationBlocked) {
+        const oversizedAlone =
+          record.kind === "debug"
+          && item.bytes > MAX_BYTES
+          && count() === 0
+          && !active
+        if ((item.bytes > MAX_BYTES && !oversizedAlone) || generationBlocked) {
           droppedRecords++
-          gapRecords++
-          gapBytes += bytes
-          gapStart ||= clock.now()
-          failed = true
+          loss(item, false, generationBlocked)
           if (generationBlocked) void writer.flush()
           return false
         }
-        while (count() >= MAX_RECORDS || pendingBytes + bytes > MAX_BYTES) {
-          if (pendingBytes + bytes > MAX_BYTES && discardBody()) continue
+        while (
+          !oversizedAlone
+          && (count() >= MAX_RECORDS || pendingBytes + item.bytes > MAX_BYTES)
+        ) {
           const index = queue.findIndex(
-            (value) =>
-              value.record.kind === "debug" || value.record.kind === "activity",
+            (value) => value.record.kind === "debug",
           )
           let candidate = index
           if (
@@ -318,17 +361,17 @@ export function createTelemetryWriter(
             candidate = 0
           if (candidate < 0 || queue.length === 0) {
             droppedRecords++
-            gapRecords++
-            gapBytes += bytes
-            gapStart ||= clock.now()
-            failed = true
+            loss(item)
             return false
           }
           drop(queue.splice(candidate, 1)[0])
         }
         queue.push(item)
-        pendingBytes += bytes
-        if (options.autoFlush !== false && queue.length >= 100)
+        pendingBytes += item.bytes
+        if (
+          options.autoFlush !== false
+          && (queue.length >= 100 || oversizedAlone)
+        )
           void writer.flush()
         return true
       } catch {
@@ -341,7 +384,7 @@ export function createTelemetryWriter(
       flushing ??= serialize(async () => {
         for (let batch = 0; batch < 20; batch++) {
           await flushOnce()
-          if (failed || (!count() && !gapRecords && !uncertainGap)) break
+          if (failed || (!count() && gaps.size === 0)) break
         }
       }).finally(() => {
         flushing = undefined
@@ -357,6 +400,15 @@ export function createTelemetryWriter(
             batchId: active?.id,
           })) ?? []),
           ...queue.map((item) => ({ record: structuredClone(item.record) })),
+          ...(active?.records
+            .filter((record) => record.kind === "collection-gap")
+            .map((record) => ({
+              record: structuredClone(record),
+              batchId: active?.id,
+            })) ?? []),
+          ...[...gaps.values()].map((record) => ({
+            record: structuredClone(record),
+          })),
         ]),
       )
     },
@@ -372,17 +424,14 @@ export function createTelemetryWriter(
             do {
               await flushOnce()
               if (failed) break
-            } while (
-              (count() || gapRecords || uncertainGap)
-              && Date.now() < flushDeadline
-            )
+            } while ((count() || gaps.size > 0) && Date.now() < flushDeadline)
           }),
           new Promise<void>((resolve) => {
             deadline = setTimeout(resolve, Math.max(0, deadlineMs))
           }),
         ])
         if (deadline) clearTimeout(deadline)
-        if (count() || gapRecords || uncertainGap || active) {
+        if (count() || gaps.size > 0 || active) {
           failed = true
           reportTelemetryFailure()
         }
@@ -403,19 +452,27 @@ export async function createHistoryRuntime(
   const now = options.now ?? Date.now,
     runId = randomUUID()
   const repository = createHistoryRepository(storage, { runId, now })
-  await repository.startRun(runId, now())
   const generations = await repository.generations()
+  await repository.startRun(runId, now())
   const clearTails: Record<DiagnosticKind, Promise<unknown>> = {
-    activity: Promise.resolve(),
     debug: Promise.resolve(),
   }
   const pendingClears: Record<DiagnosticKind, number> = {
-    activity: 0,
     debug: 0,
   }
-  const clearEpochs: Record<DiagnosticKind, number> = { activity: 0, debug: 0 }
+  const clearEpochs: Record<DiagnosticKind, number> = { debug: 0 }
   const unresolved = new Set<DiagnosticKind>()
+  let lastHeartbeat = now()
   const reconcileGenerations = async () => {
+    if (now() - lastHeartbeat >= 30_000) {
+      await repository.heartbeatRun(runId, now())
+      // eslint-disable-next-line require-atomic-updates -- Only the writer's serialized flush owner invokes this callback.
+      lastHeartbeat = now()
+      const confirmed = await repository.generations()
+      for (const kind of ["debug"] as const)
+        if (!pendingClears[kind])
+          generations[kind] = Math.max(generations[kind], confirmed[kind])
+    }
     const needed = [...unresolved].filter((kind) => pendingClears[kind] === 0)
     if (needed.length === 0) return
     const observedEpochs = { ...clearEpochs }
@@ -436,17 +493,16 @@ export async function createHistoryRuntime(
     { now },
     {
       ...options,
+      runId,
       beforeFlush: reconcileGenerations,
       acceptDiagnostic: (kind) =>
         !unresolved.has(kind) && pendingClears[kind] === 0,
-      generationDegraded: () =>
-        unresolved.size > 0
-        || pendingClears.activity > 0
-        || pendingClears.debug > 0,
+      generationDegraded: () => unresolved.size > 0 || pendingClears.debug > 0,
     },
   )
   let closing: Promise<TelemetryStatus> | undefined
   const runtime: HistoryRuntime = {
+    storage,
     repository,
     writer,
     generations,

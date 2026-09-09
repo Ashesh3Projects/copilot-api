@@ -2,12 +2,17 @@ import consola from "consola"
 
 import type { ReasoningEffort } from "~/lib/model-suffix"
 
+import { resolveModelRedirectRules } from "~/lib/model-redirect-resolver"
+import { getModelRoutingSafety } from "~/lib/model-routing-safety"
 import {
   getLoadedSetting,
+  getLoadedSettingRevision,
+  getLiveSettingRevision,
   readSetting,
   updateSetting,
 } from "~/lib/storage/domain-settings"
 import { StorageSchemaError } from "~/lib/storage/errors"
+import { peekStorageRuntime } from "~/lib/storage/runtime"
 import { normalizeSettingsJson } from "~/lib/storage/settings-repository"
 
 export type ModelRedirectEffortFilter = "all" | "default" | ReasoningEffort
@@ -59,6 +64,15 @@ export interface ModelRedirectRuleWithConflicts extends ModelRedirectRule {
 }
 
 let testRedirects: Array<ModelRedirectRule> | undefined
+let testRevision = 0
+
+export function getModelRedirectRevision(live = false): number {
+  if (testRedirects) return testRevision
+  if (!peekStorageRuntime()) return 0
+  return live ?
+      getLiveSettingRevision("model_redirects")
+    : getLoadedSettingRevision("model_redirects")
+}
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return (
@@ -200,7 +214,7 @@ export function validateStoredModelRedirects(
   })
 }
 
-function currentRedirects(): Array<ModelRedirectRule> {
+export function getLoadedModelRedirects(): Array<ModelRedirectRule> {
   return structuredClone(
     testRedirects
       ?? validateStoredModelRedirects(getLoadedSetting("model_redirects")),
@@ -224,6 +238,7 @@ async function mutateRedirects<T>(
     const next = structuredClone(testRedirects)
     const result = update(next)
     testRedirects = next
+    testRevision++
     return structuredClone(result)
   }
   let result: T | undefined
@@ -248,13 +263,13 @@ export async function saveModelRedirects(): Promise<void> {
 }
 
 export async function ensureLoaded(): Promise<void> {
-  await Promise.resolve(currentRedirects())
+  await Promise.resolve(getLoadedModelRedirects())
 }
 
 export async function getAllModelRedirects(): Promise<
   Array<ModelRedirectRuleWithConflicts>
 > {
-  return await Promise.resolve(withConflicts(currentRedirects()))
+  return await Promise.resolve(withConflicts(getLoadedModelRedirects()))
 }
 
 export async function addModelRedirect(
@@ -401,76 +416,11 @@ export interface ModelRedirectStep {
   targetVerbosity?: ModelRedirectVerbosity
 }
 
-interface MatchedRedirectRule {
-  index: number
-  rule: ModelRedirectRule
-}
-
-const MAX_REDIRECT_CHAIN_LENGTH = 10
-
-function matchesEffort(
-  filter: ModelRedirectEffortFilter,
-  effort: ReasoningEffort | undefined,
-): boolean {
-  if (filter === "all") return true
-  if (filter === "default") return effort === undefined
-  return filter === effort
-}
-
-function findMatchingRedirectRule(
-  model: string,
-  effort: ReasoningEffort | undefined,
-  startIndex = 0,
-): MatchedRedirectRule | undefined {
-  const redirects = currentRedirects()
-  for (let index = startIndex; index < redirects.length; index += 1) {
-    const rule = redirects[index]
-    if (
-      rule.enabled
-      && rule.sourceModel === model
-      && matchesEffort(rule.sourceEffort, effort)
-    ) {
-      return { index, rule }
-    }
-  }
-
-  return undefined
-}
-
 function formatModelWithEffort(
   model: string,
   effort: ReasoningEffort | undefined,
 ): string {
   return effort ? `${model}:${effort}` : model
-}
-
-function getRedirectStateKey(
-  model: string,
-  effort: ReasoningEffort | undefined,
-  verbosity: ModelRedirectVerbosity | undefined,
-): string {
-  return `${formatModelWithEffort(model, effort ?? undefined)}\u0000${verbosity ?? ""}`
-}
-
-function createRedirectStep(options: {
-  modelOnly: boolean
-  rule: ModelRedirectRule
-  sourceEffort: ReasoningEffort | undefined
-  sourceModel: string
-  sourceVerbosity: ModelRedirectVerbosity | undefined
-}): ModelRedirectStep {
-  const { modelOnly, rule, sourceEffort, sourceModel, sourceVerbosity } =
-    options
-  return {
-    ruleId: rule.id,
-    ruleName: rule.name,
-    sourceModel,
-    sourceEffort: modelOnly ? undefined : sourceEffort,
-    targetModel: rule.targetModel,
-    targetEffort: modelOnly ? undefined : (rule.targetEffort ?? sourceEffort),
-    sourceVerbosity,
-    targetVerbosity: rule.targetVerbosity ?? sourceVerbosity,
-  }
 }
 
 function formatModelRedirectState(options: {
@@ -519,83 +469,31 @@ export async function applyModelRedirect(
   input: string | ModelRedirectRequest,
 ): Promise<ModelRedirectResult> {
   await ensureLoaded()
-  const originalModel = typeof input === "string" ? input : input.model
-  const originalEffort = typeof input === "string" ? undefined : input.effort
-  const originalVerbosity =
-    typeof input === "string" ? undefined : input.verbosity
-  const modelOnly = typeof input === "string" ? false : input.modelOnly === true
-  let model = originalModel
-  let effort = originalEffort
-  let verbosity = originalVerbosity
-  const redirectChain: Array<ModelRedirectStep> = []
-  const seen = new Set<string>()
-  let nextRuleIndex = 0
-
-  while (redirectChain.length < MAX_REDIRECT_CHAIN_LENGTH) {
-    seen.add(getRedirectStateKey(model, effort, verbosity))
-
-    const match = findMatchingRedirectRule(model, effort, nextRuleIndex)
-    if (!match) break
-
-    const currentKey = getRedirectStateKey(model, effort, verbosity)
-    const step = createRedirectStep({
-      modelOnly,
-      rule: match.rule,
-      sourceEffort: effort,
-      sourceModel: model,
-      sourceVerbosity: verbosity,
-    })
-    const nextKey = getRedirectStateKey(
-      step.targetModel,
-      step.targetEffort,
-      step.targetVerbosity,
-    )
-    if (nextKey === currentKey) {
-      nextRuleIndex = match.index + 1
-      continue
+  const request = typeof input === "string" ? { model: input } : input
+  if (!getModelRoutingSafety().safe) {
+    return {
+      model: request.model,
+      effort: request.effort,
+      verbosity: request.verbosity,
+      redirected: false,
     }
-    if (seen.has(nextKey)) {
-      consola.warn(
-        `Model redirect loop detected, stopping at ${formatModelWithEffort(model, effort)} before rule ${match.rule.name || match.rule.id}`,
-      )
-      break
+  }
+  const result = resolveModelRedirectRules(getLoadedModelRedirects(), request)
+  if (result.loop)
+    return {
+      model: request.model,
+      effort: request.effort,
+      verbosity: request.verbosity,
+      redirected: false,
     }
-
-    redirectChain.push(step)
-    model = step.targetModel
-    effort = step.targetEffort
-    verbosity = step.targetVerbosity
-    nextRuleIndex = match.index + 1
-  }
-
-  if (redirectChain.length === 0) {
-    return { model, effort, verbosity, redirected: false }
-  }
-
-  if (redirectChain.length >= MAX_REDIRECT_CHAIN_LENGTH) {
-    consola.warn(
-      `Model redirect chain exceeded ${MAX_REDIRECT_CHAIN_LENGTH} hops, stopping at ${formatModelWithEffort(model, effort)}`,
+  if (result.redirected)
+    consola.debug(
+      `Model redirect chain: ${formatModelRedirectResult(result)} (rules: ${result.ruleIds?.join(", ")})`,
     )
-  }
-
-  const result: ModelRedirectResult = {
-    model,
-    effort,
-    verbosity,
-    redirected: true,
-    originalModel,
-    originalEffort,
-    originalVerbosity,
-    ruleId: redirectChain[0]?.ruleId,
-    ruleIds: redirectChain.map((step) => step.ruleId),
-    redirectChain,
-  }
-  consola.debug(
-    `Model redirect chain: ${formatModelRedirectResult(result)} (rules: ${result.ruleIds?.join(", ")})`,
-  )
   return result
 }
 
 export function setModelRedirectsForTest(rules: Array<unknown>): void {
   testRedirects = normalizeRules(rules)
+  testRevision++
 }

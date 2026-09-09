@@ -25,6 +25,7 @@ import { currentSchemaVersion, currentTables } from "~/lib/storage/schema"
 import {
   assertEmptyTransferTarget,
   insertTransferRecords,
+  LEGACY_TRANSFER_TABLES,
   MAX_FRAME_BYTES,
   REQUIRED_TRANSFER_METADATA_KEYS,
   sha256,
@@ -59,11 +60,7 @@ export async function validateTransferredState(
     )
   )
     invalid()
-  for (const key of [
-    "config_revision",
-    "history_activity_generation",
-    "history_debug_generation",
-  ])
+  for (const key of ["config_revision", "history_debug_generation"])
     parseStorageCounter(metadata.get(key))
   await validateTransferDomains(session)
   // All inserts enforce the schema's foreign keys. Routing JSON has an additional stable-ID reference.
@@ -120,7 +117,9 @@ class RecordDecoder {
   private pending?: PendingRecord
   private readonly singletonKeys = new Set<string>()
   private readonly digest = createHash("sha256")
+  private sourceSchemaVersion?: number
   readonly counts: Record<string, number> = {}
+  readonly discardedCounts: Record<string, number> = {}
   manifest?: TransferManifest
   records = 0
   private batch: Array<TransferRecord> = []
@@ -180,7 +179,7 @@ class RecordDecoder {
         invalid()
       if (
         manifest.formatVersion !== 1
-        || manifest.schemaVersion !== currentSchemaVersion
+        || manifest.schemaVersion !== this.sourceSchemaVersion
         || typeof manifest.sourceStoreId !== "string"
         || manifest.recordsSha256 !== this.digest.digest("hex")
       )
@@ -220,7 +219,7 @@ class RecordDecoder {
           if (
             typeof field.name !== "string"
             || names.has(field.name)
-            || !transferColumns(record.table).some(
+            || !transferColumns(record.table, this.isLegacy()).some(
               (column) => column.name === field.name && column.type === "TEXT",
             )
             || value[field.name] !== null
@@ -290,26 +289,21 @@ class RecordDecoder {
       }
     }
   }
-  private async record(record: TransferRecord): Promise<void> {
-    validateTransferRecord(record)
-    const index = TRANSFER_TABLES.indexOf(record.table)
+  private async record(source: TransferRecord): Promise<void> {
+    const record = this.upgradeAccountRecord(source)
+    validateTransferRecord(record, this.isLegacy())
+    const index = (
+      this.isLegacy() ?
+        LEGACY_TRANSFER_TABLES
+      : TRANSFER_TABLES).indexOf(record.table)
     if (index < this.tableIndex) invalid()
     const key = JSON.parse(record.key) as Array<string | number>
-    if (index === this.tableIndex && this.previousKey) {
-      let order = 0
-      for (let position = 0; position < key.length && order === 0; position++) {
-        const left = this.previousKey[position],
-          right = key[position]
-        order =
-          typeof left === "number" && typeof right === "number" ?
-            Math.sign(left - right)
-          : Buffer.compare(
-              Buffer.from(String(left)),
-              Buffer.from(String(right)),
-            )
-      }
-      if (order >= 0) invalid()
-    }
+    if (
+      index === this.tableIndex
+      && this.previousKey
+      && compareTransferKeys(this.previousKey, key) >= 0
+    )
+      invalid()
     this.previousKey = key
     this.tableIndex = index
     if (
@@ -320,15 +314,75 @@ class RecordDecoder {
       if (this.singletonKeys.has(id)) invalid()
       this.singletonKeys.add(id)
     }
-    const bytes = Buffer.byteLength(JSON.stringify(record))
-    if (this.batchBytes + bytes > 1024 * 1024) await this.flush()
-    this.batch.push(record)
-    this.batchBytes += bytes
     this.counts[record.table] = (this.counts[record.table] ?? 0) + 1
     this.records++
+    if (this.discardActivityRecord(record)) return
+    const retained = this.stripLegacyActivityMetadata(record)
+    const bytes = Buffer.byteLength(JSON.stringify(retained))
+    if (this.batchBytes + bytes > 1024 * 1024) await this.flush()
+    this.batch.push(retained)
+    this.batchBytes += bytes
     // Single large fields may exceed the bounded batch budget: flush immediately.
     if (this.batch.length >= 100 || this.batchBytes >= 1024 * 1024)
       await this.flush()
+  }
+  /** Version two backups predate nullable per-account integration overrides. */
+  private upgradeAccountRecord(record: TransferRecord): TransferRecord {
+    if (record.table === "capi_metadata") {
+      const value = object(record.value)
+      if (value.key === "schema_version") {
+        if (
+          !["2", "3", String(currentSchemaVersion)].includes(
+            String(value.value),
+          )
+        )
+          invalid()
+        this.sourceSchemaVersion = Number(value.value)
+      }
+    }
+    if (record.table !== "capi_accounts" || this.sourceSchemaVersion !== 2)
+      return record
+    const value = object(record.value)
+    if (Object.hasOwn(value, "integration_id")) invalid()
+    return { ...record, value: { ...value, integration_id: null } as JsonValue }
+  }
+  private isLegacy(): boolean {
+    // schema_version sorts after history counters within the metadata table.
+    return (
+      this.sourceSchemaVersion === undefined || this.sourceSchemaVersion < 4
+    )
+  }
+  private discardActivityRecord(record: TransferRecord): boolean {
+    const value = object(record.value)
+    const activity =
+      record.table === "capi_activity"
+      || (record.table === "capi_metadata"
+        && [
+          "history_activity_cleared_at",
+          "history_activity_generation",
+        ].includes(String(value.key)))
+      || (record.table === "capi_collection_gaps"
+        && object(JSON.parse(String(value.payload_json))).historyKind
+          === "activity")
+    if (!activity) return false
+    if (!this.isLegacy()) invalid()
+    this.discardedCounts[record.table] =
+      (this.discardedCounts[record.table] ?? 0) + 1
+    return true
+  }
+  private stripLegacyActivityMetadata(record: TransferRecord): TransferRecord {
+    if (
+      !this.isLegacy()
+      || !["capi_collection_gaps", "capi_process_runs"].includes(record.table)
+    )
+      return record
+    const value = object(record.value)
+    const payload = object(JSON.parse(String(value.payload_json)))
+    delete payload.activityGeneration
+    return {
+      ...record,
+      value: { ...value, payload_json: JSON.stringify(payload) } as JsonValue,
+    }
   }
   private async flush(): Promise<void> {
     if (this.batch.length === 0) return
@@ -342,11 +396,28 @@ class RecordDecoder {
   }
   finish(): void {
     if (this.buffer.length > 0 || this.pending || !this.manifest) invalid()
+    if (!this.isLegacy() && Object.keys(this.discardedCounts).length > 0)
+      invalid()
     for (const key of REQUIRED_TRANSFER_METADATA_KEYS) {
       if (!this.singletonKeys.has(`capi_metadata:${JSON.stringify([key])}`))
         invalid()
     }
   }
+}
+
+function compareTransferKeys(
+  left: Array<string | number>,
+  right: Array<string | number>,
+): number {
+  for (const [index, b] of right.entries()) {
+    const a = left[index]
+    const order =
+      typeof a === "number" && typeof b === "number" ?
+        Math.sign(a - b)
+      : Buffer.compare(Buffer.from(String(a)), Buffer.from(String(b)))
+    if (order !== 0) return order
+  }
+  return 0
 }
 
 async function requireMarker(
@@ -430,7 +501,7 @@ export async function discardIncompleteTransfer(
       args: [],
     })
     await session.execute({
-      sql: "UPDATE capi_metadata SET value='0' WHERE key IN ('config_revision','history_activity_generation','history_debug_generation')",
+      sql: "UPDATE capi_metadata SET value='0' WHERE key IN ('config_revision','history_debug_generation')",
       args: [],
     })
     await session.execute({
@@ -520,6 +591,15 @@ export async function restoreBackup(
     await target.transaction(async (session) => {
       operationSignal.throwIfAborted()
       await requireMarker(session, operationId)
+      if (
+        decoder.manifest
+        && decoder.manifest.schemaVersion < currentSchemaVersion
+      ) {
+        await session.execute({
+          sql: "UPDATE capi_metadata SET value = ? WHERE key = 'schema_version'",
+          args: [String(currentSchemaVersion)],
+        })
+      }
       await validateTransferredState(session)
       operationSignal.throwIfAborted()
       const store = await session.query({
@@ -533,7 +613,8 @@ export async function restoreBackup(
       )
         invalid()
       for (const table of TRANSFER_TABLES) {
-        const count = decoder.counts[table] ?? 0
+        const count =
+          (decoder.counts[table] ?? 0) - (decoder.discardedCounts[table] ?? 0)
         const rows = await session.query({
           sql: `SELECT COUNT(*) AS count FROM ${table}${table === "capi_metadata" ? " WHERE key != 'transfer_incomplete'" : ""}`,
           args: [],

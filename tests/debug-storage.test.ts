@@ -49,26 +49,26 @@ function start() {
     upstream: { kind: "copilot", accountId: 23 },
   })
 }
-test("pending overlays and durable rows contain no live credentials, preserving conversation and pins", async () => {
+test("pending overlays and durable rows retain raw credentials, conversation and pins", async () => {
   const id = start()
   expect((await getLlmDebugLog(id))?.request.body).toContain(
     "ordinary conversation",
   )
   failLlmDebugLog(id, new Error("failed using active-secret"))
   const pending = await history.writer.read((items) => Promise.resolve(items))
-  expect(JSON.stringify(pending)).not.toContain("active-secret")
+  expect(JSON.stringify(pending)).toContain("active-secret")
   await history.writer.flush()
   const rows = await storage.read((s) =>
     s.query({ sql: "SELECT payload_json FROM capi_debug", args: [] }),
   )
-  expect(JSON.stringify(rows)).not.toContain("active-secret")
+  expect(JSON.stringify(rows)).toContain("active-secret")
   expect((await getLlmDebugLog(id))?.upstream).toEqual({
     kind: "copilot",
     accountId: 23,
   })
 })
 
-test("custom configured secret header values are absent from header, body and error queue", async () => {
+test("custom credentials and error text remain present in the raw debug queue", async () => {
   const id = startLlmDebugLog({
     upstream: { kind: "custom", providerId: "custom-fixture" },
     requestHeaders: {
@@ -97,7 +97,7 @@ test("custom configured secret header values are absent from header, body and er
     "synthetic-id-secret",
     "synthetic-fragment-secret",
   ])
-    expect(JSON.stringify(pending)).not.toContain(secret)
+    expect(JSON.stringify(pending)).toContain(secret)
 })
 test("clear generations reject late completions, including pending writer batches", async () => {
   const id = start()
@@ -141,8 +141,14 @@ test("clear releases live request and stalled response capture reservations toge
 test("active capture state evicts oldest requests and releases their readers", async () => {
   const first = start()
   const signal = getLlmDebugCaptureSignal(first)
+  await history.writer.flush()
   for (let index = 0; index < 2000; index++) start()
   expect(signal.aborted).toBe(true)
+  expect(await getLlmDebugLog(first)).toMatchObject({
+    status: "interrupted",
+    replayable: false,
+    error: { name: "DebugCaptureInterrupted" },
+  })
   expect(
     (await listLlmDebugLogs({ limit: 200 })).entries.length,
   ).toBeLessThanOrEqual(200)
@@ -170,7 +176,7 @@ test("new history runtime exposes unfinished rows as interrupted and completed r
   })
 })
 
-test("Turso transport persists scrubbed debug captures and reopens them", async () => {
+test("Turso transport persists raw debug captures and reopens them", async () => {
   await history.close(500)
   const transport = createFakeTursoFetch()
   const remote = new TursoStorage(testConfig())
@@ -187,13 +193,61 @@ test("Turso transport persists scrubbed debug captures and reopens them", async 
     await runtime.close(500)
     const reopened = await createHistoryRuntime(remote, { autoFlush: false })
     const entry = await getLlmDebugLog(id)
-    expect(entry).toMatchObject({ status: "complete", replayable: false })
-    expect(JSON.stringify(entry)).not.toContain("active-secret")
-    expect(JSON.stringify(entry)).not.toContain("response-secret")
-    expect(JSON.stringify(entry)).not.toContain("response-cookie")
+    expect(entry).toMatchObject({ status: "complete", replayable: true })
+    expect(entry?.request.headers.authorization).toBe("Bearer active-secret")
+    expect(entry?.response?.body).toBe(
+      '{"output":"active-secret", "api_key":"response-secret"}',
+    )
+    expect(entry?.response?.headers["set-cookie"]).toBe(
+      "private=response-cookie",
+    )
     await reopened.close(500)
   } finally {
     await remote.close()
     transport.close()
   }
+})
+
+test("large request and SSE response survive pending overlays and SQLite reopening exactly", async () => {
+  const requestBody =
+    '{ "input": "'
+    + "x".repeat(2 * 1024 * 1024)
+    + '", "token": "synthetic-tail" }\r\n'
+  const responseBody =
+    ": synthetic-secret\r\nevent: delta\r\ndata: "
+    + "x".repeat(2 * 1024 * 1024)
+    + "\r\n\r\ndata:[DONE]\r\n\r\n"
+  const headers = {
+    Authorization: "Bearer synthetic-secret",
+    "X-Custom": "exact",
+  }
+  const url =
+    "https://user:synthetic-secret@example.test/responses?token=synthetic-secret&x=%2f&x=+"
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/responses",
+    url,
+    requestBody,
+    requestHeaders: headers,
+  })
+  finishLlmDebugLog(id, {
+    body: responseBody,
+    headers,
+    status: 200,
+    statusText: "OK",
+  })
+  const pending = await getLlmDebugLog(id)
+  expect(pending?.request.body === requestBody).toBe(true)
+  expect(pending?.response?.body === responseBody).toBe(true)
+  await history.close(2000)
+  // eslint-disable-next-line require-atomic-updates -- Isolated sequential test lifecycle.
+  history = await createHistoryRuntime(storage, { autoFlush: false })
+  const reopened = await getLlmDebugLog(id)
+  expect(reopened?.request.body === requestBody).toBe(true)
+  expect(reopened?.response?.body === responseBody).toBe(true)
+  expect(reopened?.request.url).toBe(url)
+  expect(reopened?.request.headers).toEqual(headers)
+  expect(reopened?.response?.headers).toEqual(headers)
+  expect(reopened?.response?.bodyBytesComplete).toBe(true)
+  expect(reopened?.status).toBe("complete")
 })

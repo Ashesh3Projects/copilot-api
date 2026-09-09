@@ -93,6 +93,51 @@ afterEach(() => {
   setModelSettingsForTest([])
 })
 
+test("WebSocket fallback targets honor model redirects and effort overrides", async () => {
+  const fast = "redirected-fast"
+  const originalTarget = state.models?.data[1]
+  if (!originalTarget) throw new Error("Missing fixture target model")
+  state.models?.data.push({ ...originalTarget, id: fast, name: fast })
+  setModelRedirectsForTest([
+    {
+      id: "ws-fast",
+      sourceModel: targetModel,
+      sourceEffort: "all",
+      targetModel: fast,
+      targetEffort: "high",
+      targetVerbosity: "low",
+      enabled: true,
+    },
+  ])
+  const ws = await createSocket()
+  responses.push(
+    new Response("unprocessable", { status: 422 }),
+    completedResponse("resp_redirect"),
+    completedResponse("resp_redirect_next"),
+  )
+  await sendTurn(ws, {
+    input: "first",
+    reasoning: { effort: "low" },
+    text: { verbosity: "high" },
+  })
+  await sendTurn(ws, {
+    previous_response_id: "resp_redirect",
+    input: "next",
+    reasoning: { effort: "low" },
+    text: { verbosity: "high" },
+  })
+  expect(requests.map((request) => request.model)).toEqual([
+    sourceModel,
+    fast,
+    fast,
+  ])
+  for (const request of requests.slice(1)) {
+    expect(request.reasoning).toMatchObject({ effort: "high" })
+    expect(request.text).toMatchObject({ verbosity: "low" })
+  }
+  expect(ws.sent.some((frame) => frame.type === "error")).toBe(false)
+})
+
 test("falls back after upstream 422 and keeps original-model continuations usable", async () => {
   const ws = await createSocket()
   responses.push(
@@ -229,7 +274,7 @@ test("scopes frame thread headers to the authenticated connection credential", a
   expect(first.data.fallbackHeaders?.get("authorization")).toBeNull()
 })
 
-test("a failed alternate does not create sticky state or chain another fallback", async () => {
+test("a configured fallback cycle is bypassed on every WebSocket turn", async () => {
   setModelFallbackConfigForTest({
     ...getLoadedModelFallbackConfig(),
     rules: [
@@ -245,14 +290,12 @@ test("a failed alternate does not create sticky state or chain another fallback"
   const ws = await createSocket()
   responses.push(
     new Response("first rejected", { status: 422 }),
-    new Response("alternate rejected", { status: 422 }),
     completedResponse("resp_source_recovered"),
   )
   await sendTurn(ws, { input: "first" })
   await sendTurn(ws, { input: "again" })
   expect(requests.map((request) => request.model)).toEqual([
     sourceModel,
-    targetModel,
     sourceModel,
   ])
   expect(ws.sent.filter((frame) => frame.type === "error")).toHaveLength(1)

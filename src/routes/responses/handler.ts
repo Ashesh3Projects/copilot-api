@@ -42,6 +42,7 @@ import {
 import { createHandlerLogger } from "~/lib/logger"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
   captureModelFallbackNotice,
   isModelFallbackActive,
   runWithModelFallback,
@@ -875,7 +876,10 @@ const handleResponsesInner = async (
   if (directCustomReference) {
     syncLegacyResponsesRouteState(legacyPayload, payload)
     return await dispatchCustomResponsesRequest(c, {
-      finalEffort: effectiveEffort,
+      finalEffort:
+        typeof effectiveEffort === "number" ? effectiveEffort : (
+          (getModelFallbackRedirect()?.effort ?? effectiveEffort)
+        ),
       payload,
       reference: directCustomReference,
       requestedModel,
@@ -919,16 +923,22 @@ const handleResponsesInner = async (
       payload,
     ) && applyResponsesModelFallback(c, payload)
   const beforeModelFallback = payload.model
-  applyModelFallbackToPayload(payload)
+  applyModelFallbackToPayload(payload, {
+    effort: redirectedEffort,
+    verbosity: redirect.verbosity,
+    modelOnly: typeof effectiveEffort === "number",
+  })
   const finalEffort =
     typeof effectiveEffort === "number" ? effectiveEffort : (
       normalizeReasoningEffortForModel(
         payload.model,
-        redirectedEffort ?? effectiveEffort,
+        getModelFallbackRedirect()?.effort
+          ?? redirectedEffort
+          ?? effectiveEffort,
       )
     )
   if (
-    beforeModelFallback !== payload.model
+    (beforeModelFallback !== payload.model || getModelFallbackRedirect())
     && typeof finalEffort !== "number"
   ) {
     applyRedirectedResponsesEffort({
@@ -1009,7 +1019,8 @@ const handleResponsesInner = async (
     finalReasoningEffort: finalEffort,
     nativeBody,
     preservedSource: options.preparedSource,
-    responsesVerbosity: redirect.verbosity,
+    responsesVerbosity:
+      getModelFallbackRedirect()?.verbosity ?? redirect.verbosity,
     selectedModel,
     signal: c.req.raw.signal,
   })

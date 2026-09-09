@@ -33,6 +33,8 @@ import {
 } from "~/lib/error"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
+  getModelFallbackEffort,
   createModelFallbackCredentialScope,
   isModelFallbackActive,
   runWithModelFallback,
@@ -528,14 +530,21 @@ async function handleResponseCreate(
   // Each turn owns its snapshot model, including retries of that same turn.
   // eslint-disable-next-line require-atomic-updates
   turn.continuationModel = payload.model
-  applyModelFallbackToPayload(payload)
+  applyModelFallbackToPayload(payload, {
+    effort: routing.reasoningEffort,
+    verbosity: routing.responsesVerbosity,
+    modelOnly: typeof payload.reasoning?.effort === "number",
+  })
   if (!turn.requestedModel && payload.model !== turn.continuationModel) {
     turn.requestedModel = turn.continuationModel
   }
   const reasoningEffort =
     payload.model === turn.continuationModel ?
       routing.reasoningEffort
-    : normalizeReasoningEffortForModel(payload.model, routing.reasoningEffort)
+    : normalizeReasoningEffortForModel(
+        payload.model,
+        getModelFallbackEffort(routing.reasoningEffort),
+      )
   if (payload.model !== turn.continuationModel) {
     applyRedirectedResponsesEffort(payload, payload.model, reasoningEffort)
   }
@@ -578,7 +587,8 @@ async function handleResponseCreate(
     prepareResponsesWebSocketCandidate({
       payload,
       reasoningEffort,
-      responsesVerbosity: routing.responsesVerbosity,
+      responsesVerbosity:
+        getModelFallbackRedirect()?.verbosity ?? routing.responsesVerbosity,
       selectedModel,
       signal: turn.abortController.signal,
     }),

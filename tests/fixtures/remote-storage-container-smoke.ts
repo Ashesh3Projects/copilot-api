@@ -160,13 +160,6 @@ async function main() {
       { length: 100 },
       (_, index): Array<HistoryRecord> => [
         {
-          id: `smoke-activity-${index}`,
-          kind: "activity" as const,
-          generation: history.generations.activity,
-          recordedAt: now,
-          payload: { type: "info", message: "synthetic smoke activity" },
-        },
-        {
           id: `smoke-debug-${index}`,
           kind: "debug" as const,
           generation: history.generations.debug,
@@ -183,7 +176,7 @@ async function main() {
     ).flat()
     await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
     await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
-    for (const table of ["capi_activity", "capi_debug"]) {
+    for (const table of ["capi_debug"]) {
       const rows = await namespace.storage.read((sql) =>
         sql.query({
           sql: `SELECT count(*) AS count FROM ${table} WHERE id LIKE 'smoke-%'`,
