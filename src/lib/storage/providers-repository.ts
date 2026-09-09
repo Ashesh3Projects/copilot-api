@@ -4,6 +4,7 @@ import { z } from "zod"
 import type { CustomProviderConfig } from "~/lib/config"
 import type { MutationContext, SqlSession, Storage } from "~/lib/storage/types"
 
+import { maskSecret } from "~/lib/credential-value"
 import { StorageSchemaError } from "~/lib/storage/errors"
 import {
   getStoreRevision,
@@ -144,20 +145,23 @@ export async function loadCustomProviderSnapshotFromSession(
     sql: `${providerSelect} AND p.enabled=1 ORDER BY p.created_at,p.id`,
     args: [],
   })
-  const groq = await session.query({
+  const groqApiKey = await readGroqSecret(session)
+  return freeze({
+    providers: rows.map((row) => decodeProvider(row)),
+    ...(groqApiKey === null ? {} : { groqApiKey }),
+  })
+}
+
+async function readGroqSecret(session: SqlSession): Promise<string | null> {
+  const rows = await session.query({
     sql: "SELECT secret_value FROM capi_service_secrets WHERE service='groq'",
     args: [],
   })
-  if (
-    groq.length > 0
-    && (typeof groq[0]?.secret_value !== "string"
-      || !groq[0].secret_value.trim())
-  )
+  if (rows.length === 0) return null
+  const value = rows[0].secret_value
+  if (typeof value !== "string" || !value.trim())
     throw new StorageSchemaError("Invalid Groq credential record")
-  return freeze({
-    providers: rows.map((row) => decodeProvider(row)),
-    ...(groq.length > 0 ? { groqApiKey: groq[0].secret_value as string } : {}),
-  })
+  return value
 }
 
 export function loadCustomProviderSnapshot(
@@ -306,16 +310,21 @@ async function listProviderSummaries(
 export function createProvidersRepository(storage: Storage) {
   return {
     storage,
-    async groqStatus(): Promise<{
-      apiKeyConfigured: boolean
-      revision: number
-    }> {
+    groqStatus() {
       return storage.read(async (session) => {
-        const snapshot = await loadCustomProviderSnapshotFromSession(session)
+        const credential = await readGroqSecret(session)
         return {
-          apiKeyConfigured: Boolean(snapshot.groqApiKey),
+          apiKeyConfigured: credential !== null,
+          maskedValue: credential === null ? null : maskSecret(credential),
           revision: await readStoreRevision(session),
         }
+      })
+    },
+    async revealGroq() {
+      return storage.read(async (session) => {
+        const credential = await readGroqSecret(session)
+        if (credential === null) return null
+        return { credential, revision: await readStoreRevision(session) }
       })
     },
     async list(): Promise<Array<ProviderSummary>> {

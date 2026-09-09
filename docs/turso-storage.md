@@ -50,8 +50,9 @@ TURSO_AUTH_TOKEN=your-database-token
 
 The URL identifies the database; no database-name variable is needed. Supported
 URL schemes are `turso://` and `https://`, without embedded credentials, query,
-fragment, or application path. Keep the token server-side. The bundled
-1Password/Varlock path can resolve this pair and other deployment settings.
+fragment, or application path. Keep the token server-side. Put the actual pair
+in a normal `.env` file or exported process environment; Bun and Docker Compose
+load these without an additional configuration dependency.
 
 The adapter uses the pinned `@tursodatabase/serverless` 1.4.0 driver. Readiness
 requires the remote engine to expose both `sqlite_version()` and
@@ -95,6 +96,10 @@ Provider editors explicitly load existing API keys and custom-header values.
 All reveal endpoints require an administrator session, CSRF and Origin checks
 and return no-store responses. Inference credentials cannot become
 administrator or gateway credentials through a matching key or digest literal.
+
+The Speech transcription panel also shows the current Groq key masked, with
+explicit reveal/copy controls. Replacing or removing it does not affect gateway
+keys or provider configuration.
 
 ### Gateway-key schema upgrade
 

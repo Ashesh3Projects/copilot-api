@@ -134,6 +134,14 @@ export function createDashboardCredentialRoutes(): Hono {
     return c.json({ ...result.value, revision: result.revision })
   })
   routes.get("/groq", async (c) => c.json(await groqStatus()))
+  routes.post("/groq/reveal", async (c) => {
+    const result = await createProvidersRepository(
+      getStorageRuntime().storage,
+    ).revealGroq()
+    if (!result)
+      throw new StorageNotFoundError("Groq credential does not exist")
+    return c.json(result)
+  })
   routes.put("/groq", async (c) => {
     const input = await body(c)
     if (

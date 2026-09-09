@@ -6,7 +6,8 @@ import { Heading, Text } from "@astryxdesign/core/Text"
 import { TextInput } from "@astryxdesign/core/TextInput"
 import { useState } from "react"
 
-import { api, get, put } from "../lib/api"
+import { Trash2Icon } from "../icons"
+import { api, get } from "../lib/api"
 import { generateGatewayKey } from "../lib/gateway-creation"
 import { useToast } from "../lib/toast"
 import { useAsyncData } from "../lib/usePolling"
@@ -21,18 +22,23 @@ interface Credential {
   revokedAt: number | null
   maskedValue: string
 }
+interface GroqStatus {
+  apiKeyConfigured: boolean
+  maskedValue: string | null
+  revision: number
+}
 const root = "/dashboard/api/credentials"
 const load = async () => {
   const [gateway, groq] = await Promise.all([
     get<{ credentials: Array<Credential>; revision: number }>(
       `${root}/gateway`,
     ),
-    get<{ apiKeyConfigured: boolean }>(`${root}/groq`),
+    get<GroqStatus>(`${root}/groq`),
   ])
   return {
     credentials: gateway.credentials,
     revision: gateway.revision,
-    groq: groq.apiKeyConfigured,
+    groq,
   }
 }
 export function StoredCredentials() {
@@ -118,38 +124,37 @@ export function StoredCredentials() {
           {data?.credentials
             .filter((key) => key.revokedAt === null)
             .map((key) => (
-              <HStack
+              <SecretValue
                 key={`${key.id}:${data.revision}:${revealGeneration}`}
-                gap={3}
-                hAlign="between"
-                vAlign="center"
-                wrap="wrap"
-              >
-                <SecretValue
-                  label={key.label}
-                  maskedValue={key.maskedValue}
-                  revealPath={`${root}/gateway/${encodeURIComponent(key.id)}/reveal`}
-                />
-                <ConfirmButton
-                  label="Delete"
-                  confirmTitle="Delete gateway key"
-                  confirmDescription="This permanently removes the key. API clients using it will lose access."
-                  isDisabled={busy || data.credentials.length <= 1}
-                  onConfirm={() =>
-                    run(async () => {
-                      await api(
-                        "DELETE",
-                        `${root}/gateway/${encodeURIComponent(key.id)}`,
-                        undefined,
-                        {
-                          expectedRevision: data.revision,
-                        },
-                      )
-                      toast.success("Key deleted")
-                    })
-                  }
-                />
-              </HStack>
+                label={key.label}
+                maskedValue={key.maskedValue}
+                revealPath={`${root}/gateway/${encodeURIComponent(key.id)}/reveal`}
+                actions={
+                  <ConfirmButton
+                    label={`Delete ${key.label}`}
+                    isIconOnly
+                    icon={<Trash2Icon />}
+                    size="sm"
+                    confirmActionLabel="Delete key"
+                    confirmTitle="Delete gateway key"
+                    confirmDescription="This permanently removes the key. API clients using it will lose access."
+                    isDisabled={busy || data.credentials.length <= 1}
+                    onConfirm={() =>
+                      run(async () => {
+                        await api(
+                          "DELETE",
+                          `${root}/gateway/${encodeURIComponent(key.id)}`,
+                          undefined,
+                          {
+                            expectedRevision: data.revision,
+                          },
+                        )
+                        toast.success("Key deleted")
+                      })
+                    }
+                  />
+                }
+              />
             ))}
           {data?.credentials.length === 1 ?
             <Text type="supporting" color="secondary">
@@ -162,15 +167,51 @@ export function StoredCredentials() {
         <VStack gap={3}>
           <Heading level={3}>Speech transcription</Heading>
           <Text color="secondary">
-            {data?.groq ?
-              "A Groq key is stored. Leave blank to retain it."
+            {data?.groq.apiKeyConfigured ?
+              "Reveal or copy the current key below. Enter a replacement only when you want to change it."
             : "Add a Groq API key to enable transcription."}
           </Text>
-          <TextInput
-            type="password"
-            label="Groq API key"
+          {data?.groq.maskedValue ?
+            <SecretValue
+              key={`groq:${data.groq.revision}:${revealGeneration}`}
+              label="Current Groq key"
+              maskedValue={data.groq.maskedValue}
+              revealPath={`${root}/groq/reveal`}
+              actions={
+                <ConfirmButton
+                  label="Remove Groq key"
+                  isIconOnly
+                  icon={<Trash2Icon />}
+                  size="sm"
+                  isDisabled={busy}
+                  confirmTitle="Remove Groq key"
+                  confirmDescription="Speech transcription will be unavailable until a new key is saved."
+                  onConfirm={() =>
+                    run(async () => {
+                      await api(
+                        "PUT",
+                        `${root}/groq`,
+                        { clearApiKey: true },
+                        {
+                          expectedRevision: data.groq.revision,
+                        },
+                      )
+                      toast.success("Groq key removed")
+                    })
+                  }
+                />
+              }
+            />
+          : null}
+          <SecretInput
+            label={
+              data?.groq.apiKeyConfigured ?
+                "Replacement Groq API key"
+              : "Groq API key"
+            }
             value={groq}
             onChange={setGroq}
+            isDisabled={busy}
           />
           <HStack gap={2} wrap="wrap">
             <Button
@@ -179,25 +220,19 @@ export function StoredCredentials() {
               isDisabled={busy || !groq.trim()}
               onClick={() =>
                 void run(async () => {
-                  await put(`${root}/groq`, { apiKey: groq })
+                  await api(
+                    "PUT",
+                    `${root}/groq`,
+                    { apiKey: groq },
+                    {
+                      expectedRevision: data?.groq.revision,
+                    },
+                  )
                   setGroq("")
                   toast.success("Groq key saved")
                 })
               }
             />
-            {data?.groq ?
-              <ConfirmButton
-                label="Remove key"
-                confirmTitle="Remove Groq key"
-                confirmDescription="Speech transcription will be unavailable until a new key is saved."
-                onConfirm={() =>
-                  run(async () => {
-                    await put(`${root}/groq`, { clearApiKey: true })
-                    toast.success("Groq key removed")
-                  })
-                }
-              />
-            : null}
           </HStack>
         </VStack>
       </Card>

@@ -41,7 +41,7 @@ test("repository configuration does not support a gateway key file", async () =>
   for (const relativePath of [
     "src/start.ts",
     "docker-compose.yml",
-    ".env.schema",
+    ".env.example",
     "README.md",
   ]) {
     expect(await readRepositoryFile(relativePath)).not.toContain(
@@ -50,7 +50,7 @@ test("repository configuration does not support a gateway key file", async () =>
   }
 })
 
-test("Docker Compose preserves automatic secret-management integration", async () => {
+test("Docker Compose loads ordinary environment files and forwards the Turso pair", async () => {
   const compose = YAML.parse(await readRepositoryFile("docker-compose.yml"))
   const root = requireRecord(compose, "Docker Compose document")
   const services = requireRecord(root.services, "services")
@@ -63,8 +63,7 @@ test("Docker Compose preserves automatic secret-management integration", async (
     "services.copilot-api.environment",
   )
   expect(copilotApi.env_file).toEqual([{ path: ".env", required: false }])
-  expect(environment).toContain("OP_TOKEN=${OP_TOKEN:-}")
-  expect(environment).toContain("OP_ENV_ID=${OP_ENV_ID:-}")
+  expect(environment.some((value) => value.startsWith("OP_"))).toBe(false)
   expect(environment).toContain("TURSO_DATABASE_URL")
   expect(environment).toContain("TURSO_AUTH_TOKEN")
 })
@@ -72,33 +71,30 @@ test("Docker Compose preserves automatic secret-management integration", async (
 test("deployment defaults remain portable and omit obsolete setup guidance", async () => {
   const [
     compose,
-    schema,
+    example,
     readme,
     security,
     nginxReadme,
     updater,
     startSource,
     windowsLauncher,
-    generatedEnvTypes,
   ] = await Promise.all([
     readRepositoryFile("docker-compose.yml"),
-    readRepositoryFile(".env.schema"),
+    readRepositoryFile(".env.example"),
     readRepositoryFile("README.md"),
     readRepositoryFile("SECURITY.md"),
     readRepositoryFile("nginx/README.md"),
     readRepositoryFile("update.sh"),
     readRepositoryFile("src/start.ts"),
     readRepositoryFile("start.bat"),
-    readRepositoryFile("env.d.ts"),
   ])
 
   expect(compose).not.toContain("172.19.0.1")
   expect(compose).not.toContain("setup.md")
   expect(compose).toContain("COPILOT_ADMIN_ORIGIN=${COPILOT_ADMIN_ORIGIN:-}")
-  expect(schema).not.toContain("COPILOT_PORT")
-  expect(schema).toContain("TURSO_DATABASE_URL")
-  expect(schema).not.toContain("COPILOT_ADMIN_PASSWORD_HASH=")
-  expect(generatedEnvTypes).toContain("TURSO_AUTH_TOKEN?: string")
+  expect(example).not.toContain("COPILOT_PORT")
+  expect(example).toContain("TURSO_DATABASE_URL")
+  expect(example).not.toContain("COPILOT_ADMIN_PASSWORD_HASH=")
   expect(readme).not.toContain("recent password reauthentication")
   expect(security).toContain("2026 public-exposure remediation")
   expect(nginxReadme).toContain("Upgrade: websocket")
