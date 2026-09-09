@@ -195,4 +195,8 @@ semantics, and the required replacement of pre-upgrade gateway keys.
 
 No provider model/routing changes, password-only authentication, encryption
 master-key management, Groq reveal feature, inference/JWT digest redesign,
-legacy digest recovery, unrelated cleanup, or dependency upgrades.
+legacy digest recovery, or unrelated cleanup.
+
+The user separately approved pinning only Hono to `4.13.5` on September 9, 2026,
+after the unchanged dependency failed the production audit in CI. No other
+dependency upgrades are included.
