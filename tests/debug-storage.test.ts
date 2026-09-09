@@ -52,7 +52,7 @@ function start() {
     upstream: { kind: "copilot", accountId: 23 },
   })
 }
-test("captures and dashboard reads never enter telemetry or SQL, preserving conversation and pins", async () => {
+test("raw captures and dashboard reads never enter telemetry or SQL, preserving conversation and pins", async () => {
   const databaseRead = spyOn(storage, "read")
   const databaseWrite = spyOn(storage, "transaction")
   const enqueue = spyOn(history.writer, "enqueue")
@@ -62,7 +62,8 @@ test("captures and dashboard reads never enter telemetry or SQL, preserving conv
   )
   failLlmDebugLog(id, new Error("failed using active-secret"))
   const entry = await getLlmDebugLog(id)
-  expect(JSON.stringify(entry)).not.toContain("active-secret")
+  expect(entry?.request.headers.authorization).toBe("Bearer active-secret")
+  expect(entry?.error?.message).toBe("failed using active-secret")
   expect(entry?.upstream).toEqual({
     kind: "copilot",
     accountId: 23,
@@ -87,7 +88,7 @@ test("captures and dashboard reads never enter telemetry or SQL, preserving conv
   expect(tables).toEqual([])
 })
 
-test("custom configured secrets are absent from retained headers, bodies and errors", async () => {
+test("custom configured credentials remain in memory-only headers, bodies and errors", async () => {
   const id = startLlmDebugLog({
     upstream: { kind: "custom", providerId: "custom-fixture" },
     requestHeaders: {
@@ -117,7 +118,7 @@ test("custom configured secrets are absent from retained headers, bodies and err
     "synthetic-id-secret",
     "synthetic-fragment-secret",
   ])
-    expect(JSON.stringify(entry)).not.toContain(secret)
+    expect(JSON.stringify(entry)).toContain(secret)
 })
 test("clearing memory cancels captures and ignores their late completions", async () => {
   const id = start()
@@ -163,6 +164,7 @@ test("active capture state evicts oldest requests and releases their readers", a
   const signal = getLlmDebugCaptureSignal(first)
   for (let index = 0; index < 2000; index++) start()
   expect(signal.aborted).toBe(true)
+  expect(await getLlmDebugLog(first)).toBeUndefined()
   expect(
     (await listLlmDebugLogs({ limit: 200 })).entries.length,
   ).toBeLessThanOrEqual(200)
@@ -188,15 +190,21 @@ test("database history lifecycle cannot reload, interrupt or delete process-loca
     status: "complete",
     replayable: true,
   })
+  await clearLlmDebugLogs()
+  await history.close(500)
+  // eslint-disable-next-line require-atomic-updates -- Isolated sequential test lifecycle.
+  history = await createHistoryRuntime(storage, { autoFlush: false })
+  expect((await listLlmDebugLogs()).count).toBe(0)
 })
 
-test("debug operations send no Turso requests and keep scrubbed results only in memory", async () => {
+test("debug operations send no Turso requests and keep raw results only in memory", async () => {
   await history.close(500)
   const transport = createFakeTursoFetch()
   const remote = new TursoStorage(testConfig())
+  let runtime: HistoryRuntime | undefined
   try {
     await migrateStorage(remote)
-    const runtime = await createHistoryRuntime(remote, { autoFlush: false })
+    runtime = await createHistoryRuntime(remote, { autoFlush: false })
     const requestCount = transport.requests.length
     const id = start()
     finishLlmDebugLog(id, {
@@ -206,16 +214,21 @@ test("debug operations send no Turso requests and keep scrubbed results only in 
       statusText: "OK",
     })
     const entry = await getLlmDebugLog(id)
-    expect(entry).toMatchObject({ status: "complete", replayable: false })
-    expect(JSON.stringify(entry)).not.toContain("active-secret")
-    expect(JSON.stringify(entry)).not.toContain("response-secret")
-    expect(JSON.stringify(entry)).not.toContain("response-cookie")
+    expect(entry).toMatchObject({ status: "complete", replayable: true })
+    expect(entry?.request.headers.authorization).toBe("Bearer active-secret")
+    expect(entry?.response?.body).toBe(
+      '{"output":"active-secret", "api_key":"response-secret"}',
+    )
+    expect(entry?.response?.headers["set-cookie"]).toBe(
+      "private=response-cookie",
+    )
     expect((await listLlmDebugLogs()).count).toBe(1)
     await clearLlmDebugLogs()
     expect(transport.requests.length).toBe(requestCount)
     expect(runtime.writer.status().pendingRecords).toBe(0)
-    await runtime.close(500)
   } finally {
+    await clearLlmDebugLogs()
+    await runtime?.close(500)
     await remote.close()
     transport.close()
   }
@@ -246,21 +259,35 @@ test("debug remains available while the selected database is unavailable", async
 test("completed request and response bodies share the bounded memory budget", async () => {
   const baseline = debugCaptureMemoryUsage()
   let first: string | undefined
-  for (let index = 0; index < 40; index++) {
+  const requestBody = '{ "input": "' + "x".repeat(2 * 1024 * 1024) + '" }\r\n'
+  const responseBody =
+    "event: delta\r\ndata: "
+    + "y".repeat(2 * 1024 * 1024)
+    + "\r\n\r\ndata:[DONE]\r\n\r\n"
+  for (let index = 0; index < 18; index++) {
     const id = startLlmDebugLog({
       method: "POST",
       path: "/responses",
       url: "https://example.test/responses",
       requestHeaders: {},
-      requestBody: JSON.stringify({ input: "x".repeat(450_000) }),
+      requestBody,
     })
     first ??= id
     finishLlmDebugLog(id, {
-      body: JSON.stringify({ output: "y".repeat(450_000) }),
+      body: responseBody,
       headers: {},
       status: 200,
       statusText: "OK",
     })
+    const entry = await getLlmDebugLog(id)
+    expect(entry?.request.body === requestBody).toBe(true)
+    expect(entry?.response?.body === responseBody).toBe(true)
+    expect(entry?.status).toBe("complete")
+    if (index === 0) {
+      expect(debugCaptureMemoryUsage() - baseline).toBeGreaterThanOrEqual(
+        (requestBody.length + responseBody.length) * 2,
+      )
+    }
     expect(debugCaptureMemoryUsage()).toBeLessThanOrEqual(
       DEBUG_CAPTURE_MEMORY_MAX_BYTES,
     )
@@ -272,6 +299,57 @@ test("completed request and response bodies share the bounded memory budget", as
   await clearLlmDebugLogs()
   expect(debugCaptureMemoryUsage()).toBe(baseline)
 })
+
+test.each(["request", "response"] as const)(
+  "retains one oversized %s capture and evicts it whole for the next entry",
+  async (side) => {
+    const baseline = debugCaptureMemoryUsage()
+    const first = start()
+    const signal = getLlmDebugCaptureSignal(first)
+    const oversizedBody = "x".repeat(DEBUG_CAPTURE_MEMORY_MAX_BYTES / 2 + 1)
+    const requestBody = side === "request" ? oversizedBody : "{}"
+    const responseBody = side === "response" ? oversizedBody : "{}"
+    const id = startLlmDebugLog({
+      method: "POST",
+      path: "/responses",
+      url: "https://example.test/responses",
+      requestHeaders: {},
+      requestBody,
+    })
+    if (side === "request") {
+      expect(debugCaptureMemoryUsage()).toBeGreaterThan(
+        DEBUG_CAPTURE_MEMORY_MAX_BYTES,
+      )
+      expect((await getLlmDebugLog(id))?.request.body === requestBody).toBe(
+        true,
+      )
+    }
+    finishLlmDebugLog(id, {
+      body: responseBody,
+      headers: {},
+      status: 200,
+      statusText: "OK",
+    })
+    const entry = await getLlmDebugLog(id)
+    expect(entry?.request.body === requestBody).toBe(true)
+    expect(entry?.response?.body === responseBody).toBe(true)
+    expect(entry?.status).toBe("complete")
+    expect(entry?.replayable).toBe(true)
+    expect(debugCaptureMemoryUsage()).toBeGreaterThan(
+      DEBUG_CAPTURE_MEMORY_MAX_BYTES,
+    )
+    expect(signal.aborted).toBe(true)
+    expect(await getLlmDebugLog(first)).toBeUndefined()
+    const replacement = start()
+    expect(await getLlmDebugLog(id)).toBeUndefined()
+    expect((await getLlmDebugLog(replacement))?.status).toBe("pending")
+    expect(debugCaptureMemoryUsage()).toBeLessThanOrEqual(
+      DEBUG_CAPTURE_MEMORY_MAX_BYTES,
+    )
+    await clearLlmDebugLogs()
+    expect(debugCaptureMemoryUsage()).toBe(baseline)
+  },
+)
 
 test("fresh processes cannot recover completed debug bodies or pending captures", async () => {
   const script = `

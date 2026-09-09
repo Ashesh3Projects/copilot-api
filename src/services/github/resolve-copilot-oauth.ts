@@ -87,12 +87,16 @@ export async function resolveCopilotOAuth(options: {
   accountType: string
   githubToken: string
   instanceDomain: string
+  integrationId?: string | null
 }): Promise<ResolvedCopilotOAuth> {
   const discovered = await discoverCopilotOAuth(options)
   const response = await fetch(
     `${discovered.baseUrl}/models`,
     createCopilotTransportInit({
-      headers: copilotHeaders({ copilotToken: options.githubToken }),
+      headers: copilotHeaders({
+        copilotToken: options.githubToken,
+        integrationId: options.integrationId ?? null,
+      }),
     }),
   )
   if (!response.ok) {

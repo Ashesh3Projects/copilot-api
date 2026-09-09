@@ -1,7 +1,8 @@
 # Database table review
 
 This source audit covers the 29 application tables in schema 2. Schema 3 removes
-`capi_debug`, leaving 28 application tables. The table definitions come from
+`capi_debug`, leaving 28 application tables. Version 5.1.0 schema 5 also removes
+`capi_activity`, leaving 27 tables, and schema 4 adds per-account integration IDs. The table definitions come from
 [migration 001](../src/lib/storage/migrations/001-initial.ts),
 [migration 002](../src/lib/storage/migrations/002-gateway-secrets.ts), and the
 [current schema](../src/lib/storage/schema.ts).
@@ -12,7 +13,7 @@ database was queried for this review. SQLite/Turso system objects and indexes
 are excluded from the count. Every baseline application table has a source
 consumer; none is wholly unused.
 
-Only the LLM Debug persistence correction is implemented. Broader cleanup below
+The LLM Debug persistence correction and Activity removal are implemented. Broader cleanup below
 is proposed for review and has not been performed. "Keep" means needed for the
 current feature and behavior; it does not mean every installation uses that
 feature.

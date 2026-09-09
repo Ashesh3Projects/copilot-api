@@ -31,6 +31,7 @@ export interface Account {
   models: Set<string>
   modelsData: Array<Model>
   accountType: string
+  integrationId?: string | null
   healthy: boolean
   enabled?: boolean
   deleting?: boolean
@@ -46,6 +47,7 @@ export interface AccountLease {
 
 interface AddAccountOptions {
   accountType: string
+  integrationId?: string | null
   githubInstanceDomain?: string
   id: number
 }
@@ -97,6 +99,7 @@ export class TokenPool {
         options.githubInstanceDomain ?? DEFAULT_GITHUB_DOMAIN,
       ),
       accountType: options.accountType,
+      integrationId: options.integrationId ?? null,
       models: new Set(),
       modelsData: [],
       healthy: false,
@@ -126,6 +129,7 @@ export class TokenPool {
       || current.deleting
       || !current.healthy
       || current.credentialRevision !== account.credentialRevision
+      || (current.integrationId ?? null) !== (account.integrationId ?? null)
     )
       return undefined
     const snapshot = {
@@ -179,11 +183,17 @@ export class TokenPool {
     const credentialRevision = account.credentialRevision
     const githubToken = account.githubToken
     const instanceDomain = account.githubInstanceDomain
+    const integrationId = account.integrationId ?? null
     const stillMatches = () =>
       account.credentialRevision === credentialRevision
       && account.githubToken === githubToken
       && account.githubInstanceDomain === instanceDomain
-    const key = `${account.id}:${account.credentialRevision ?? 0}:${createHash("sha256").update(account.githubToken).digest("hex")}`
+      && (account.integrationId ?? null) === integrationId
+    const key = `${account.id}:${account.credentialRevision ?? 0}:${createHash(
+      "sha256",
+    )
+      .update(JSON.stringify([githubToken, instanceDomain, integrationId]))
+      .digest("hex")}`
     const existing = this.accountReinitializations.get(key)
     if (existing) {
       const resolved = await existing
@@ -196,6 +206,7 @@ export class TokenPool {
       accountType: account.accountType,
       githubToken: account.githubToken,
       instanceDomain: account.githubInstanceDomain,
+      integrationId,
     })
     this.accountReinitializations.set(key, current)
     try {
@@ -553,6 +564,7 @@ export class TokenPool {
       accountType: account.accountType,
       githubToken: account.githubToken,
       instanceDomain: account.githubInstanceDomain,
+      integrationId: account.integrationId ?? null,
     })
     this.applyOAuthAccount(account, resolved, publishModels, showToken)
   }
@@ -587,6 +599,8 @@ export class TokenPool {
       && current !== account
       && current.githubToken === account.githubToken
       && current.credentialRevision === account.credentialRevision
+      && current.githubInstanceDomain === account.githubInstanceDomain
+      && (current.integrationId ?? null) === (account.integrationId ?? null)
     ) {
       Object.assign(current, {
         ...account,

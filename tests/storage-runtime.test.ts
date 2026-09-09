@@ -47,7 +47,7 @@ test("initialization migrates the selected SQLite store and creates no JSON", as
       args: ["schema_version"],
     }),
   )
-  expect(rows).toEqual([{ value: "3" }])
+  expect(rows).toEqual([{ value: "5" }])
   expect(
     (await readdir(db.directory)).every((name) =>
       /^copilot-api\.sqlite(?:-(?:wal|shm))?$/.test(name),

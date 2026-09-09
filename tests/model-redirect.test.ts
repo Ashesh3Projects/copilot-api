@@ -391,7 +391,7 @@ test("enforces final self-redirect target effort across exact opus chain", async
   expect(directXhigh.effort).toBe("xhigh")
 })
 
-test("stops chained redirects before loops", async () => {
+test("bypasses chained redirects when a loop is configured", async () => {
   setModelRedirectsForTest([
     {
       id: "a-to-b",
@@ -412,9 +412,8 @@ test("stops chained redirects before loops", async () => {
   const redirect = await applyModelRedirect("model-a")
 
   expect(redirect).toMatchObject({
-    model: "model-b",
-    redirected: true,
-    ruleIds: ["a-to-b"],
+    model: "model-a",
+    redirected: false,
   })
 })
 

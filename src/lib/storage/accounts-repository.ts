@@ -13,6 +13,7 @@ import {
   runMutation,
   readCommittedMutation,
 } from "~/lib/storage/operations"
+import { normalizeAccountIntegrationId } from "~/services/copilot/copilot-contract"
 
 export interface AccountRecord {
   id: number
@@ -25,6 +26,13 @@ export interface AccountRecord {
   deleting: boolean
   credentialRevision: number
   accountType: string
+  integrationId: string | null
+}
+
+export interface AccountUpdate {
+  enabled?: boolean
+  label?: string | null
+  integrationId?: string | null
 }
 
 export interface ValidatedAccount {
@@ -35,6 +43,7 @@ export interface ValidatedAccount {
   label: string | null
   accountType: string
   modelCount: number
+  integrationId?: string | null
 }
 
 export interface AccountWithCredential {
@@ -74,6 +83,13 @@ function decodeAccount(row: Record<string, unknown>): AccountRecord {
     "accountType" in validation && typeof validation.accountType === "string" ?
       validation.accountType
     : "individual"
+  let integrationId: string | null
+  try {
+    integrationId = normalizeAccountIntegrationId(row.integration_id)
+    if (integrationId !== row.integration_id) throw new TypeError()
+  } catch {
+    throw new StorageSchemaError("Invalid stored account integration ID")
+  }
   return {
     id: row.id,
     instanceDomain: row.domain,
@@ -86,6 +102,7 @@ function decodeAccount(row: Record<string, unknown>): AccountRecord {
     deleting: row.deleting_at !== null,
     credentialRevision: row.credential_revision,
     accountType,
+    integrationId,
   }
 }
 
@@ -124,12 +141,13 @@ export async function insertValidatedAccount(
 ): Promise<AccountRecord> {
   const now = Date.now()
   const rows = await session.query({
-    sql: "INSERT INTO capi_accounts (domain, upstream_user_id, login, label, credential_revision, validation_json, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?) RETURNING id",
+    sql: "INSERT INTO capi_accounts (domain, upstream_user_id, login, label, integration_id, credential_revision, validation_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING id",
     args: [
       input.instanceDomain,
       input.upstreamUserId,
       input.login,
       input.label,
+      normalizeAccountIntegrationId(input.integrationId),
       JSON.stringify({
         accountType: input.accountType,
         modelCount: input.modelCount,
@@ -161,6 +179,7 @@ export class AccountsRepository {
       instanceDomain: string
       label: string | null
       accountType: string
+      integrationId?: string
     },
     context: MutationContext,
   ): Promise<Committed<AccountRecord> | undefined> {
@@ -256,6 +275,9 @@ export class AccountsRepository {
       instanceDomain: input.instanceDomain,
       label: input.label,
       accountType: input.accountType,
+      ...(input.integrationId ?
+        { integrationId: normalizeAccountIntegrationId(input.integrationId) }
+      : {}),
     })
     return runMutation(this.storage, bound, (session) =>
       insertValidatedAccount(session, input),
@@ -264,9 +286,13 @@ export class AccountsRepository {
 
   update(
     id: number,
-    input: { enabled?: boolean; label?: string | null },
+    input: AccountUpdate,
     context: MutationContext,
   ): Promise<Committed<AccountRecord>> {
+    const integrationId =
+      input.integrationId === undefined ?
+        undefined
+      : normalizeAccountIntegrationId(input.integrationId)
     const bound = bindAccountMutation(context, "account.update", {
       id,
       ...input,
@@ -274,11 +300,15 @@ export class AccountsRepository {
     return runMutation(this.storage, bound, async (session) => {
       const before = await readAccount(session, id)
       assertActive(before)
+      const nextIntegrationId =
+        integrationId === undefined ? before.integrationId : integrationId
       await session.execute({
-        sql: "UPDATE capi_accounts SET enabled = ?, label = ?, updated_at = ? WHERE id = ?",
+        sql: "UPDATE capi_accounts SET enabled = ?, label = ?, integration_id = ?, credential_revision = credential_revision + ?, updated_at = ? WHERE id = ?",
         args: [
           Number(input.enabled ?? before.enabled),
           input.label === undefined ? before.label : input.label,
+          nextIntegrationId,
+          Number(nextIntegrationId !== before.integrationId),
           Date.now(),
           id,
         ],

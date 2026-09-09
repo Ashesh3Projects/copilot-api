@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import type { Model } from "~/services/copilot/get-models"
 
 import { setConfigForTest } from "~/lib/config"
+import { listLlmDebugLogs } from "~/lib/llm-debug-log"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -60,6 +61,156 @@ function configure(sourceModel = "source-model", targetModel = "target-model") {
     }),
   )
 }
+
+test("native Messages fallback redirects override body effort on each turn", async () => {
+  state.models = {
+    object: "list",
+    data: [
+      model("source-model", "/v1/messages"),
+      model("fast-target", "/v1/messages"),
+    ],
+  }
+  setModelRedirectsForTest([
+    {
+      id: "native-fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "high",
+      enabled: true,
+    },
+  ])
+  for (let i = 0; i < 2; i++) {
+    const response = await post("/v1/messages", {
+      model: "source-model",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hello" }],
+      output_config: { effort: "low" },
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(calls.at(-1)?.body.output_config).toMatchObject({ effort: "high" })
+  }
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "source-model",
+    "fast-target",
+    "fast-target",
+  ])
+  expect((await listLlmDebugLogs()).entries[0]).toMatchObject({
+    fallback: { cached: true, targetModel: "fast-target" },
+  })
+})
+
+test.each([
+  [
+    "Chat",
+    "/v1/chat/completions",
+    {
+      model: "custom-source",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "low",
+    },
+  ],
+  [
+    "Responses",
+    "/v1/responses",
+    { model: "custom-source", input: "hello", reasoning: { effort: "low" } },
+  ],
+] as const)(
+  "%s retains redirect effort on custom-provider to Copilot fallback",
+  async (_protocol, path, body) => {
+    setConfigForTest({
+      customProviders: [
+        {
+          id: "custom",
+          name: "Custom",
+          type: "openai-compatible",
+          baseUrl: "https://custom.example/v1",
+          apiKey: "synthetic",
+          models: [{ id: "custom-source", kind: "chat" }],
+        },
+      ],
+    })
+    configure("custom-source", "target-model")
+    state.models?.data.push(model("fast-target"))
+    setModelRedirectsForTest([
+      {
+        id: "fast",
+        sourceModel: "target-model",
+        sourceEffort: "all",
+        targetModel: "fast-target",
+        targetEffort: "high",
+        enabled: true,
+      },
+    ])
+    const response = await post(path, body)
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(calls.map((call) => call.body.model)).toEqual([
+      "custom-source",
+      "fast-target",
+    ])
+    expect(calls[1].body.reasoning_effort).toBe("high")
+  },
+)
+
+test("Google custom fallback effort is normalized against its target model", async () => {
+  setConfigForTest({
+    customProviders: [
+      {
+        id: "custom",
+        name: "Custom",
+        type: "openai-compatible",
+        baseUrl: "https://custom.example/v1",
+        apiKey: "synthetic",
+        passReasoningEffort: true,
+        models: [
+          { id: "gpt-5.2", kind: "chat" },
+          { id: "fast-target", kind: "chat" },
+        ],
+      },
+    ],
+  })
+  state.models = { object: "list", data: [] }
+  configure("gpt-5.2", "target-model")
+  setModelRedirectsForTest([
+    {
+      id: "fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "xhigh",
+      enabled: true,
+    },
+  ])
+  const original = globalThis.fetch
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    if (
+      typeof init?.body === "string"
+      && (JSON.parse(init.body) as Record<string, unknown>).model === "gpt-5.2"
+    ) {
+      calls.push({
+        path: "/chat/completions",
+        body: JSON.parse(init.body) as Record<string, unknown>,
+      })
+      return new Response("unprocessable", { status: 422 })
+    }
+    return await original(input, init)
+  }) as typeof fetch
+  const response = await post("/v1beta/models/gpt-5.2:low:generateContent", {
+    contents: [{ role: "user", parts: [{ text: "hello" }] }],
+  })
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "gpt-5.2",
+    "fast-target",
+  ])
+  expect(calls[1].body.reasoning_effort).toBe("xhigh")
+})
 
 function success(body: Record<string, unknown>, path: string): Response {
   if (path === "/v1/messages") {
@@ -207,6 +358,60 @@ function post(
     }),
   )
 }
+
+test.each([
+  [
+    "Chat",
+    "/v1/chat/completions",
+    {
+      model: "source-model",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "low",
+    },
+  ],
+  [
+    "Messages",
+    "/v1/messages",
+    {
+      model: "source-model:low",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hello" }],
+    },
+  ],
+  [
+    "Google",
+    "/v1beta/models/source-model:low:generateContent",
+    { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
+  ],
+] as const)(
+  "%s applies fallback redirects and target effort before preparing upstream payloads",
+  async (_protocol, path, payload) => {
+    state.models?.data.push(model("fast-target"))
+    setModelRedirectsForTest([
+      {
+        id: "faster-target",
+        sourceModel: "target-model",
+        sourceEffort: "all",
+        targetModel: "fast-target",
+        targetEffort: "high",
+        enabled: true,
+      },
+    ])
+    const response = await post(path, payload)
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(calls.map((call) => call.body.model)).toEqual([
+      "source-model",
+      "fast-target",
+    ])
+    expect(calls[1].body.reasoning_effort).toBe("high")
+    const next = await post(path, payload)
+    expect(next.status).toBe(200)
+    await next.text()
+    expect(calls.at(-1)?.body.model).toBe("fast-target")
+    expect(calls.at(-1)?.body.reasoning_effort).toBe("high")
+  },
+)
 
 test("Chat preserves public model and fallback reasoning through the next turn", async () => {
   const payload = (signature: string) => ({

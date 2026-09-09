@@ -22,6 +22,7 @@ import {
   IconAction,
   RowActions,
 } from "../components/common"
+import { ModelRoutingWarning } from "../components/ModelRoutingWarning"
 import { Page } from "../components/Page"
 import { ResponsivePair } from "../components/ResponsivePair"
 import { FallbackIcon, PencilIcon, Trash2Icon } from "../icons"
@@ -231,6 +232,7 @@ function FallbackControls({
 
   return (
     <>
+      <ModelRoutingWarning safety={settings.safety} />
       {saveError ?
         <Banner
           status="error"
@@ -262,16 +264,17 @@ function FallbackControls({
             }}
           />
           <Text type="supporting" color="secondary">
-            Rules match each model after Model Redirects. Each request can
-            follow up to 3 fallback hops (4 model attempts).
+            Rules match each model after Model Redirects. Fallback targets also
+            follow Model Redirects. Each request can follow up to 3 fallback
+            hops (4 model attempts).
           </Text>
           <VStack gap={1}>
             <Text type="code">A → B → C → D</Text>
             <Text type="supporting" color="secondary">
               Add one rule per arrow. Each hop requires HTTP 422. The chain
               stops at the first success, any other error, a model without an
-              enabled fallback, or the 3-hop limit. Loops stop before retrying a
-              model.
+              enabled fallback, or the 3-hop limit. A loop in either feature
+              pauses all redirects and fallbacks until its rules are corrected.
             </Text>
           </VStack>
           <Switch

@@ -201,6 +201,59 @@ test("account routes enforce real admin session and CSRF", async () => {
   expect(await accounts.list()).toEqual([])
 })
 
+test("account integration editor receives the default and saves, clears, and validates its override", async () => {
+  const created = await request("/accounts", {
+    method: "POST",
+    body: { token: "fixture-oauth" },
+  })
+  const { account } = (await created.json()) as { account: { id: number } }
+  const listed = await request("/accounts")
+  const page = (await listed.json()) as {
+    defaultIntegrationId: string
+    revision: number
+    accounts: Array<{ integrationId: string | null }>
+  }
+  expect(page.defaultIntegrationId).toBe("copilot-developer-cli")
+  expect(page.accounts[0].integrationId).toBeNull()
+  const saved = await request(`/accounts/${account.id}`, {
+    method: "PATCH",
+    body: { integrationId: "  assigned-integration  " },
+    headers: { "If-Match": String(page.revision) },
+  })
+  expect(saved.status).toBe(200)
+  expect(await saved.json()).toMatchObject({
+    account: { integrationId: "assigned-integration" },
+  })
+  await accounts.whenIdle()
+  for (const integrationId of [
+    "\tassigned-integration",
+    "\r\n",
+    "a".repeat(129),
+    "你好",
+    42,
+  ]) {
+    expect(
+      (
+        await request(`/accounts/${account.id}`, {
+          method: "PATCH",
+          body: { integrationId },
+        })
+      ).status,
+    ).toBe(400)
+  }
+  for (const integrationId of ["   ", null]) {
+    const cleared = await request(`/accounts/${account.id}`, {
+      method: "PATCH",
+      body: { integrationId },
+    })
+    expect(cleared.status).toBe(200)
+    expect(await cleared.json()).toMatchObject({
+      account: { integrationId: null },
+    })
+    await accounts.whenIdle()
+  }
+})
+
 test("lifecycle routes return metadata, enforce revisions and retain credentials on conflict", async () => {
   const created = await request("/accounts", {
     method: "POST",

@@ -5,20 +5,16 @@ import { Badge } from "@astryxdesign/core/Badge"
 import { Banner } from "@astryxdesign/core/Banner"
 import { Button } from "@astryxdesign/core/Button"
 import { Card } from "@astryxdesign/core/Card"
-import { Divider } from "@astryxdesign/core/Divider"
-import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList"
 import { Selector } from "@astryxdesign/core/Selector"
 import { Skeleton } from "@astryxdesign/core/Skeleton"
 import { HStack, VStack } from "@astryxdesign/core/Stack"
-import { pixel, proportional } from "@astryxdesign/core/Table"
+import { Table, pixel, proportional } from "@astryxdesign/core/Table"
 import { Heading, Text } from "@astryxdesign/core/Text"
 import { TextInput } from "@astryxdesign/core/TextInput"
 import { useRef, useState } from "react"
 
 import {
   ConfirmButton,
-  DataTable,
-  EmptyState,
   IconAction,
   MonoText,
   RelTime,
@@ -26,9 +22,8 @@ import {
 } from "../components/common"
 import { DatabaseBackup } from "../components/DatabaseBackup"
 import { Page } from "../components/Page"
-import { ResponsivePair } from "../components/ResponsivePair"
 import { StoredCredentials } from "../components/StoredCredentials"
-import { DownloadIcon, PlusIcon, Trash2Icon } from "../icons"
+import { PlusIcon, Trash2Icon } from "../icons"
 import { ApiError, del, get, patch, post, put } from "../lib/api"
 import { useToast } from "../lib/toast"
 import {
@@ -43,6 +38,7 @@ import {
   type TrustedJwtDigestEntry,
 } from "../lib/types"
 import { useAsyncData } from "../lib/usePolling"
+import "./settings.css"
 
 type IpRow = IpAllowlistEntry & Record<string, unknown>
 type TrustedJwtDigestRow = TrustedJwtDigestEntry & Record<string, unknown>
@@ -55,11 +51,11 @@ function errorMessage(caught: unknown, fallback: string): string {
   return caught instanceof ApiError ? caught.message : fallback
 }
 
-function boolBadge(value: boolean, trueLabel = "Yes", falseLabel = "No") {
+function ServerStatus({ label, enabled }: { label: string; enabled: boolean }) {
   return (
     <Badge
-      variant={value ? "success" : "neutral"}
-      label={value ? trueLabel : falseLabel}
+      variant={enabled ? "success" : "neutral"}
+      label={`${label}: ${enabled ? "Yes" : "No"}`}
     />
   )
 }
@@ -276,9 +272,24 @@ export default function SettingsScreen() {
   const ipColumns: Array<TableColumn<IpRow>> = [
     {
       key: "ip",
-      header: "IP",
-      width: proportional(2),
-      renderCell: (item) => <MonoText>{item.ip}</MonoText>,
+      header: "IP address",
+      width: proportional(1),
+      renderCell: (item) => (
+        <div className="settings-entry-details">
+          <MonoText>{item.ip}</MonoText>
+          <Text type="supporting" color="secondary">
+            Source: {item.source}
+          </Text>
+          <HStack gap={1} wrap="wrap">
+            <Text type="supporting" color="secondary">
+              Last seen:
+            </Text>
+            {item.lastSeenAt ?
+              <RelTime ts={item.lastSeenAt} />
+            : <Text type="supporting">—</Text>}
+          </HStack>
+        </div>
+      ),
     },
     {
       key: "enabled",
@@ -293,24 +304,9 @@ export default function SettingsScreen() {
       ),
     },
     {
-      key: "source",
-      header: "Source",
-      width: pixel(120),
-      renderCell: (item) => <Text type="supporting">{item.source}</Text>,
-    },
-    {
-      key: "lastSeen",
-      header: "Last Seen",
-      width: pixel(140),
-      renderCell: (item) =>
-        item.lastSeenAt ?
-          <RelTime ts={item.lastSeenAt} />
-        : <Text type="supporting">—</Text>,
-    },
-    {
       key: "actions",
       header: "",
-      width: pixel(56),
+      width: pixel(44),
       align: "end",
       renderCell: (item) => (
         <IconAction
@@ -328,16 +324,17 @@ export default function SettingsScreen() {
       key: "label",
       header: "Device",
       width: proportional(1),
-      renderCell: (item) => <Text>{item.label}</Text>,
-    },
-    {
-      key: "digest",
-      header: "SHA-256 digest",
-      width: proportional(2),
       renderCell: (item) => (
-        <span title={item.digest}>
+        <div className="settings-entry-details">
+          <Text weight="medium">{item.label}</Text>
           <MonoText>{item.digest}</MonoText>
-        </span>
+          <HStack gap={1} wrap="wrap">
+            <Text type="supporting" color="secondary">
+              Created:
+            </Text>
+            <RelTime ts={item.createdAt} />
+          </HStack>
+        </div>
       ),
     },
     {
@@ -353,19 +350,13 @@ export default function SettingsScreen() {
       ),
     },
     {
-      key: "createdAt",
-      header: "Created",
-      width: pixel(112),
-      renderCell: (item) => <RelTime ts={item.createdAt} />,
-    },
-    {
       key: "actions",
       header: "",
-      width: pixel(56),
+      width: pixel(44),
       align: "end",
       renderCell: (item) => (
         <ConfirmButton
-          label="Delete"
+          label={`Delete ${item.label}`}
           isIconOnly
           icon={<Trash2Icon />}
           size="sm"
@@ -400,214 +391,302 @@ export default function SettingsScreen() {
       : null}
 
       {data ?
-        <VStack gap={4}>
-          <StoredCredentials />
-          <DatabaseBackup />
-          <Card>
+        <div className="settings-layout">
+          <Card className="settings-card settings-summary">
             <VStack gap={3}>
-              <Heading level={3}>Administrator password</Heading>
-              <Text color="secondary">
-                Changing your password signs out other administrator sessions.
-                API client credentials stay active.
-              </Text>
-              <TextInput
-                type="password"
-                label="Current password"
-                value={currentPassword}
-                onChange={setCurrentPassword}
-              />
-              <TextInput
-                type="password"
-                label="New password"
-                value={newPassword}
-                onChange={setNewPassword}
-              />
-              <TextInput
-                type="password"
-                label="Confirm new password"
-                value={confirmPassword}
-                onChange={setConfirmPassword}
-              />
-              <Button
-                label="Change password"
-                variant="secondary"
-                isLoading={changingPassword}
-                isDisabled={
-                  changingPassword
-                  || !currentPassword
-                  || newPassword.length < 4
-                  || newPassword !== confirmPassword
-                }
-                onClick={() => void changePassword()}
-              />
+              <Heading level={2}>Server Configuration</Heading>
+              <dl className="settings-server-facts">
+                <div>
+                  <dt>Version</dt>
+                  <dd>{data.settings.version}</dd>
+                </div>
+                <div>
+                  <dt>Port</dt>
+                  <dd>{data.settings.port}</dd>
+                </div>
+                <div>
+                  <dt>Host</dt>
+                  <dd>
+                    <MonoText>{data.settings.host}</MonoText>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Database</dt>
+                  <dd>
+                    <MonoText>{data.settings.dataDir}</MonoText>
+                  </dd>
+                </div>
+              </dl>
+              <HStack gap={2} wrap="wrap" vAlign="center">
+                <ServerStatus
+                  label="API key configured"
+                  enabled={data.settings.authEnabled}
+                />
+                <ServerStatus
+                  label="Multi-token mode"
+                  enabled={data.settings.multiToken}
+                />
+                <ServerStatus
+                  label="Sentry"
+                  enabled={data.settings.sentryEnabled}
+                />
+                <ServerStatus
+                  label="Groq"
+                  enabled={data.settings.groqEnabled}
+                />
+                <ServerStatus
+                  label="Debug mode"
+                  enabled={data.settings.debug}
+                />
+                <ServerStatus
+                  label="Verbose logging"
+                  enabled={data.settings.verbose}
+                />
+              </HStack>
             </VStack>
           </Card>
-          <ResponsivePair minWidth={470}>
-            <Card>
-              <VStack gap={4}>
-                <Heading level={3}>Server Configuration</Heading>
-                <MetadataList columns={2}>
-                  <MetadataListItem label="Version">
-                    {data.settings.version}
-                  </MetadataListItem>
-                  <MetadataListItem label="Port">
-                    {data.settings.port}
-                  </MetadataListItem>
-                  <MetadataListItem label="Host">
-                    {data.settings.host}
-                  </MetadataListItem>
-                  <MetadataListItem label="API Key Configured">
-                    {boolBadge(data.settings.authEnabled)}
-                  </MetadataListItem>
-                  <MetadataListItem label="Multi-Token Mode">
-                    {boolBadge(data.settings.multiToken)}
-                  </MetadataListItem>
-                  <MetadataListItem label="Sentry Enabled">
-                    {boolBadge(data.settings.sentryEnabled)}
-                  </MetadataListItem>
-                  <MetadataListItem label="Groq Enabled">
-                    {boolBadge(data.settings.groqEnabled)}
-                  </MetadataListItem>
-                  <MetadataListItem label="Database">
-                    <MonoText>{data.settings.dataDir}</MonoText>
-                  </MetadataListItem>
-                  <MetadataListItem label="Debug Mode">
-                    {boolBadge(data.settings.debug)}
-                  </MetadataListItem>
-                  <MetadataListItem label="Verbose Logging">
-                    {boolBadge(data.settings.verbose)}
-                  </MetadataListItem>
-                </MetadataList>
 
-                <Divider />
-
-                <VStack gap={4}>
-                  <HStack gap={2} vAlign="center" wrap="wrap">
-                    <Heading level={4}>Codex Dictation Cleanup</Heading>
-                    <Badge variant="neutral" label="Used by /codex/responses" />
-                  </HStack>
+          <div className="settings-columns">
+            <section
+              className="settings-column settings-credentials"
+              aria-labelledby="settings-credentials-heading"
+            >
+              <Heading level={2} id="settings-credentials-heading">
+                Credentials &amp; speech
+              </Heading>
+              <StoredCredentials />
+              <Card className="settings-card">
+                <VStack gap={3}>
+                  <Heading level={3}>Codex Dictation Cleanup</Heading>
+                  <Text type="supporting" color="secondary">
+                    Used by /codex/responses
+                  </Text>
                   <Selector
                     label="Cleanup model"
                     options={cleanupOptions}
                     value={cleanupValue}
                     onChange={setCleanupDraft}
+                    width="100%"
                   />
-                  <HStack hAlign="end">
+                  <HStack gap={2} wrap="wrap">
                     <Button
                       label="Save"
-                      variant="primary"
+                      variant="secondary"
                       isLoading={isSavingCleanup}
                       onClick={handleSaveCleanup}
                     />
                   </HStack>
                 </VStack>
+              </Card>
+            </section>
 
-                <Divider />
+            <section
+              className="settings-column settings-access"
+              aria-labelledby="settings-access-heading"
+            >
+              <Heading level={2} id="settings-access-heading">
+                Access controls
+              </Heading>
+              <Card className="settings-card">
+                <VStack gap={3}>
+                  <HStack gap={2} vAlign="center" wrap="wrap">
+                    <Heading level={3}>IP Allowlist</Heading>
+                    <Badge variant="neutral" label="Used by /transcribe" />
+                  </HStack>
+                  <HStack gap={2} vAlign="end" wrap="wrap">
+                    <div className="settings-inline-field">
+                      <TextInput
+                        label="IP address"
+                        value={newIp}
+                        onChange={setNewIp}
+                        placeholder={ipAddressPlaceholder(data.currentIp)}
+                        width="100%"
+                      />
+                    </div>
+                    <Button
+                      label="Add"
+                      variant="secondary"
+                      icon={<PlusIcon />}
+                      isLoading={isAddingIp}
+                      isDisabled={isAddingIp}
+                      onClick={handleAddIp}
+                    />
+                  </HStack>
+                  <HStack gap={2} hAlign="between" vAlign="center" wrap="wrap">
+                    <Text type="supporting" id="settings-ip-list-label">
+                      {data.allowlist.length} IP{" "}
+                      {data.allowlist.length === 1 ? "address" : "addresses"}
+                      {` · ${data.allowlist.filter((entry) => entry.enabled).length} enabled`}
+                    </Text>
+                    {data.allowlist.length > 0 ?
+                      <ConfirmButton
+                        label="Clear all"
+                        size="sm"
+                        confirmTitle="Clear IP allowlist"
+                        confirmDescription="Remove every IP address from the allowlist?"
+                        confirmActionLabel="Clear all"
+                        onConfirm={handleClearAllowlist}
+                      />
+                    : null}
+                  </HStack>
+                  {data.allowlist.length === 0 ?
+                    <div className="settings-empty-list">
+                      <VStack gap={1}>
+                        <Text weight="medium">No allowlisted IPs</Text>
+                        <Text type="supporting" color="secondary">
+                          Add an IP address to allow access to /transcribe.
+                        </Text>
+                      </VStack>
+                    </div>
+                  : <div
+                      className="settings-access-list"
+                      role="region"
+                      aria-labelledby="settings-ip-list-label"
+                      tabIndex={0}
+                    >
+                      <Table
+                        tableProps={{ "aria-label": "IP allowlist" }}
+                        data={data.allowlist as Array<IpRow>}
+                        columns={ipColumns}
+                        idKey="ip"
+                        density="compact"
+                        textOverflow="wrap"
+                        dividers="rows"
+                        hasHover
+                      />
+                    </div>
+                  }
+                </VStack>
+              </Card>
 
-                <HStack hAlign="end">
-                  <Button
-                    label="Export sanitized config"
-                    variant="secondary"
-                    icon={<DownloadIcon />}
-                    onClick={() => void handleExport()}
-                  />
-                </HStack>
-              </VStack>
-            </Card>
-
-            <Card>
-              <VStack gap={4}>
-                <HStack gap={2} vAlign="center" wrap="wrap">
-                  <Heading level={3}>IP Allowlist</Heading>
-                  <Badge variant="neutral" label="Used by /transcribe" />
-                </HStack>
-                <HStack gap={2} vAlign="end" wrap="wrap">
+              <Card className="settings-card">
+                <VStack gap={3}>
+                  <HStack gap={2} vAlign="center" wrap="wrap">
+                    <Heading level={3}>Trusted JWT Digests</Heading>
+                    <Badge variant="neutral" label="Inference only" />
+                  </HStack>
+                  <Text type="supporting" color="secondary">
+                    Generate a local Codex ChatGPT auth file with the repository
+                    PowerShell script, then paste only its SHA-256 digest here.
+                  </Text>
                   <TextInput
-                    label="IP address"
-                    value={newIp}
-                    onChange={setNewIp}
-                    placeholder={ipAddressPlaceholder(data.currentIp)}
-                    width="min(100%, 320px)"
+                    label="Device label"
+                    value={newJwtLabel}
+                    onChange={setNewJwtLabel}
+                    width="100%"
                   />
-                  <Button
-                    label="Add"
-                    variant="secondary"
-                    icon={<PlusIcon />}
-                    isLoading={isAddingIp}
-                    isDisabled={isAddingIp}
-                    onClick={handleAddIp}
+                  <TextInput
+                    label="SHA-256 digest"
+                    value={newJwtDigest}
+                    onChange={setNewJwtDigest}
+                    width="100%"
                   />
-                </HStack>
-                {data.allowlist.length > 0 ?
-                  <ConfirmButton
-                    label="Clear all"
-                    confirmTitle="Clear IP allowlist"
-                    confirmDescription="Remove every IP address from the allowlist?"
-                    confirmActionLabel="Clear all"
-                    onConfirm={handleClearAllowlist}
-                  />
-                : null}
-                {data.allowlist.length === 0 ?
-                  <EmptyState
-                    title="No allowlisted IPs"
-                    description="Add an IP address to allow access to /transcribe."
-                  />
-                : <DataTable
-                    data={data.allowlist as Array<IpRow>}
-                    columns={ipColumns}
-                    idKey="ip"
-                  />
-                }
-              </VStack>
-            </Card>
-          </ResponsivePair>
+                  <HStack gap={2} hAlign="between" vAlign="center" wrap="wrap">
+                    <Text type="supporting" id="settings-jwt-list-label">
+                      {data.trustedJwtDigests.length} trusted{" "}
+                      {data.trustedJwtDigests.length === 1 ?
+                        "digest"
+                      : "digests"}
+                      {` · ${data.trustedJwtDigests.filter((entry) => entry.enabled).length} enabled`}
+                    </Text>
+                    <Button
+                      label="Add"
+                      variant="secondary"
+                      icon={<PlusIcon />}
+                      isLoading={isAddingJwtDigest}
+                      isDisabled={isAddingJwtDigest}
+                      onClick={handleAddJwtDigest}
+                    />
+                  </HStack>
+                  {data.trustedJwtDigests.length === 0 ?
+                    <div className="settings-empty-list">
+                      <VStack gap={1}>
+                        <Text weight="medium">No trusted JWT digests</Text>
+                        <Text type="supporting" color="secondary">
+                          Generate a digest on the Codex PC, then register it
+                          here.
+                        </Text>
+                      </VStack>
+                    </div>
+                  : <div
+                      className="settings-access-list"
+                      role="region"
+                      aria-labelledby="settings-jwt-list-label"
+                      tabIndex={0}
+                    >
+                      <Table
+                        tableProps={{ "aria-label": "Trusted JWT digests" }}
+                        data={
+                          data.trustedJwtDigests as Array<TrustedJwtDigestRow>
+                        }
+                        columns={trustedJwtDigestColumns}
+                        idKey="id"
+                        density="compact"
+                        textOverflow="wrap"
+                        dividers="rows"
+                        hasHover
+                      />
+                    </div>
+                  }
+                </VStack>
+              </Card>
+            </section>
 
-          <Card>
-            <VStack gap={4}>
-              <HStack gap={2} vAlign="center" wrap="wrap">
-                <Heading level={3}>Trusted JWT Digests</Heading>
-                <Badge variant="neutral" label="Inference only" />
-              </HStack>
-              <Text type="supporting">
-                Generate a local Codex ChatGPT auth file with the repository
-                PowerShell script, then paste only its SHA-256 digest here.
-              </Text>
-              <HStack gap={2} vAlign="end" wrap="wrap">
-                <TextInput
-                  label="Device label"
-                  value={newJwtLabel}
-                  onChange={setNewJwtLabel}
-                  width="min(100%, 240px)"
-                />
-                <TextInput
-                  label="SHA-256 digest"
-                  value={newJwtDigest}
-                  onChange={setNewJwtDigest}
-                  width="min(100%, 420px)"
-                />
-                <Button
-                  label="Add"
-                  variant="secondary"
-                  icon={<PlusIcon />}
-                  isLoading={isAddingJwtDigest}
-                  isDisabled={isAddingJwtDigest}
-                  onClick={handleAddJwtDigest}
-                />
-              </HStack>
-              {data.trustedJwtDigests.length === 0 ?
-                <EmptyState
-                  title="No trusted JWT digests"
-                  description="Generate a digest on the Codex PC, then register it here."
-                />
-              : <DataTable
-                  data={data.trustedJwtDigests as Array<TrustedJwtDigestRow>}
-                  columns={trustedJwtDigestColumns}
-                  idKey="id"
-                />
-              }
-            </VStack>
-          </Card>
-        </VStack>
+            <section
+              className="settings-column settings-administration"
+              aria-labelledby="settings-administration-heading"
+            >
+              <Heading level={2} id="settings-administration-heading">
+                Administration &amp; backup
+              </Heading>
+              <Card className="settings-card">
+                <VStack gap={3}>
+                  <Heading level={3}>Administrator password</Heading>
+                  <Text type="supporting" color="secondary">
+                    Changing your password signs out other administrator
+                    sessions. API client credentials stay active.
+                  </Text>
+                  <TextInput
+                    type="password"
+                    label="Current password"
+                    value={currentPassword}
+                    onChange={setCurrentPassword}
+                    width="100%"
+                  />
+                  <TextInput
+                    type="password"
+                    label="New password"
+                    value={newPassword}
+                    onChange={setNewPassword}
+                    width="100%"
+                  />
+                  <TextInput
+                    type="password"
+                    label="Confirm new password"
+                    value={confirmPassword}
+                    onChange={setConfirmPassword}
+                    width="100%"
+                  />
+                  <HStack gap={2} wrap="wrap">
+                    <Button
+                      label="Change password"
+                      variant="secondary"
+                      isLoading={changingPassword}
+                      isDisabled={
+                        changingPassword
+                        || !currentPassword
+                        || newPassword.length < 4
+                        || newPassword !== confirmPassword
+                      }
+                      onClick={() => void changePassword()}
+                    />
+                  </HStack>
+                </VStack>
+              </Card>
+              <DatabaseBackup onExport={() => void handleExport()} />
+            </section>
+          </div>
+        </div>
       : null}
     </Page>
   )

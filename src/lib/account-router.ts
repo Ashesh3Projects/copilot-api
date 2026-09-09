@@ -364,6 +364,7 @@ async function fetchWithAccount(
   const headers = copilotHeaders({
     ...boundHeaderOptions,
     copilotToken: account.copilotToken,
+    integrationId: account.integrationId ?? null,
   })
   const baseUrl = tokenPool.getBaseUrl(account)
 
@@ -1004,6 +1005,13 @@ async function routedFetchInner(
       const response = createNoEnabledAccountResponse(modelId)
       return { response, account: undefined }
     }
+    // A selected account remains authoritative while its catalog is refreshed.
+    if (
+      routedAccountPin?.accountId !== undefined
+      || asyncPinnedAccountId !== undefined
+      || selectedAccountPin?.accountId !== undefined
+    )
+      throw unavailableAccount()
 
     consola.warn(
       `No account found${routedModelDiagnosticSuffix(modelId)}, falling back to default`,

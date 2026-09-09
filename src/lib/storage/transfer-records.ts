@@ -53,7 +53,6 @@ export const REQUIRED_TRANSFER_METADATA_KEYS = [
   "store_id",
   "schema_version",
   "config_revision",
-  "history_activity_generation",
 ]
 const metadataKeys = [
   ...REQUIRED_TRANSFER_METADATA_KEYS,
@@ -180,10 +179,20 @@ export function validateTransferRecord(
     record.table === "capi_metadata"
     && (typeof value.key !== "string"
       || (!metadataKeys.includes(value.key)
-        && (version !== 2 || value.key !== "history_debug_generation")))
+        && !legacyMetadataKey(value.key, version)))
   )
     throw new StorageSchemaError("Invalid transferred metadata")
   return value as Record<string, SqlValue>
+}
+
+function legacyMetadataKey(key: string, version: number): boolean {
+  if (version === 2 && key === "history_debug_generation") return true
+  return (
+    version < 5
+    && ["history_activity_cleared_at", "history_activity_generation"].includes(
+      key,
+    )
+  )
 }
 export async function insertTransferRecord(
   session: SqlSession,

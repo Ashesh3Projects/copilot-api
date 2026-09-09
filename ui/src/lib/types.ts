@@ -99,8 +99,18 @@ export interface ModelFallbackConfig {
 }
 
 export interface ModelFallbackSettings {
+  safety?: ModelRoutingSafety
   config: ModelFallbackConfig
   cache: { entries: number }
+}
+
+export interface ModelRoutingSafety {
+  safe: boolean
+  loop?: {
+    kind: "redirect" | "fallback" | "combined"
+    models: Array<string>
+    ruleIds: Array<string>
+  }
 }
 
 export interface ModelRedirectConflict {
@@ -354,6 +364,7 @@ export class TrustedJwtDigestInputError extends Error {
 }
 
 export interface LlmDebugEntry {
+  fallback?: LlmDebugFallback
   id: string
   method: string
   path: string
@@ -409,6 +420,7 @@ export interface LlmDebugLogResponse extends CapturedBodyState {
 }
 
 export interface LlmDebugDetail {
+  fallback?: LlmDebugFallback
   id: string
   model?: string
   requestId?: string
@@ -430,6 +442,16 @@ export interface ReplayStreamEvent {
   event?: string
   id?: string
   retry?: number
+}
+
+export interface LlmDebugFallback {
+  reason: "http_422"
+  sourceModel: string
+  fromModel: string
+  configuredTargetModel: string
+  targetModel: string
+  cached: boolean
+  hop: number
 }
 
 export interface ReplayResult {

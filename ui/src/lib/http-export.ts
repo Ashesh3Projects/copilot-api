@@ -46,14 +46,6 @@ interface FormattedToolArguments {
   value: string
 }
 
-const STALE_BODY_HEADERS = new Set([
-  "content-encoding",
-  "content-length",
-  "content-md5",
-  "digest",
-  "transfer-encoding",
-])
-
 function formattedToolArguments(
   toolCall: ParsedToolCall,
 ): FormattedToolArguments {
@@ -84,22 +76,6 @@ export function buildCurlRequest(request: LlmDebugLogRequest): string {
   return lines.join(" \\\n")
 }
 
-function textualHttpHeaders(
-  headers: Record<string, string>,
-  body: string | null,
-): Array<[string, string]> {
-  const framed = Object.entries(headers).filter(
-    ([key]) => !STALE_BODY_HEADERS.has(key.toLowerCase()),
-  )
-  if (body) {
-    framed.push([
-      "Content-Length",
-      String(new TextEncoder().encode(body).byteLength),
-    ])
-  }
-  return framed
-}
-
 export function buildRawHttpRequest(request: LlmDebugLogRequest): string {
   let target = request.path
   let host: string | undefined
@@ -111,7 +87,7 @@ export function buildRawHttpRequest(request: LlmDebugLogRequest): string {
     // Preserve the captured path when the captured URL cannot be parsed.
   }
 
-  const headers = textualHttpHeaders(request.headers, request.body)
+  const headers = Object.entries(request.headers)
   const hasHost = headers.some(([key]) => key.toLowerCase() === "host")
   const lines = [`${request.method.toUpperCase()} ${target} HTTP/1.1`]
   if (host && !hasHost) lines.push(`Host: ${host}`)
@@ -220,13 +196,9 @@ export function buildResponseJson(
 export function buildRawHttpResponse(
   response: HttpResponseExportSource,
 ): string {
-  const statusLine =
-    `HTTP/1.1 ${response.status} ${response.statusText}`.trimEnd()
+  const statusLine = `HTTP/1.1 ${response.status} ${response.statusText}`
   const lines = [statusLine]
-  for (const [key, value] of textualHttpHeaders(
-    response.headers,
-    response.body,
-  )) {
+  for (const [key, value] of Object.entries(response.headers)) {
     lines.push(`${key}: ${value}`)
   }
   lines.push("")

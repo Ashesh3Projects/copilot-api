@@ -23,6 +23,7 @@ import {
   StorageUnavailableError,
 } from "~/lib/storage/errors"
 import { getStoreRevision } from "~/lib/storage/operations"
+import { normalizeAccountIntegrationId } from "~/services/copilot/copilot-contract"
 
 function owner(): string {
   const actor = getSettingsActorId()
@@ -62,6 +63,9 @@ function accountInput(input: Record<string, unknown>): CreateAccountInput {
     instanceDomain: textField(input, "instanceDomain"),
     label: textField(input, "label"),
     accountType: textField(input, "accountType"),
+    ...(input.integrationId === undefined ?
+      {}
+    : { integrationId: normalizeAccountIntegrationId(input.integrationId) }),
   }
 }
 
@@ -227,6 +231,10 @@ export function createDashboardAccountRoutes(
     const update = {
       enabled: input.enabled,
       label: input.label === null ? null : textField(input, "label"),
+      integrationId:
+        input.integrationId === undefined ?
+          undefined
+        : normalizeAccountIntegrationId(input.integrationId),
     }
     const accounts = options.accounts()
     const id = accountId(c)

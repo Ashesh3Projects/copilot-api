@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto"
 
+import type { ModelFallbackDebugInfo } from "~/lib/model-fallback"
+
 import {
-  debugCredentialLiterals,
-  sanitizeDebugCapture,
-  sanitizeDebugHeaders,
-  sanitizeDebugText,
-  sanitizeDebugUrl,
+  rawDebugCapture,
   reserveDebugCaptureMemory,
   releaseDebugCaptureMemory,
   type CapturedBody,
@@ -50,6 +48,7 @@ export interface LlmDebugLogResponse extends CapturedBody {
 }
 
 export interface LlmDebugLogEntry {
+  fallback?: ModelFallbackDebugInfo
   upstream?:
     | { kind: "custom"; providerId: string }
     | { kind: "copilot"; accountId?: number }
@@ -70,6 +69,7 @@ export interface LlmDebugLogEntry {
 }
 
 export interface LlmDebugLogSummary {
+  fallback?: ModelFallbackDebugInfo
   durationMs?: number
   endedAt?: string
   errorMessage?: string
@@ -105,6 +105,7 @@ interface AbortLlmDebugLogOptions {
 }
 
 interface StartLlmDebugLogInput {
+  fallback?: ModelFallbackDebugInfo
   upstream?: LlmDebugLogEntry["upstream"]
   method: string
   path: string
@@ -119,7 +120,6 @@ interface StartLlmDebugLogInput {
 interface DebugCapture {
   entry: LlmDebugLogEntry
   controller: AbortController
-  credentials: Array<string>
   bytes: number
 }
 // This store must remain independent of database, telemetry and backup state.
@@ -134,7 +134,6 @@ function releaseCapture(id: string): void {
   captures.delete(id)
   releaseDebugCaptureMemory(capture.bytes)
   capture.controller.abort()
-  capture.credentials.length = 0
 }
 
 function captureDeadline(entry: LlmDebugLogEntry): number {
@@ -181,31 +180,35 @@ export function getLlmDebugCaptureSignal(id: string): AbortSignal {
 }
 
 function reserveCapture(capture: DebugCapture): boolean {
+  const { entry } = capture
+  // Count retained strings as UTF-16 without serializing the raw bodies again.
   const bytes =
-    Buffer.byteLength(JSON.stringify(capture.entry))
-    + capture.credentials.reduce(
-      (total, value) => total + Buffer.byteLength(value),
-      0,
-    )
-  const additionalBytes = bytes - capture.bytes
-  if (additionalBytes <= 0) {
-    releaseDebugCaptureMemory(-additionalBytes)
-    capture.bytes = bytes
-    return true
-  }
-  let reserved = reserveDebugCaptureMemory(additionalBytes)
+    ((entry.request.body?.length ?? 0) + (entry.response?.body?.length ?? 0))
+      * 2
+    + JSON.stringify({
+      ...entry,
+      request: { ...entry.request, body: null },
+      ...(entry.response ?
+        { response: { ...entry.response, body: null } }
+      : {}),
+    }).length
+      * 2
+  // Replace the whole reservation so a lone entry can grow past the budget
+  // when its response arrives, just as a lone oversized request can.
+  releaseDebugCaptureMemory(capture.bytes)
+  capture.bytes = 0
+  let reserved = reserveDebugCaptureMemory(bytes, true)
   for (const [id, candidate] of captures) {
     if (reserved) break
     if (candidate === capture) continue
     releaseCapture(id)
-    reserved = reserveDebugCaptureMemory(additionalBytes)
+    reserved = reserveDebugCaptureMemory(bytes, true)
   }
   if (reserved) capture.bytes = bytes
   return reserved
 }
 
 function retainTerminalCapture(capture: DebugCapture): void {
-  capture.credentials.length = 0
   capture.controller.abort()
   if (!reserveCapture(capture)) releaseCapture(capture.entry.id)
   pruneCaptures()
@@ -443,6 +446,7 @@ function toSummary(entry: LlmDebugLogEntry): LlmDebugLogSummary {
     "content-type",
   )
   return {
+    ...(entry.fallback ? { fallback: { ...entry.fallback } } : {}),
     durationMs: entry.durationMs,
     endedAt: entry.endedAt,
     errorMessage:
@@ -482,48 +486,33 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
   const id = randomUUID()
   const startedAtMs = input.startedAtMs ?? Date.now()
   pruneCaptures()
-  const customProvider = input.upstream?.kind === "custom"
-  const credentials = debugCredentialLiterals(
-    input.requestHeaders,
-    input.url,
-    customProvider,
-  )
-  const body = sanitizeDebugCapture({
+  const body = rawDebugCapture({
     ...input.requestCapture,
     body: input.requestBody,
-    contentType: findHeader(input.requestHeaders, "content-type"),
-    knownCredentials: credentials,
   })
   const entry: LlmDebugLogEntry = {
     id,
+    ...(input.fallback ? { fallback: { ...input.fallback } } : {}),
     ...(input.upstream ? { upstream: { ...input.upstream } } : {}),
     model: inferModel(body.body),
     request: {
       ...body,
-      headers: sanitizeDebugHeaders(
-        input.requestHeaders,
-        credentials,
-        customProvider,
-      ),
-      method: sanitizeDebugText(input.method, credentials),
-      path: sanitizeDebugUrl(sanitizeDebugText(input.path, credentials)),
-      url: sanitizeDebugUrl(sanitizeDebugText(input.url, credentials)),
+      headers: { ...input.requestHeaders },
+      method: input.method,
+      path: input.path,
+      url: input.url,
     },
-    requestId:
-      input.requestId ?
-        sanitizeDebugText(input.requestId, credentials)
-      : undefined,
+    requestId: input.requestId,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
     updatedAt: startedAtMs,
     status: "pending",
-    replayable: body.body !== null && !body.redacted && !body.omittedReason,
+    replayable: body.body !== null && !incompleteBody(body),
     stream: inferStream(body.body),
   }
   const capture: DebugCapture = {
     entry,
     controller: new AbortController(),
-    credentials,
     bytes: 0,
   }
   while (captures.size >= MAX_CAPTURES) {
@@ -534,24 +523,10 @@ export function startLlmDebugLog(input: StartLlmDebugLogInput): string {
   if (reserveCapture(capture)) {
     captures.set(id, capture)
   } else {
-    capture.credentials.length = 0
     capture.controller.abort()
   }
   pruneCaptures()
   return id
-}
-
-function sanitizedError(
-  error: unknown,
-  credentials: ReadonlyArray<string>,
-): LlmDebugLogError {
-  const normalized = normalizeError(error)
-  return Object.fromEntries(
-    Object.entries(normalized).map(([key, value]) => [
-      key,
-      typeof value === "string" ? sanitizeDebugText(value, credentials) : value,
-    ]),
-  ) as unknown as LlmDebugLogError
 }
 
 function terminalCapture(
@@ -567,30 +542,28 @@ function terminalCapture(
   return capture
 }
 
-function sanitizeResponse(
+function captureResponse(
   response: Omit<LlmDebugLogResponse, "bodyBytes"> & { bodyBytes?: number },
   capture: DebugCapture,
 ): LlmDebugLogResponse {
-  const credentials = [
-    ...capture.credentials,
-    ...debugCredentialLiterals(response.headers),
-  ]
-  const body = sanitizeDebugCapture({
-    ...response,
-    contentType: findHeader(response.headers, "content-type"),
-    knownCredentials: credentials,
-  })
-  if (body.redacted || body.omittedReason || response.bodyReadError)
+  const body = rawDebugCapture(response)
+  if (incompleteBody(body) || response.bodyReadError)
     capture.entry.replayable = false
   return {
     ...body,
     ...(response.bodyReadError ?
-      { bodyReadError: sanitizedError(response.bodyReadError, credentials) }
+      { bodyReadError: normalizeError(response.bodyReadError) }
     : {}),
-    headers: sanitizeDebugHeaders(response.headers, credentials),
+    headers: { ...response.headers },
     status: response.status,
-    statusText: sanitizeDebugText(response.statusText, credentials),
+    statusText: response.statusText,
   }
+}
+
+function incompleteBody(body: CapturedBody): boolean {
+  return Boolean(
+    body.truncated || body.omittedReason || body.bodyBytesComplete === false,
+  )
 }
 
 export function finishLlmDebugLog(
@@ -600,9 +573,15 @@ export function finishLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, endedAtMs)
   if (!capture) return
-  capture.entry.response = sanitizeResponse(response, capture)
+  capture.entry.response = captureResponse(response, capture)
   capture.entry.status =
-    response.bodyReadError || response.status < 200 || response.status >= 300 ?
+    (
+      response.bodyReadError
+      || incompleteBody(capture.entry.request)
+      || incompleteBody(capture.entry.response)
+      || response.status < 200
+      || response.status >= 300
+    ) ?
       "error"
     : "complete"
   retainTerminalCapture(capture)
@@ -615,7 +594,7 @@ export function failLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, endedAtMs)
   if (!capture) return
-  capture.entry.error = sanitizedError(error, capture.credentials)
+  capture.entry.error = normalizeError(error)
   capture.entry.status = "error"
   retainTerminalCapture(capture)
 }
@@ -626,9 +605,9 @@ export function abortLlmDebugLog(
 ): void {
   const capture = terminalCapture(id, options.endedAtMs ?? Date.now())
   if (!capture) return
-  capture.entry.error = sanitizedError(options.error, capture.credentials)
+  capture.entry.error = normalizeError(options.error)
   if (options.response)
-    capture.entry.response = sanitizeResponse(options.response, capture)
+    capture.entry.response = captureResponse(options.response, capture)
   capture.entry.status = "aborted"
   retainTerminalCapture(capture)
 }

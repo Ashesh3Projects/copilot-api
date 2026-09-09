@@ -1,4 +1,14 @@
-import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  expect,
+  mock,
+  test,
+} from "bun:test"
+
+import type { ModelFallbackDebugInfo } from "~/lib/model-fallback"
 
 import {
   AccountsService,
@@ -87,6 +97,10 @@ beforeEach(async () => {
   await service.create({ token: "github-token" }, context)
 })
 
+afterEach(async () => {
+  await clearLlmDebugLogs()
+})
+
 afterAll(async () => {
   for (const account of tokenPool.getAllAccounts())
     tokenPool.deleteAccount(account.id)
@@ -97,6 +111,15 @@ afterAll(async () => {
 })
 
 test("serves LLM debug logs through dashboard API", async () => {
+  const fallback: ModelFallbackDebugInfo = {
+    reason: "http_422",
+    sourceModel: "gpt-source",
+    fromModel: "gpt-source",
+    configuredTargetModel: "gpt-ui-alias",
+    targetModel: "gpt-ui",
+    cached: false,
+    hop: 1,
+  }
   const requestBody = `{ "input": "dashboard lookup", "api_key": "body-secret", "model": "gpt-ui" }`
   const responseBody = `{ "access_token": "response-secret", "ok": true }`
   const requestHeaders = {
@@ -109,6 +132,7 @@ test("serves LLM debug logs through dashboard API", async () => {
   }
   const url = "https://example.test/responses?api_key=query-secret"
   const id = startLlmDebugLog({
+    fallback,
     method: "POST",
     path: "/responses",
     requestBody,
@@ -129,9 +153,14 @@ test("serves LLM debug logs through dashboard API", async () => {
   expect(listResponse.status).toBe(200)
   expect(listResponse.headers.get("cache-control")).toBe("no-store")
   const listBody = (await listResponse.json()) as {
-    entries: Array<{ id: string; requestPreview: string }>
+    entries: Array<{
+      fallback?: ModelFallbackDebugInfo
+      id: string
+      requestPreview: string
+    }>
   }
   expect(listBody.entries[0]?.id).toBe(id)
+  expect(listBody.entries[0]?.fallback).toEqual(fallback)
   expect(listBody.entries[0]?.requestPreview).toContain("dashboard lookup")
 
   const detailResponse = await server.request(
@@ -143,6 +172,7 @@ test("serves LLM debug logs through dashboard API", async () => {
   expect(detailResponse.status).toBe(200)
   expect(detailResponse.headers.get("cache-control")).toBe("no-store")
   const detailBody = (await detailResponse.json()) as {
+    fallback?: ModelFallbackDebugInfo
     request: {
       body: string | null
       headers: Record<string, string>
@@ -153,18 +183,15 @@ test("serves LLM debug logs through dashboard API", async () => {
       headers: Record<string, string>
     }
   }
+  expect(detailBody.fallback).toEqual(fallback)
   expect(detailBody.request).toMatchObject({
-    body: JSON.stringify({
-      input: "dashboard lookup",
-      api_key: "[REDACTED]",
-      model: "gpt-ui",
-    }),
-    headers: { authorization: "[REDACTED]", cookie: "[REDACTED]" },
-    url: "https://example.test/responses?api_key=%5BREDACTED%5D",
+    body: requestBody,
+    headers: requestHeaders,
+    url,
   })
   expect(detailBody.response).toMatchObject({
-    body: JSON.stringify({ access_token: "[REDACTED]", ok: true }),
-    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
+    body: responseBody,
+    headers: responseHeaders,
   })
 
   const clearResponse = await server.request("/dashboard/api/llm-debug", {
@@ -179,6 +206,29 @@ test("serves LLM debug logs through dashboard API", async () => {
   })
   const afterClearBody = (await afterClearResponse.json()) as { count: number }
   expect(afterClearBody.count).toBe(0)
+})
+
+test("replays a raw JSON string verbatim including duplicate keys and credentials", async () => {
+  const raw =
+    ' { "model":"claude-fable-5", "model":"claude-fable-5", "messages":[], "api_key":"synthetic-key", "input":"[REDACTED]" }\r\n'
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/chat/completions",
+    requestBody: raw,
+    requestHeaders: { authorization: "Bearer synthetic-key" },
+    url: "https://api.githubcopilot.com/chat/completions",
+  })
+  const response = await server.request(
+    `/dashboard/api/llm-debug/${id}/replay`,
+    {
+      method: "POST",
+      headers: adminHeaders(adminSession),
+      body: JSON.stringify({ body: raw }),
+    },
+  )
+  expect(response.status).toBe(200)
+  const upstream = fetchMock.mock.calls[0]?.[1]
+  expect(upstream?.body).toBe(raw)
 })
 
 test("dashboard bundle ships the LLM debug UI", () => {

@@ -2,21 +2,35 @@ import { Badge } from "@astryxdesign/core/Badge"
 import { Banner } from "@astryxdesign/core/Banner"
 import { Button } from "@astryxdesign/core/Button"
 import { Card } from "@astryxdesign/core/Card"
+import { Skeleton } from "@astryxdesign/core/Skeleton"
 import { HStack, VStack } from "@astryxdesign/core/Stack"
 import { Heading, Text } from "@astryxdesign/core/Text"
 import { TextInput } from "@astryxdesign/core/TextInput"
 import { useEffect, useState } from "react"
 
-import { ConfirmButton, EmptyState } from "../components/common"
+import {
+  ConfirmButton,
+  EmptyState,
+  IconAction,
+  RowActions,
+} from "../components/common"
 import { Page } from "../components/Page"
-import { RefreshCwIcon } from "../icons"
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  KeyRoundIcon,
+  PlayIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+} from "../icons"
 import {
   refreshModelsSummary,
   type AccountModelRefreshBatch,
 } from "../lib/account-model-refresh"
 import { api, del, get, post } from "../lib/api"
 import { useToast } from "../lib/toast"
-import { useAsyncData } from "../lib/usePolling"
+import { useAsyncData, useDelayedPolling } from "../lib/usePolling"
 
 interface Account {
   id: number
@@ -27,10 +41,12 @@ interface Account {
   deleting: boolean
   healthy: boolean
   modelCount: number
+  integrationId: string | null
 }
 interface AccountList {
   accounts: Array<Account>
   revision: number
+  defaultIntegrationId: string
 }
 interface DeviceLogin {
   id: string
@@ -44,6 +60,21 @@ interface DeviceLogin {
 const root = "/dashboard/api/accounts"
 const load = () => get<AccountList>(root)
 
+function PauseIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      <path d="M8 5v14M16 5v14" />
+    </svg>
+  )
+}
+
 function accountBadge(account: Account): {
   variant: "neutral" | "success" | "warning"
   label: string
@@ -54,7 +85,10 @@ function accountBadge(account: Account): {
   return { variant: "warning", label: "Needs attention" }
 }
 export default function AccountsScreen() {
-  const { data, error, loading, reload } = useAsyncData(load, [])
+  const { data, error, loading, reload, reloadSilently } = useAsyncData(
+    load,
+    [],
+  )
   const toast = useToast()
   const [domain, setDomain] = useState("github.com")
   const [label, setLabel] = useState("")
@@ -65,6 +99,49 @@ export default function AccountsScreen() {
   const [resumeId, setResumeId] = useState("")
   const [edit, setEdit] = useState<number>()
   const [replacement, setReplacement] = useState("")
+  const [integrationId, setIntegrationId] = useState("")
+  const [integrationError, setIntegrationError] = useState<string>()
+
+  useDelayedPolling(
+    () => {
+      if (
+        !busy
+        && data?.accounts.some(
+          (account) => !account.healthy && !account.deleting,
+        )
+      )
+        reloadSilently()
+    },
+    5000,
+    [busy, data],
+  )
+
+  function toggleEditor(account: Account) {
+    setEdit(edit === account.id ? undefined : account.id)
+    setReplacement("")
+    setIntegrationId(account.integrationId ?? "")
+    setIntegrationError(undefined)
+  }
+
+  async function saveIntegration(account: Account) {
+    setBusy(`integration-${account.id}`)
+    setIntegrationError(undefined)
+    try {
+      await mutate("PATCH", `${root}/${account.id}`, { integrationId })
+      setIntegrationId(integrationId.trim())
+      toast.success("Integration ID saved; refreshing account models")
+    } catch (caught) {
+      const message =
+        caught instanceof Error ?
+          caught.message
+        : "Could not save Integration ID"
+      setIntegrationError(message)
+      toast.error(message)
+    } finally {
+      setBusy(undefined)
+      reload()
+    }
+  }
 
   const mutate = <T,>(
     method: "POST" | "PATCH" | "PUT" | "DELETE",
@@ -335,98 +412,181 @@ export default function AccountsScreen() {
             description="Connect an account above. Custom providers can be configured independently."
           />
         : null}
-        {data?.accounts.map((account) => (
-          <Card key={account.id}>
-            <VStack gap={3}>
-              <HStack gap={2} wrap="wrap" vAlign="center">
-                <Heading level={3}>
-                  {account.label || account.login || `Account ${account.id}`}
-                </Heading>
-                <Badge {...accountBadge(account)} />
-              </HStack>
-              <Text color="secondary">
-                {account.instanceDomain} · #{account.id} · {account.modelCount}{" "}
-                models
-              </Text>
-              <HStack gap={2} wrap="wrap">
-                <Button
-                  label={account.enabled ? "Disable" : "Enable"}
-                  variant="secondary"
-                  isDisabled={Boolean(busy) || account.deleting}
-                  onClick={() =>
-                    void act(
-                      String(account.id),
-                      () =>
-                        mutate("PATCH", `${root}/${account.id}`, {
-                          enabled: !account.enabled,
-                        }),
-                      "Account updated",
-                    )
-                  }
-                />
-                <Button
-                  label="Refresh models"
-                  icon={<RefreshCwIcon />}
-                  variant="secondary"
-                  isDisabled={Boolean(busy) || account.deleting}
-                  isLoading={busy === `refresh-${account.id}`}
-                  onClick={() => void refreshModels(account.id)}
-                />
-                <Button
-                  label="Reconnect"
-                  variant="secondary"
-                  isDisabled={account.deleting}
-                  onClick={() => {
-                    setEdit(edit === account.id ? undefined : account.id)
-                    setReplacement("")
-                  }}
-                />
-                <ConfirmButton
-                  label="Remove"
-                  confirmTitle="Remove GitHub account"
-                  confirmDescription="New requests stop using this account. Its stored credential is removed after active requests finish. Existing conversations pinned to it may no longer continue."
-                  onConfirm={() =>
-                    act(
-                      String(account.id),
-                      () => mutate("DELETE", `${root}/${account.id}`),
-                      "Account removal started",
-                    )
-                  }
-                />
-              </HStack>
-              {edit === account.id ?
-                <HStack gap={2} wrap="wrap" vAlign="end">
-                  <TextInput
-                    type="password"
-                    label="Replacement OAuth token for this same account"
-                    value={replacement}
-                    onChange={setReplacement}
-                  />
-                  <Button
-                    label="Save credential"
-                    variant="primary"
-                    isDisabled={Boolean(busy) || !replacement.trim()}
-                    onClick={() =>
-                      void act(
-                        String(account.id),
-                        async () => {
-                          await mutate(
-                            "PUT",
-                            `${root}/${account.id}/credential`,
-                            { token: replacement },
+        {!data && loading ?
+          <VStack gap={2} role="status" aria-label="Loading GitHub accounts">
+            {Array.from({ length: 3 }, (_, index) => (
+              <Skeleton key={index} height={56} index={index} />
+            ))}
+          </VStack>
+        : null}
+        <VStack gap={2}>
+          {data?.accounts.map((account) => (
+            <Card key={account.id} padding={3}>
+              <VStack gap={3}>
+                <HStack gap={2} wrap="wrap" hAlign="between" vAlign="center">
+                  <VStack
+                    gap={0.5}
+                    style={{
+                      flex: "1 1 220px",
+                      minWidth: 0,
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    <HStack gap={2} wrap="wrap" vAlign="center">
+                      <Text weight="semibold">
+                        {account.label
+                          || account.login
+                          || `Account ${account.id}`}
+                      </Text>
+                      <Badge {...accountBadge(account)} />
+                    </HStack>
+                    <Text color="secondary" size="sm">
+                      {account.label && account.login ?
+                        `${account.login} · `
+                      : ""}
+                      {account.instanceDomain} · #{account.id} ·{" "}
+                      {account.modelCount} models
+                    </Text>
+                  </VStack>
+                  <RowActions>
+                    <IconAction
+                      label={`${account.enabled ? "Disable" : "Enable"} account ${account.id}`}
+                      icon={account.enabled ? <PauseIcon /> : <PlayIcon />}
+                      isDisabled={Boolean(busy) || account.deleting}
+                      onClick={() =>
+                        act(
+                          String(account.id),
+                          () =>
+                            mutate("PATCH", `${root}/${account.id}`, {
+                              enabled: !account.enabled,
+                            }),
+                          "Account updated",
+                        )
+                      }
+                    />
+                    <IconAction
+                      label={`Refresh models for account ${account.id}`}
+                      icon={<RefreshCwIcon />}
+                      isDisabled={Boolean(busy) || account.deleting}
+                      onClick={() => refreshModels(account.id)}
+                    />
+                    <Button
+                      label={`${edit === account.id ? "Close" : "Edit"} integration and reconnect for account ${account.id}`}
+                      tooltip={
+                        edit === account.id ?
+                          "Close account editor"
+                        : "Integration ID and reconnect"
+                      }
+                      icon={
+                        edit === account.id ?
+                          <ChevronUpIcon />
+                        : <ChevronDownIcon />
+                      }
+                      variant="ghost"
+                      size="sm"
+                      isIconOnly
+                      aria-expanded={edit === account.id}
+                      aria-controls={`account-editor-${account.id}`}
+                      isDisabled={Boolean(busy) || account.deleting}
+                      onClick={() => toggleEditor(account)}
+                    />
+                    <span title={`Remove account ${account.id}`}>
+                      <ConfirmButton
+                        label={`Remove account ${account.id}`}
+                        icon={<Trash2Icon />}
+                        isIconOnly
+                        size="sm"
+                        isDisabled={Boolean(busy) || account.deleting}
+                        confirmTitle="Remove GitHub account"
+                        confirmDescription="New requests stop using this account. Its stored credential is removed after active requests finish. Existing conversations pinned to it may no longer continue."
+                        onConfirm={() =>
+                          act(
+                            String(account.id),
+                            () => mutate("DELETE", `${root}/${account.id}`),
+                            "Account removal started",
                           )
-                          setEdit(undefined)
-                          setReplacement("")
-                        },
-                        "Credential updated",
-                      )
-                    }
-                  />
+                        }
+                      />
+                    </span>
+                  </RowActions>
                 </HStack>
-              : null}
-            </VStack>
-          </Card>
-        ))}
+                {edit === account.id ?
+                  <VStack gap={3} id={`account-editor-${account.id}`}>
+                    <HStack gap={2} wrap="wrap" vAlign="end">
+                      <div style={{ flex: "1 1 240px", minWidth: 0 }}>
+                        <TextInput
+                          label="Integration ID"
+                          description="Leave blank to use the default. Saving refreshes this account's models."
+                          value={integrationId}
+                          onChange={(value) => {
+                            setIntegrationId(value)
+                            setIntegrationError(undefined)
+                          }}
+                          placeholder={data.defaultIntegrationId}
+                          isDisabled={Boolean(busy) || account.deleting}
+                          status={
+                            integrationError ?
+                              { type: "error", message: integrationError }
+                            : undefined
+                          }
+                        />
+                      </div>
+                      <IconAction
+                        label={`Save Integration ID for account ${account.id}`}
+                        icon={<CheckIcon />}
+                        variant="primary"
+                        isDisabled={
+                          Boolean(busy)
+                          || account.deleting
+                          || integrationId.trim()
+                            === (account.integrationId ?? "")
+                        }
+                        onClick={() => saveIntegration(account)}
+                      />
+                    </HStack>
+                    <HStack gap={2} wrap="wrap" vAlign="end">
+                      <div style={{ flex: "1 1 240px", minWidth: 0 }}>
+                        <TextInput
+                          type="password"
+                          label="Reconnect with a replacement OAuth token"
+                          description="Use a token for the same GitHub identity."
+                          value={replacement}
+                          onChange={setReplacement}
+                          isDisabled={Boolean(busy) || account.deleting}
+                        />
+                      </div>
+                      <IconAction
+                        label={`Save credential for account ${account.id}`}
+                        icon={<KeyRoundIcon />}
+                        variant="primary"
+                        isDisabled={
+                          Boolean(busy)
+                          || account.deleting
+                          || !replacement.trim()
+                        }
+                        onClick={() =>
+                          act(
+                            String(account.id),
+                            async () => {
+                              await mutate(
+                                "PUT",
+                                `${root}/${account.id}/credential`,
+                                { token: replacement },
+                              )
+                              setEdit(undefined)
+                              setReplacement("")
+                            },
+                            "Credential updated",
+                          )
+                        }
+                      />
+                    </HStack>
+                  </VStack>
+                : null}
+              </VStack>
+            </Card>
+          ))}
+        </VStack>
       </VStack>
     </Page>
   )

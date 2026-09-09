@@ -9,7 +9,7 @@ import { LocalSqliteStorage } from "~/lib/storage/local-sqlite"
 import { migrateStorage } from "~/lib/storage/migrations"
 import { createHistoryRuntime } from "~/lib/telemetry-writer"
 
-test("handler logging has no file writes or signal hooks and persists sanitized output", async () => {
+test("handler logging has no file writes, signal hooks, or stored activity and keeps sanitized output", async () => {
   const directory = await mkdtemp(join(tmpdir(), "capi-logger-"))
   const storage = new LocalSqliteStorage(join(directory, "fixture.sqlite"))
   await migrateStorage(storage)
@@ -27,6 +27,11 @@ test("handler logging has no file writes or signal hooks and persists sanitized 
   const write = spyOn(fs, "writeFileSync").mockImplementation(() => {
     throw new Error("filesystem tripwire")
   })
+  const output: Array<string> = []
+  const stdout = spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    output.push(String(chunk))
+    return true
+  })
   try {
     const logger = createHandlerLogger("fixture")
     logger.level = 5
@@ -42,15 +47,27 @@ test("handler logging has no file writes or signal hooks and persists sanitized 
       process.listenerCount("SIGINT"),
       process.listenerCount("SIGTERM"),
     ]).toEqual(signals)
-    const records = await runtime.repository.list("activity")
-    expect(records.records).toHaveLength(1)
-    expect(JSON.stringify(records)).not.toContain("credential-value")
-    expect(JSON.stringify(records)).not.toContain("Bearer private")
-    expect(JSON.stringify(records)).toContain("Prepared request")
+    expect(runtime.writer.status().pendingRecords).toBe(0)
+    expect((await runtime.repository.readUsage(0)).lifetime.requestCount).toBe(
+      0,
+    )
+    expect((await runtime.repository.readRouting(0)).buckets).toHaveLength(0)
+    expect(
+      await storage.read((session) =>
+        session.query({
+          sql: "SELECT id FROM capi_applied_operations WHERE kind = 'history_batch'",
+          args: [],
+        }),
+      ),
+    ).toEqual([])
+    expect(output.join("")).not.toContain("credential-value")
+    expect(output.join("")).not.toContain("Bearer private")
+    expect(output.join("")).toContain("Prepared request")
   } finally {
     mkdir.mockRestore()
     stream.mockRestore()
     write.mockRestore()
+    stdout.mockRestore()
     await runtime.close(500)
     await storage.close()
     await rm(directory, { recursive: true, force: true })

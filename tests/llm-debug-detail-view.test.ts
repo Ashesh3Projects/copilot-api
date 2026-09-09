@@ -63,3 +63,24 @@ test("removes selectors owned by the retired response body viewer", () => {
   expect(css).not.toContain(".responses-pretty-view")
   expect(css).not.toContain(".responses-event-detail")
 })
+
+test("Refresh resets debug pagination and Latest is absent", () => {
+  const source = screenSource()
+  expect(source).not.toContain('label="Latest"')
+  const refresh = source.match(
+    /function refreshLatest\(\) \{([\s\S]*?)\n {2}\}/,
+  )?.[1]
+  expect(refresh).toContain("setCursor(undefined)")
+  expect(refresh).toContain("reload()")
+  expect(source).toContain("onRefresh={refreshLatest}")
+})
+
+test("replay screen has no gate or warning based solely on legacy redaction", () => {
+  const source = fs.readFileSync(
+    path.join(import.meta.dir, "..", "ui", "src", "screens", "LlmReplay.tsx"),
+    "utf8",
+  )
+  expect(source).not.toContain("data?.replayable")
+  expect(source).not.toContain("!data.replayable")
+  expect(source).not.toContain("replace any redacted values")
+})

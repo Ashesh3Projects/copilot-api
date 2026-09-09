@@ -40,7 +40,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseReplayBody(
   body: ReplayRequestBody | null,
 ):
-  | { ok: true; payload: Record<string, unknown> }
+  | { ok: true; payload: Record<string, unknown>; rawBody: string }
   | { ok: false; error: string } {
   if (!body || body.body === undefined || body.body === null) {
     return { ok: false, error: "body is required" }
@@ -54,7 +54,7 @@ function parseReplayBody(
       if (!isRecord(parsed)) {
         return { ok: false, error: "body must be a JSON object" }
       }
-      return { ok: true, payload: parsed }
+      return { ok: true, payload: parsed, rawBody: body.body }
     } catch {
       return { ok: false, error: "body must be valid JSON" }
     }
@@ -64,7 +64,7 @@ function parseReplayBody(
     return { ok: false, error: "body must be a JSON object or JSON string" }
   }
 
-  return { ok: true, payload: body.body }
+  return { ok: true, payload: body.body, rawBody: JSON.stringify(body.body) }
 }
 
 function extractReplayModel(payload: Record<string, unknown>): string | null {
@@ -286,13 +286,14 @@ export async function handleReplayLlmDebugLog(c: Context) {
         providerId: entry.upstream.providerId,
         originalUrl: entry.request.url,
         payload: parsedBody.payload,
+        rawBody: parsedBody.rawBody,
         signal: c.req.raw.signal,
       })
     : (
         await routedFetch(
           path,
           {
-            body: JSON.stringify(parsedBody.payload),
+            body: parsedBody.rawBody,
             method: "POST",
             signal: c.req.raw.signal,
           },

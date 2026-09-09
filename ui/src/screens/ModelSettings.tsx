@@ -203,25 +203,6 @@ export default function ModelSettingsScreen() {
     }
   }
 
-  function applyImplicitMediumPreset() {
-    setForm((f) => ({
-      ...f,
-      supportedReasoningEfforts: ["medium"],
-      defaultReasoningEffort: "medium",
-      implicitReasoningDefault: "true",
-      exposeVirtualReasoningModels: "false",
-    }))
-  }
-
-  function applyNoSamplingPreset() {
-    setForm((f) => ({
-      ...f,
-      unsupportedRequestParameters: Array.from(
-        new Set([...f.unsupportedRequestParameters, "temperature", "top_p"]),
-      ),
-    }))
-  }
-
   const columns: Array<TableColumn<SettingRow>> = [
     {
       key: "model",
@@ -378,20 +359,6 @@ export default function ModelSettingsScreen() {
               <Heading level={3}>
                 {editingModel ? "Edit setting" : "Add setting"}
               </Heading>
-              <HStack gap={2}>
-                <Button
-                  label="Implicit medium"
-                  variant="secondary"
-                  size="sm"
-                  onClick={applyImplicitMediumPreset}
-                />
-                <Button
-                  label="No sampling"
-                  variant="secondary"
-                  size="sm"
-                  onClick={applyNoSamplingPreset}
-                />
-              </HStack>
               <FormLayout>
                 <TextInput
                   label="Model ID"

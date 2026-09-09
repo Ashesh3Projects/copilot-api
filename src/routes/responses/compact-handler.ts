@@ -18,11 +18,15 @@ import { getModelEndpointSupport } from "~/lib/endpoint-routing"
 import { createHandlerLogger } from "~/lib/logger"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
   isModelFallbackActive,
   runWithModelFallback,
 } from "~/lib/model-fallback"
 import { getLoadedModelFallbackConfig } from "~/lib/model-fallback-config"
-import { applyModelRedirect } from "~/lib/model-redirect"
+import {
+  applyModelRedirect,
+  type ModelRedirectRequest,
+} from "~/lib/model-redirect"
 import { normalizeModelName } from "~/lib/model-resolver"
 import {
   normalizeReasoningEffortForModel,
@@ -276,8 +280,8 @@ const handleCompactAttempt = async (c: Context, body: CompactRequestBody) => {
   const sourceModel = await resolveCompactFallbackSource(requestedModel)
   // The fallback executor owns this fresh payload clone for the whole attempt.
   // eslint-disable-next-line require-atomic-updates
-  body.model = sourceModel
-  applyModelFallbackToPayload(body)
+  body.model = sourceModel.model
+  applyModelFallbackToPayload(body, sourceModel)
   const model = body.model
 
   setRequestContext(c, {
@@ -308,6 +312,7 @@ const handleCompactAttempt = async (c: Context, body: CompactRequestBody) => {
     stream: false,
     tool_choice: "none",
     store: false,
+    ...compactFallbackOptions(),
   }
   const customReference = resolveCompactCustomFallback(model)
   const routedModel = customReference ? {} : selectRoutedModel(model)
@@ -351,6 +356,7 @@ const handleCompactAttempt = async (c: Context, body: CompactRequestBody) => {
         ],
         stream: false,
         temperature: 0,
+        ...compactChatFallbackOptions(),
       }
 
       const response =
@@ -395,9 +401,10 @@ function resolveCompactCustomFallback(model: string) {
 
 async function resolveCompactFallbackSource(
   requestedModel: string,
-): Promise<string> {
+): Promise<ModelRedirectRequest> {
   const { baseModel, reasoningEffort } = parseModelSuffix(requestedModel)
-  if (!getLoadedModelFallbackConfig().enabled) return baseModel
+  if (!getLoadedModelFallbackConfig().enabled)
+    return { model: baseModel, effort: reasoningEffort }
   const normalized = normalizeModelName(baseModel)
   const redirect = await applyModelRedirect({
     model: normalized,
@@ -409,6 +416,29 @@ async function resolveCompactFallbackSource(
     && tokenPool.hasEnabledAccountForKnownModel(model) === undefined
     && state.models?.data.some((entry) => entry.id === `${model}-1m`)
   )
-    return `${model}-1m`
-  return model
+    return {
+      model: `${model}-1m`,
+      effort: redirect.effort,
+      verbosity: redirect.verbosity,
+    }
+  return { model, effort: redirect.effort, verbosity: redirect.verbosity }
+}
+
+function compactFallbackOptions(): Pick<
+  ResponsesPayload,
+  "reasoning" | "text"
+> {
+  const redirect = getModelFallbackRedirect()
+  return {
+    ...(redirect?.effort ? { reasoning: { effort: redirect.effort } } : {}),
+    ...(redirect?.verbosity ? { text: { verbosity: redirect.verbosity } } : {}),
+  }
+}
+
+function compactChatFallbackOptions(): Pick<
+  ChatCompletionsPayload,
+  "reasoning_effort"
+> {
+  const effort = getModelFallbackRedirect()?.effort
+  return effort ? { reasoning_effort: effort } : {}
 }

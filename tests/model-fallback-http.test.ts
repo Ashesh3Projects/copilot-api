@@ -2,6 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 
 import type { Model } from "~/services/copilot/get-models"
 
+import { setConfigForTest } from "~/lib/config"
+import { getLlmDebugLog, listLlmDebugLogs } from "~/lib/llm-debug-log"
 import { clearModelFallbackCache } from "~/lib/model-fallback"
 import {
   setModelFallbackConfigForTest,
@@ -26,6 +28,85 @@ const calls: Array<{ path: string; body: Record<string, unknown> }> = []
 let sourceStatus = 422
 let targetStatus = 200
 
+test("LLM Debug labels resulting and cached fallback attempts independently of client notices", async () => {
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "debug-fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      enabled: true,
+    },
+  ])
+  const headers = { "thread-id": "debug-fallback-trace" }
+  const first = await post({}, headers)
+  expect(first.status).toBe(200)
+  await first.text()
+  const entries = (await listLlmDebugLogs()).entries
+  const original = entries.find((entry) => entry.model === "source-model")
+  const fallback = entries.find((entry) => entry.model === "fast-target")
+  expect(original).not.toHaveProperty("fallback")
+  expect(fallback).toMatchObject({
+    fallback: {
+      reason: "http_422",
+      sourceModel: "source-model",
+      fromModel: "source-model",
+      configuredTargetModel: "target-model",
+      targetModel: "fast-target",
+      cached: false,
+      hop: 1,
+    },
+  })
+  expect((await getLlmDebugLog(fallback?.id ?? ""))?.fallback).toEqual(
+    fallback?.fallback,
+  )
+  const next = await post({}, headers)
+  expect(next.status).toBe(200)
+  await next.text()
+  expect((await listLlmDebugLogs()).entries[0]).toMatchObject({
+    model: "fast-target",
+    fallback: {
+      cached: true,
+      sourceModel: "source-model",
+      targetModel: "fast-target",
+    },
+  })
+})
+
+test("LLM Debug labels a fallback while pending even if that attempt later fails", async () => {
+  targetStatus = 500
+  const original = globalThis.fetch
+  let pending: unknown
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    if (
+      typeof init?.body === "string"
+      && (JSON.parse(init.body) as Record<string, unknown>).model
+        === "target-model"
+    ) {
+      pending = (await listLlmDebugLogs()).entries.find(
+        (entry) => entry.model === "target-model",
+      )
+      return new Response("fallback failed", { status: 422 })
+    }
+    return await original(input, init)
+  }) as typeof fetch
+  const response = await post()
+  expect(response.status).toBe(422)
+  await response.text()
+  expect(pending).toMatchObject({
+    status: "pending",
+    fallback: {
+      cached: false,
+      reason: "http_422",
+      targetModel: "target-model",
+    },
+  })
+})
+
 function model(id: string, endpoint = "/responses"): Model {
   return {
     id,
@@ -46,6 +127,37 @@ function model(id: string, endpoint = "/responses"): Model {
     },
   }
 }
+
+test("native Responses applies fallback target redirects, effort and verbosity on consecutive turns", async () => {
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "high",
+      targetVerbosity: "low",
+      enabled: true,
+    },
+  ])
+  for (let i = 0; i < 2; i++) {
+    const response = await post(
+      { reasoning: { effort: "low" }, text: { verbosity: "high" } },
+      { "thread-id": "redirect-thread" },
+    )
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(calls.at(-1)?.body.model).toBe("fast-target")
+    expect(calls.at(-1)?.body.reasoning).toMatchObject({ effort: "high" })
+    expect(calls.at(-1)?.body.text).toMatchObject({ verbosity: "low" })
+  }
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "source-model",
+    "fast-target",
+    "fast-target",
+  ])
+})
 
 function configure(extra: Record<string, unknown> = {}): void {
   setModelFallbackConfigForTest(
@@ -160,6 +272,73 @@ afterEach(() => {
   setModelSettingsForTest([])
   setModelFallbackConfigForTest(null)
   clearModelFallbackCache()
+  setConfigForTest(null)
+})
+
+test("custom-provider source retries native Responses with redirected effort", async () => {
+  setConfigForTest({
+    customProviders: [
+      {
+        id: "custom",
+        name: "Custom",
+        type: "openai-compatible",
+        baseUrl: "https://custom.example/v1",
+        apiKey: "synthetic",
+        models: [{ id: "custom-source", kind: "chat" }],
+      },
+    ],
+  })
+  configure({
+    rules: [
+      {
+        id: "cross-provider",
+        sourceModel: "custom-source",
+        targetModel: "target-model",
+        enabled: true,
+      },
+    ],
+  })
+  state.models?.data.push(model("fast-target"))
+  setModelRedirectsForTest([
+    {
+      id: "fast",
+      sourceModel: "target-model",
+      sourceEffort: "all",
+      targetModel: "fast-target",
+      targetEffort: "high",
+      enabled: true,
+    },
+  ])
+  const original = globalThis.fetch
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    if (
+      typeof init?.body === "string"
+      && (JSON.parse(init.body) as Record<string, unknown>).model
+        === "custom-source"
+    ) {
+      calls.push({
+        path: "/chat/completions",
+        body: JSON.parse(init.body) as Record<string, unknown>,
+      })
+      return new Response("unprocessable", { status: 422 })
+    }
+    return await original(input, init)
+  }) as typeof fetch
+  const response = await post({
+    model: "custom-source",
+    reasoning: { effort: "low" },
+  })
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "custom-source",
+    "fast-target",
+  ])
+  expect(calls[1].path).toBe("/responses")
+  expect(calls[1].body.reasoning).toMatchObject({ effort: "high" })
 })
 
 function post(

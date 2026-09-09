@@ -180,30 +180,28 @@ test("Chat stops before an alias repeats the same custom provider model", async 
   expect(calls).toEqual([{ host: "alias-one.example", model: "shared-model" }])
 })
 
-test("Chat stops an intermediate alias cycle without skipping to the next rule", async () => {
+test("Chat bypasses fallbacks when an intermediate alias cycle is configured", async () => {
   configure([
     ["copilot-source", "alias-a"],
     ["alias-a", "alias-b"],
     ["alias-b", "other-model"],
   ])
   expect((await post("copilot-source")).status).toBe(422)
-  expect(calls.map((call) => call.model)).toEqual([
-    "copilot-source",
-    "shared-model",
-  ])
+  expect(calls.map((call) => call.model)).toEqual(["copilot-source"])
 })
 
 test("Chat prevents alias loops when starting from a remembered custom model", async () => {
+  configure([["copilot-source", "alias-a"]])
+  successes.add("alias-one.example:shared-model")
+  expect((await post("copilot-source", "alias-conversation")).status).toBe(200)
+  calls.length = 0
   configure([
     ["copilot-source", "alias-a"],
     ["alias-a", "alias-b"],
   ])
-  successes.add("alias-one.example:shared-model")
-  expect((await post("copilot-source", "alias-conversation")).status).toBe(200)
-  calls.length = 0
   successes.clear()
   expect((await post("copilot-source", "alias-conversation")).status).toBe(422)
-  expect(calls).toEqual([{ host: "alias-one.example", model: "shared-model" }])
+  expect(calls.map((call) => call.model)).toEqual(["copilot-source"])
 })
 
 test("Chat permits the same upstream model name at a different custom provider", async () => {

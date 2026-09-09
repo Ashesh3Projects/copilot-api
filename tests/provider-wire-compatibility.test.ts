@@ -172,6 +172,27 @@ test("dashboard replays a provider log to the same provider with fresh credentia
   expect(requests[0]?.headers.get("authorization")).toBe("Bearer rotated-key")
 })
 
+test("custom-provider replay sends the exact edited JSON string", async () => {
+  const body =
+    '{ "model":"provider-chat", "model":"provider-chat", "messages":[], "api_key":"synthetic-secret" }\r\n'
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/chat/completions",
+    requestBody: body,
+    requestHeaders: { authorization: "Bearer synthetic-secret" },
+    url: "https://provider.example/v1/chat/completions",
+    upstream: { kind: "custom", providerId: provider.id },
+  })
+  const admin = await createTestAdminSession({ reuseStorage: true })
+  const replay = await post(
+    `/dashboard/api/llm-debug/${id}/replay`,
+    { body },
+    adminHeaders(admin),
+  )
+  expect(replay.status).toBe(200)
+  expect(await requests[0].text()).toBe(body)
+})
+
 test("removed custom providers cannot redirect a replay to Copilot", async () => {
   const body = {
     model: "provider-chat",

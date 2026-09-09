@@ -403,7 +403,10 @@ The dashboard is the recommended interface for these controls:
 - **Redirects** map an exact source model/effort to a target model/effort. Rules
   are ordered and can chain only through later rules.
 - **Fallbacks** switch models only after upstream HTTP 422, with up to three
-  hops and loop prevention. Conversation routes and old-thinking fingerprints
+  hops. Each target also follows Model Redirects, including effort and verbosity
+  overrides. A cycle in redirects, fallbacks, or their combination pauses both
+  features until the conflicting rules are fixed; the dashboard shows the loop.
+  Conversation routes and old-thinking fingerprints
   stay in memory; optional client notices are configurable. See the
   [fallback configuration guide](docs/model-fallbacks.md).
 - **Model settings** override capability assumptions and discovery behavior for
@@ -502,6 +505,7 @@ Open `/dashboard` on the same host as the API. The dashboard includes:
 - request replacements and ordered model redirects;
 - HTTP 422 model fallback chains and conversation cache controls;
 - per-model settings and per-account model routing;
+- compact GitHub account controls with optional per-account integration IDs;
 - custom provider configuration;
 - managed IP allowlists and managed inference-only Codex JWT digests; and
 - settings inspection and ZIP export.
@@ -526,22 +530,37 @@ docker compose run --rm --no-deps copilot-api admin --reset
 docker compose up -d copilot-api
 ```
 
-LLM Debug keeps bounded, sanitized outbound attempts only in server memory.
-URLs, headers, body fields, and recognized credential values are scrubbed before
-capture. Successful captures expire ten minutes after the request starts; all
-other captures expire after one hour. Clear and restart remove the captures.
-Capacity limits can evict entries sooner. Captures never enter SQLite, Turso,
-or application backups. Upgrading applies migration `003`, which drops the old
-`capi_debug` table; existing external backup files are not erased.
+LLM Debug retains original outbound request and response bodies, URLs, headers,
+and error details in server memory only, without sensitive-value filtering or
+JSON/SSE reconstruction. Captures never enter SQLite, Turso, or application backups.
+Successful captures expire after ten minutes; failed or
+interrupted captures after one hour. Capacity limits can evict entries sooner.
 Replay supports complete replayable Chat Completions and Responses captures,
-obtains fresh server-side credentials, and rejects redacted, omitted, expired,
-or interrupted captures and removed or changed providers.
+preserves the captured request body, and obtains fresh server-side credentials.
+Incomplete and legacy redacted request bodies can be edited before replay;
+expired entries and removed or changed providers remain unavailable.
+Large response captures use an anonymous temporary file while collecting the
+stream; the file is removed when capture finishes, and retained captures are
+process-local. Clear and restart remove captures. Capture follows downstream consumption with bounded read-ahead.
+Read-only containers need a writable temporary directory, supplied by
+the Turso Compose example's `/tmp` tmpfs mount.
+
+In GitHub Accounts, expand an account's settings to enter an Integration ID.
+Leave it blank to use the hardcoded `copilot-developer-cli` default shown in the
+placeholder. Saving refreshes that account's models and applies its override to
+its subsequent inference requests; other accounts keep their own settings.
+
+Version 5.1.0 includes the memory-only LLM Debug migration (`003`), adds account
+integration overrides (`004`), and removes Activity and its stored history (`005`).
+The database upgrade discards the obsolete debug and Activity tables. LLM Debug, usage totals,
+account settings, and the other dashboard pages remain available.
 
 `GET /usage` returns current Copilot quota data. Dashboard utilization instead
 uses committed minute/model usage buckets and lifetime counters; committed old
-usage is retained. Activity and routing detail have bounded retention. Pending
-usage, routing, and Activity telemetry is bounded to 2,000 records, 16 MiB, and
-five minutes; pressure and outages may lose records. Collection-gap indicators
+usage is retained. Diagnostic and routing detail has bounded retention. Pending
+usage/routing telemetry is bounded to 2,000 records, 16 MiB, and five minutes.
+LLM Debug has its own process-local count and memory budget; pressure evicts
+whole captures instead of rewriting captured bodies. Collection-gap indicators
 report known loss and uncertainty instead of claiming complete history.
 
 Sanitized ZIP export excludes credential and history tables and replaces
@@ -986,10 +1005,10 @@ returns `200` with `{ "text": "..." }`.
   to the client, ordinary logs, and Sentry with its status and content type.
   Protect their transport, retention, and access, and rotate credentials exposed
   through those channels.
-- **Protect diagnostic history.** LLM Debug retains bounded, sanitized captures
-  only in process memory. Prompts and non-secret response content can still be
-  sensitive. Access requires an administrator session; capture retention and
-  replay eligibility are limited.
+- **Diagnostic history is raw and memory only.** LLM Debug retains complete
+  unfiltered request and response content, including credentials, outside the database and backups. Access requires an administrator
+  session; successful captures expire after ten minutes and unsuccessful
+  captures after one hour.
 - **Use Sentry deliberately.** When `SENTRY_DSN` is set, AI prompt and completion
   content is recorded by default. Set `SENTRY_AI_RECORD_INPUTS=false` before
   handling sensitive data.

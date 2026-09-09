@@ -10,9 +10,10 @@ import {
   mergeCopilotRequestAttribution,
 } from "~/lib/copilot-request-context"
 import {
-  captureDebugResponseBody,
-  DEBUG_CAPTURE_MAX_BYTES,
+  bodyToDebugCapture,
+  tapDebugResponse,
   type CapturedBody,
+  DebugCaptureError,
 } from "~/lib/debug-capture"
 import { resolveCopilotApiBaseUrl } from "~/lib/github-instance"
 import {
@@ -23,6 +24,7 @@ import {
   startLlmDebugLog,
   toLlmDebugLogError,
 } from "~/lib/llm-debug-log"
+import { getModelFallbackDebugInfo } from "~/lib/model-fallback"
 import {
   clearCopilotResponseHeaders,
   getClientSessionId,
@@ -42,6 +44,8 @@ import { deriveUpstreamSessionId } from "~/lib/upstream-session-affinity"
 import {
   collectSafeCopilotResponseHeaders,
   COPILOT_API_VERSION,
+  DEFAULT_COPILOT_INTEGRATION_ID,
+  normalizeAccountIntegrationId,
   sanitizeCopilotHeaderValue,
 } from "~/services/copilot/copilot-contract"
 import { rediscoverCopilotOAuthBaseUrl } from "~/services/github/resolve-copilot-oauth"
@@ -117,6 +121,7 @@ export interface CopilotHeaderOptions {
   attribution?: CopilotRequestAttribution
   copilotSessionToken?: string
   copilotToken?: string
+  integrationId?: string | null
   initiator?: "agent" | "user"
   modelProviderPreference?: string
   vision?: boolean
@@ -188,6 +193,23 @@ function resolveCopilotHeaderToken(options?: CopilotHeaderOptions): string {
   return token
 }
 
+function resolveAccountIntegrationHeader(
+  options?: CopilotHeaderOptions,
+): string {
+  if (options?.integrationId !== undefined)
+    return (
+      normalizeAccountIntegrationId(options.integrationId)
+      ?? DEFAULT_COPILOT_INTEGRATION_ID
+    )
+  const account = getActiveAccount()
+  if (account)
+    return (
+      normalizeAccountIntegrationId(account.integrationId)
+      ?? DEFAULT_COPILOT_INTEGRATION_ID
+    )
+  return state.copilotIntegrationId
+}
+
 export function copilotHeaders(
   options?: CopilotHeaderOptions,
 ): Record<string, string> {
@@ -208,7 +230,7 @@ export function copilotHeaders(
     accept: "application/json",
     Authorization: `Bearer ${token}`,
     "User-Agent": "copilot-api",
-    "Copilot-Integration-Id": state.copilotIntegrationId,
+    "Copilot-Integration-Id": resolveAccountIntegrationHeader(options),
     "Copilot-Harness-Id": "copilot-sdk",
     "editor-version": `vscode/${state.vsCodeVersion ?? "1.104.3"}`,
     "Openai-Intent": attribution.openaiIntent ?? "conversation-agent",
@@ -338,54 +360,14 @@ function isLlmDebugPath(path: string): boolean {
   )
 }
 
-type DebuggableBody = RequestInit["body"]
-
-function bodyToDebugCapture(body: DebuggableBody): CapturedBody {
-  if (body === null || body === undefined) return { body: null, bodyBytes: 0 }
-  if (typeof body === "string") {
-    const bodyBytes = Buffer.byteLength(body)
-    return bodyBytes > DEBUG_CAPTURE_MAX_BYTES ?
-        { body: null, bodyBytes, truncated: true, omittedReason: "size-limit" }
-      : { body, bodyBytes }
-  }
-  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    const bodyBytes = body.byteLength
-    if (bodyBytes > DEBUG_CAPTURE_MAX_BYTES)
-      return {
-        body: null,
-        bodyBytes,
-        truncated: true,
-        omittedReason: "size-limit",
-      }
-    try {
-      return {
-        body: new TextDecoder(undefined, { fatal: true }).decode(body),
-        bodyBytes,
-      }
-    } catch {
-      return { body: null, bodyBytes, omittedReason: "unsupported" }
-    }
-  }
-  return {
-    body: null,
-    bodyBytes: 0,
-    bodyBytesComplete: false,
-    omittedReason: "unsupported",
-  }
-}
-
 async function captureLlmDebugResponse(
   logId: string,
   response: Response,
-  signal?: AbortSignal,
+  captured: Promise<CapturedBody>,
 ): Promise<void> {
   const responseHeaders = Object.fromEntries(response.headers.entries())
   try {
-    const captureSignal = getLlmDebugCaptureSignal(logId)
-    const body = await captureDebugResponseBody(
-      response,
-      signal ? AbortSignal.any([signal, captureSignal]) : captureSignal,
-    )
+    const body = await captured
     finishLlmDebugLog(logId, {
       ...body,
       headers: responseHeaders,
@@ -393,16 +375,20 @@ async function captureLlmDebugResponse(
       statusText: response.statusText,
     })
   } catch (error) {
+    const cause = error instanceof DebugCaptureError ? error.cause : error
     const debugResponse = {
       body: null,
+      bodyBytes: 0,
+      bodyBytesComplete: false,
       omittedReason: "read-error" as const,
-      bodyReadError: toLlmDebugLogError(error),
+      ...(error instanceof DebugCaptureError ? error.capture : {}),
+      bodyReadError: toLlmDebugLogError(cause),
       headers: responseHeaders,
       status: response.status,
       statusText: response.statusText,
     }
-    if (isAbortLikeError(error)) {
-      abortLlmDebugLog(logId, { error, response: debugResponse })
+    if (isAbortLikeError(cause) || isAbortLikeError(error)) {
+      abortLlmDebugLog(logId, { error: cause, response: debugResponse })
       return
     }
     finishLlmDebugLog(logId, debugResponse)
@@ -421,6 +407,7 @@ function startLlmDebugAttempt(opts: {
 
   const requestCapture = bodyToDebugCapture(requestInit?.body)
   return startLlmDebugLog({
+    fallback: getModelFallbackDebugInfo(),
     requestCapture,
     upstream: { kind: "copilot", accountId: opts.accountId },
     method: requestInit?.method ?? "GET",
@@ -436,9 +423,15 @@ function captureLlmDebugAttemptResponse(
   logId: string | undefined,
   response: Response,
   signal?: AbortSignal,
-): void {
-  if (!logId) return
-  void captureLlmDebugResponse(logId, response, signal)
+): Response {
+  if (!logId) return response
+  const captureSignal = getLlmDebugCaptureSignal(logId)
+  const tapped = tapDebugResponse(
+    response,
+    signal ? AbortSignal.any([signal, captureSignal]) : captureSignal,
+  )
+  void captureLlmDebugResponse(logId, tapped.response, tapped.capture)
+  return tapped.response
 }
 
 function failLlmDebugAttempt(logId: string | undefined, error: unknown): void {
@@ -816,17 +809,25 @@ export async function copilotFetch(
         ...requestInit,
         headers,
       })
-      const response = await fetchCopilotAttempt({
+      const upstreamResponse = await fetchCopilotAttempt({
         init: transportInit,
         telemetryState,
         url,
       })
 
-      captureLlmDebugAttemptResponse(
+      const response = captureLlmDebugAttemptResponse(
         debugLogId,
-        response,
+        upstreamResponse,
         requestInit?.signal ?? undefined,
       )
+      // Once a new response arrived, an earlier retry response can no longer
+      // be returned. Drain through its tap with bounded stream backpressure.
+      if (lastResponse) {
+        void lastResponse.body
+          ?.pipeTo(new WritableStream<Uint8Array>({ write() {} }))
+          .catch(() => undefined)
+        lastResponse = undefined
+      }
       logQuotaSnapshot(response)
 
       const action = await classifyResponse({
@@ -843,7 +844,6 @@ export async function copilotFetch(
       })
 
       if (action.kind !== "return") {
-        lastResponse = response
         clearCopilotResponseHeaders()
         if (action.kind === "rediscover-endpoint") {
           endpointRediscoveryAttempted = true
@@ -863,6 +863,7 @@ export async function copilotFetch(
           markCopilotContractResponseMetadataAvailable()
           return response
         }
+        lastResponse = response
         requestInit = next.requestInit
         retryBackoffExtraSeconds = next.retryBackoffExtraSeconds
         telemetryState.reason = next.telemetryReason

@@ -30,6 +30,7 @@ import {
   currentCounterKeys,
   currentSchemaVersion,
   currentTables,
+  storageSchema,
 } from "~/lib/storage/schema"
 import {
   assertEmptyTransferTarget,
@@ -353,10 +354,17 @@ class RecordDecoder {
   ): TransferRecord | null {
     if (record.table === "capi_metadata" && value.key === "schema_version") {
       const version = parseStorageCounter(value.value)
-      if (version !== 2 && version !== currentSchemaVersion) invalid()
+      if (version < 2 || version > currentSchemaVersion) invalid()
       if (
-        version === currentSchemaVersion
+        version >= 3
         && this.singletonKeys.has('capi_metadata:["history_debug_generation"]')
+      )
+        invalid()
+      if (
+        version >= 5
+        && this.singletonKeys.has(
+          'capi_metadata:["history_activity_generation"]',
+        )
       )
         invalid()
       this.sourceVersion = version
@@ -368,14 +376,25 @@ class RecordDecoder {
     // Retired records count toward the original manifest's integrity checks,
     // but never enter a write batch or a replacement database, even temporarily.
     if (record.table === "capi_debug") return null
+    if (record.table === "capi_activity") return null
     if (
       record.table === "capi_metadata"
-      && value.key === "history_debug_generation"
+      && [
+        "history_activity_cleared_at",
+        "history_activity_generation",
+        "history_debug_generation",
+      ].includes(String(value.key))
     ) {
       parseStorageCounter(value.value)
       return null
     }
-    return record
+    if (record.table === "capi_accounts" && (this.sourceVersion ?? 2) < 4) {
+      return {
+        ...record,
+        value: { ...value, integration_id: null } as JsonValue,
+      }
+    }
+    return stripRetiredHistoryMetadata(record, value)
   }
   private async flush(): Promise<void> {
     if (this.batch.length === 0) return
@@ -391,12 +410,32 @@ class RecordDecoder {
     if (this.buffer.length > 0 || this.pending || !this.manifest) invalid()
     const requiredMetadata = [
       ...REQUIRED_TRANSFER_METADATA_KEYS,
-      ...(this.sourceVersion === 2 ? ["history_debug_generation"] : []),
+      ...storageSchema(this.sourceVersion ?? currentSchemaVersion).counterKeys,
     ]
     for (const key of requiredMetadata) {
       if (!this.singletonKeys.has(`capi_metadata:${JSON.stringify([key])}`))
         invalid()
     }
+  }
+}
+
+function stripRetiredHistoryMetadata(
+  record: TransferRecord,
+  value: Readonly<Record<string, SqlValue>>,
+): TransferRecord | null {
+  if (!["capi_collection_gaps", "capi_process_runs"].includes(record.table))
+    return record
+  const payload = object(JSON.parse(String(value.payload_json)))
+  if (
+    record.table === "capi_collection_gaps"
+    && ["activity", "debug"].includes(String(payload.historyKind))
+  )
+    return null
+  delete payload.activityGeneration
+  delete payload.debugGeneration
+  return {
+    ...record,
+    value: { ...value, payload_json: JSON.stringify(payload) } as JsonValue,
   }
 }
 

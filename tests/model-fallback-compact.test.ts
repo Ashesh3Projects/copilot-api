@@ -21,6 +21,47 @@ const previous = { ...state }
 const originalFetch = globalThis.fetch
 const calls: Array<{ path: string; body: Record<string, unknown> }> = []
 
+test("compaction follows fallback target redirects and their effort and verbosity", async () => {
+  const target = state.models?.data.find((item) => item.id === "compact-target")
+  if (!target || !state.models)
+    throw new Error("Missing compaction fixture model")
+  state.models.data.push({
+    ...target,
+    id: "compact-fast",
+    name: "compact-fast",
+  })
+  setModelRedirectsForTest([
+    {
+      id: "compact-fast",
+      sourceModel: "compact-target",
+      sourceEffort: "all",
+      targetModel: "compact-fast",
+      targetEffort: "high",
+      targetVerbosity: "low",
+      enabled: true,
+    },
+  ])
+  await seedProtocolDatabase()
+  const response = await server.request("/v1/responses/compact", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "compact-source",
+      input: [{ role: "user", content: "Summarize this conversation" }],
+    }),
+  })
+  expect(response.status).toBe(200)
+  expect(calls.map((call) => call.body.model)).toEqual([
+    "compact-source",
+    "compact-fast",
+  ])
+  expect(calls[1].body.reasoning).toMatchObject({ effort: "high" })
+  expect(calls[1].body.text).toMatchObject({ verbosity: "low" })
+})
+
 beforeEach(() => {
   calls.length = 0
   setConfigForTest({})

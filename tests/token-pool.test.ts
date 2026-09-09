@@ -291,11 +291,12 @@ test("uses a GitHub.com OAuth token directly for model discovery", async () => {
   ).toBe(false)
 })
 
-test("uses the current Copilot contract for multi-token model discovery", async () => {
+test("uses the account integration override and current contract for multi-token model discovery", async () => {
   const pool = new tokenPoolModule.TokenPool()
   pools.add(pool)
   const account = createInitializedAccount(pool)
-  state.copilotIntegrationId = "assigned-integration"
+  state.copilotIntegrationId = "unrelated-global-integration"
+  account.integrationId = "assigned-integration"
   queuedResults.push(
     copilotUserResponse(),
     modelsResponse([createModel(MODEL_A)]),

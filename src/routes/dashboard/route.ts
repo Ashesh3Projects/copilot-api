@@ -1,13 +1,13 @@
 import { Hono } from "hono"
 
 import { authenticateAdminRequest } from "~/lib/admin-auth"
+import { getModelRoutingSafety } from "~/lib/model-routing-safety"
 import { secureHtml } from "~/lib/secure-html"
 import { withSettingsActor } from "~/lib/storage/domain-settings"
 import { getSession } from "~/routes/code-sessions/session-store"
 import { mintRemoteWebSocketTicket } from "~/routes/remote/ws-security"
 
 import { dashboardAccountRoutes } from "./accounts"
-import { dashboardActivityRoutes } from "./activity"
 import {
   handleAddTrustedJwtDigest,
   handleAddModelRedirect,
@@ -112,7 +112,6 @@ dashboardRoutes.use("/api/*", async (c, next) => {
 // Overview
 dashboardRoutes.route("/api/accounts", dashboardAccountRoutes)
 dashboardRoutes.route("/api/credentials", createDashboardCredentialRoutes())
-dashboardRoutes.route("/api", dashboardActivityRoutes)
 dashboardRoutes.get("/api/overview", handleOverview)
 
 // Sessions
@@ -160,6 +159,9 @@ dashboardRoutes.put("/api/replacements/:id", handleUpdateReplacement)
 
 // Model Redirects
 dashboardRoutes.get("/api/model-redirects", handleListModelRedirects)
+dashboardRoutes.get("/api/model-routing-safety", (c) =>
+  c.json(getModelRoutingSafety()),
+)
 dashboardRoutes.post("/api/model-redirects", handleAddModelRedirect)
 dashboardRoutes.delete("/api/model-redirects/:id", handleDeleteModelRedirect)
 dashboardRoutes.patch("/api/model-redirects/:id", handleUpdateModelRedirect)

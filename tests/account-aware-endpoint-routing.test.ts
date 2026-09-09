@@ -341,9 +341,7 @@ test.each([
         (entry) => entry.path === upstreamPath,
       )?.id ?? "",
     )
-    expect(debugEntry?.request.headers["Copilot-Session-Token"]).toBe(
-      "[REDACTED]",
-    )
+    expect(debugEntry?.request.headers["Copilot-Session-Token"]).toBe(token)
   },
 )
 

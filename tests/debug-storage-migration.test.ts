@@ -92,7 +92,7 @@ test.each([1, 2] as const)(
         args: [],
       }),
       activity: await session.query({
-        sql: "SELECT id,generation FROM capi_activity",
+        sql: "SELECT name FROM sqlite_master WHERE name='capi_activity'",
         args: [],
       }),
       settings: await session.query({
@@ -103,11 +103,10 @@ test.each([1, 2] as const)(
     expect(state.retired).toEqual([])
     expect(state.metadata).toEqual([
       { key: "config_revision", value: "7" },
-      { key: "history_activity_generation", value: "4" },
-      { key: "schema_version", value: "3" },
+      { key: "schema_version", value: "5" },
       { key: "store_id", value: storeId },
     ])
-    expect(state.activity).toEqual([{ id: "retained-activity", generation: 4 }])
+    expect(state.activity).toEqual([])
     expect(state.settings).toEqual([{ namespace: "app", revision: 7 }])
   },
 )

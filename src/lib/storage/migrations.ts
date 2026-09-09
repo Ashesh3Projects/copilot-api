@@ -71,7 +71,7 @@ async function validateSchema(
   if (
     Object.keys(schema.tables).some((name) => !tables.has(name))
     || Object.keys(schema.indexes).some((name) => !indexes.has(name))
-    || (version >= 3 && tables.has("capi_debug"))
+    || retiredStatePresent(version, tables)
   ) {
     throw new StorageSchemaError("Application schema is incomplete")
   }
@@ -93,8 +93,8 @@ async function validateSchema(
     throw new StorageSchemaError("Required storage metadata is invalid")
   }
   for (const key of schema.counterKeys) parseStorageCounter(metadata.get(key))
-  if (version >= 3 && metadata.has("history_debug_generation"))
-    throw new StorageSchemaError("Retired debug metadata is present")
+  if (retiredStatePresent(version, new Set(metadata.keys()), true))
+    throw new StorageSchemaError("Retired history metadata is present")
   const lifetime = await session.query({
     sql: "SELECT id FROM capi_usage_lifetime",
     args: [],
@@ -102,6 +102,19 @@ async function validateSchema(
   if (lifetime.length !== 1 || lifetime[0]?.id !== 1) {
     throw new StorageSchemaError("Usage lifetime singleton is missing")
   }
+}
+
+function retiredStatePresent(
+  version: number,
+  names: ReadonlySet<unknown>,
+  metadata = false,
+): boolean {
+  return (
+    (version >= 3
+      && names.has(metadata ? "history_debug_generation" : "capi_debug"))
+    || (version >= 5
+      && names.has(metadata ? "history_activity_generation" : "capi_activity"))
+  )
 }
 
 /** All DDL and migration metadata commit together; never repair partial schemas. */

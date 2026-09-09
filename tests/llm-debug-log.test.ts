@@ -43,7 +43,7 @@ test("captures request and response in memory without initializing storage", asy
   expect(await getLlmDebugLog(id)).toBeUndefined()
 })
 
-test("scrubs request and completed response credentials before retaining them", async () => {
+test("preserves exact request and response credentials, formatting, headers and URL", async () => {
   const startedAtMs = Date.now()
   const requestBody = `{"messages": [ {"role": "user", "content": "Find this request"} ], "api_key": "body-secret", "model": "gpt-test", "stream": false}`
   const responseBody = `{ "access_token": "response-secret", "ok": true }`
@@ -88,25 +88,17 @@ test("scrubs request and completed response credentials before retaining them", 
 
   const detail = await getLlmDebugLog(id)
   expect(detail?.request).toMatchObject({
-    body: JSON.stringify({
-      messages: [{ role: "user", content: "Find this request" }],
-      api_key: "[REDACTED]",
-      model: "gpt-test",
-      stream: false,
-    }),
+    body: requestBody,
     bodyBytes: new TextEncoder().encode(requestBody).byteLength,
-    headers: {
-      authorization: "[REDACTED]",
-      cookie: "[REDACTED]",
-      "x-api-key": "[REDACTED]",
-    },
-    url: "https://example.test/chat/completions?api_key=%5BREDACTED%5D",
+    headers: requestHeaders,
+    url,
   })
   expect(detail?.response).toMatchObject({
-    body: JSON.stringify({ access_token: "[REDACTED]", ok: true }),
+    body: responseBody,
     bodyBytes: new TextEncoder().encode(responseBody).byteLength,
-    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
+    headers: responseHeaders,
   })
+  expect(detail?.replayable).toBe(true)
 })
 
 test("classifies non-success upstream responses as errors", async () => {
@@ -131,7 +123,7 @@ test("classifies non-success upstream responses as errors", async () => {
   expect((await listLlmDebugLogs()).entries[0]?.status).toBe("error")
 })
 
-test("scrubs session headers and nested structured request bodies", async () => {
+test("preserves session headers and nested structured request bodies", async () => {
   const rawIds = [
     "root-session-private",
     "root-thread-private",
@@ -171,14 +163,12 @@ test("scrubs session headers and nested structured request bodies", async () => 
   })
 
   const detail = await getLlmDebugLog(id)
-  for (const value of rawIds)
-    expect(JSON.stringify(detail)).not.toContain(value)
-  for (const value of Object.values(requestHeaders))
-    expect(JSON.stringify(detail)).not.toContain(value)
-  expect(detail?.replayable).toBe(false)
+  expect(detail?.request.body).toBe(requestBody)
+  expect(detail?.request.headers).toEqual(requestHeaders)
+  expect(detail?.replayable).toBe(true)
 })
 
-test("omits unsupported request bodies", async () => {
+test("preserves non-JSON request bodies", async () => {
   const requestBody = "api_key=body-secret & keep = exact spacing"
   const id = startLlmDebugLog({
     method: "POST",
@@ -189,12 +179,12 @@ test("omits unsupported request bodies", async () => {
   })
 
   expect((await getLlmDebugLog(id))?.request).toMatchObject({
-    body: null,
-    omittedReason: "unsupported",
+    body: requestBody,
+    bodyBytes: Buffer.byteLength(requestBody),
   })
 })
 
-test("scrubs aborted response details and runtime error URL", async () => {
+test("preserves aborted response details and runtime error URL", async () => {
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
     method: "POST",
@@ -228,17 +218,15 @@ test("scrubs aborted response details and runtime error URL", async () => {
   })
 
   const detail = await getLlmDebugLog(id)
-  expect(detail?.error?.path).toBe(
-    "https://example.test/responses?token=%5BREDACTED%5D",
-  )
+  expect(detail?.error?.path).toBe(errorPath)
   expect(detail?.response).toMatchObject({
-    body: JSON.stringify({ refresh_token: "[REDACTED]" }),
+    body: responseBody,
     bodyBytes: new TextEncoder().encode(responseBody).byteLength,
-    headers: { "content-type": "application/json", "set-cookie": "[REDACTED]" },
+    headers: responseHeaders,
   })
 })
 
-test("returns independent sanitized entries", async () => {
+test("returns independent raw entries", async () => {
   const requestBody = `{ "api_key": "request-secret" }`
   const responseBody = `{ "access_token": "response-secret" }`
   const id = startLlmDebugLog({
@@ -263,14 +251,62 @@ test("returns independent sanitized entries", async () => {
   firstRead.response.headers["set-cookie"] = "mutated"
 
   const secondRead = await getLlmDebugLog(id)
-  expect(secondRead?.request.body).toBe(
-    JSON.stringify({ api_key: "[REDACTED]" }),
-  )
-  expect(secondRead?.request.headers.authorization).toBe("[REDACTED]")
-  expect(secondRead?.response?.body).toBe(
-    JSON.stringify({ access_token: "[REDACTED]" }),
-  )
-  expect(secondRead?.response?.headers["set-cookie"]).toBe("[REDACTED]")
+  expect(secondRead?.request.body).toBe(requestBody)
+  expect(secondRead?.request.headers.authorization).toBe("Bearer raw-token")
+  expect(secondRead?.response?.body).toBe(responseBody)
+  expect(secondRead?.response?.headers["set-cookie"]).toBe("upstream=secret")
+})
+
+test("incomplete HTTP 200 captures stay unsuccessful with honest byte counts", async () => {
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/responses",
+    requestBody: "{}",
+    requestHeaders: {},
+    url: "https://example.test/responses",
+  })
+  finishLlmDebugLog(id, {
+    body: "data: partial\r\n",
+    bodyBytes: 15,
+    bodyBytesComplete: false,
+    truncated: true,
+    omittedReason: "queue-pressure",
+    headers: { "content-type": "text/event-stream" },
+    status: 200,
+    statusText: "OK",
+  })
+  const detail = await getLlmDebugLog(id)
+  expect(detail?.status).toBe("error")
+  expect(detail?.response).toMatchObject({
+    body: "data: partial\r\n",
+    bodyBytes: 15,
+    bodyBytesComplete: false,
+    truncated: true,
+    omittedReason: "queue-pressure",
+  })
+})
+
+test("an unavailable request capture is not marked complete after HTTP 200", async () => {
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/responses",
+    requestBody: null,
+    requestCapture: {
+      body: null,
+      bodyBytes: 123,
+      bodyBytesComplete: false,
+      omittedReason: "read-error",
+    },
+    requestHeaders: {},
+    url: "https://example.test/responses",
+  })
+  finishLlmDebugLog(id, {
+    body: "{}",
+    headers: {},
+    status: 200,
+    statusText: "OK",
+  })
+  expect((await getLlmDebugLog(id))?.status).toBe("error")
 })
 
 test("prunes entries older than the retention window", async () => {

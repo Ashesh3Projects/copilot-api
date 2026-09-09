@@ -37,6 +37,10 @@ import {
   RelTime,
 } from "../components/common"
 import { JsonTreeViewer } from "../components/JsonTreeViewer"
+import {
+  LlmFallbackBadge,
+  LlmFallbackBanner,
+} from "../components/LlmFallbackIndicator"
 import { Page } from "../components/Page"
 import { RequestExportMenu } from "../components/RequestExportMenu"
 import { ResponseInspector } from "../components/ResponseInspector"
@@ -55,6 +59,7 @@ import {
 import { ApiError, del, get } from "../lib/api"
 import {
   canEditReplayCapture,
+  canReplayCapture,
   captureOmissionMessage,
 } from "../lib/capture-state"
 import { formatDuration } from "../lib/duration-format"
@@ -166,7 +171,7 @@ function LlmDebugListView() {
       if (statusFilter !== "all" && entry.status !== statusFilter) return false
       if (!needle) return true
       const haystack =
-        `${entry.method} ${entry.path} ${entry.model ?? ""} ${entry.requestId ?? ""}`.toLowerCase()
+        `${entry.method} ${entry.path} ${entry.model ?? ""} ${entry.requestId ?? ""} ${entry.fallback ? `fallback ${entry.fallback.sourceModel} ${entry.fallback.fromModel} ${entry.fallback.targetModel}` : ""}`.toLowerCase()
       return haystack.includes(needle)
     }) as Array<DebugRow>
   }, [entries, query, statusFilter])
@@ -182,9 +187,14 @@ function LlmDebugListView() {
   })
   const sortPlugin = useTableSortable<DebugRow>(sortConfig)
 
+  function refreshLatest() {
+    setCursor(undefined)
+    reload()
+  }
+
   async function handleClearAll() {
     await del("/dashboard/api/llm-debug")
-    reload()
+    refreshLatest()
   }
 
   async function handleExport() {
@@ -247,12 +257,19 @@ function LlmDebugListView() {
       header: "Model",
       width: proportional(1, { minWidth: 120 }),
       sortable: true,
-      renderCell: (row) =>
-        row.model ?
-          <MonoText>{row.model}</MonoText>
-        : <Text type="supporting" color="secondary">
-            —
-          </Text>,
+      renderCell: (row) => (
+        <VStack gap={1}>
+          {row.model ?
+            <MonoText>{row.model}</MonoText>
+          : <Text type="supporting" color="secondary">
+              —
+            </Text>
+          }
+          {row.fallback ?
+            <LlmFallbackBadge fallback={row.fallback} />
+          : null}
+        </VStack>
+      ),
     },
     {
       key: "size",
@@ -308,7 +325,7 @@ function LlmDebugListView() {
     <Page
       kicker="Monitor"
       title="LLM Debug"
-      onRefresh={reload}
+      onRefresh={refreshLatest}
       isRefreshing={loading}
       actions={
         entries.length > 0 ?
@@ -357,14 +374,6 @@ function LlmDebugListView() {
       : null}
 
       <HStack gap={2}>
-        <Button
-          label="Latest"
-          variant="secondary"
-          onClick={() => {
-            setCursor(undefined)
-            reload()
-          }}
-        />
         {data?.cursor ?
           <Button
             label="Older captures"
@@ -599,7 +608,9 @@ function LlmDebugDetailView({ id }: { id: string }) {
             onClick={() => copy(globalThis.location.href)}
           />
           <Button
-            label={data?.replayable ? "Replay" : "Edit and replay"}
+            label={
+              data && canReplayCapture(data) ? "Replay" : "Edit and replay"
+            }
             variant="primary"
             icon={<PlayIcon />}
             isDisabled={!showReplay}
@@ -657,6 +668,9 @@ function LlmDebugDetailView({ id }: { id: string }) {
           title="Capture incomplete"
           description={captureWarning}
         />
+      : null}
+      {data?.fallback ?
+        <LlmFallbackBanner fallback={data.fallback} />
       : null}
       {data ?
         <VStack gap={4}>

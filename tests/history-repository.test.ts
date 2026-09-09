@@ -6,10 +6,7 @@ import { join } from "node:path"
 
 import type { HistoryRecord } from "~/lib/telemetry-writer"
 
-import {
-  createHistoryRepository,
-  type DiagnosticKind,
-} from "~/lib/storage/history-repository"
+import { createHistoryRepository } from "~/lib/storage/history-repository"
 import { LocalSqliteStorage } from "~/lib/storage/local-sqlite"
 import { migrateStorage } from "~/lib/storage/migrations"
 import { TursoStorage } from "~/lib/storage/turso"
@@ -23,115 +20,6 @@ import { createFakeTursoFetch, testConfig } from "./helpers/turso-transport"
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => {
   for (const close of cleanup.splice(0)) await close()
-})
-
-test("uncertain clear blocks new diagnostics with visible loss until generation recovery", async () => {
-  const { storage } = await fixture()
-  let loseClear = false
-  let unavailable = false
-  const runtime = await createHistoryRuntime(
-    {
-      read: (work) =>
-        unavailable ?
-          Promise.reject(new Error("unavailable"))
-        : storage.read(work),
-      atomicBatch: (statements) => storage.atomicBatch(statements),
-      close: () => storage.close(),
-      async transaction(work) {
-        const result = await storage.transaction(work)
-        if (loseClear) {
-          loseClear = false
-          unavailable = true
-          throw new Error("lost response")
-        }
-        return result
-      },
-    },
-    { autoFlush: false },
-  )
-  const diagnostic = (id: string): HistoryRecord => ({
-    id,
-    kind: "activity",
-    recordedAt: Date.now(),
-    generation: runtime.generations.activity,
-    payload: { type: "info", message: "safe" },
-  })
-  const preClear = diagnostic("old-capture")
-  try {
-    loseClear = true
-    let rejected = false
-    try {
-      await runtime.clear("activity")
-    } catch {
-      rejected = true
-    }
-    expect(rejected).toBe(true)
-    expect(runtime.writer.status().degraded).toBe(true)
-    expect(runtime.writer.enqueue(diagnostic("during-unknown"))).toBe(false)
-    expect(runtime.writer.status().droppedRecords).toBe(1)
-    await runtime.writer.flush()
-    expect(runtime.writer.status().degraded).toBe(true)
-    unavailable = false
-    await runtime.writer.flush()
-    expect(runtime.generations.activity).toBe(1)
-    runtime.writer.enqueue(preClear)
-    expect(runtime.writer.enqueue(diagnostic("after-recovery"))).toBe(true)
-    await runtime.writer.flush()
-    expect(
-      (await runtime.repository.list("activity")).records.map(
-        (record) => record.id,
-      ),
-    ).toEqual(["after-recovery"])
-    expect((await runtime.repository.collectionStatus()).knownLostRecords).toBe(
-      1,
-    )
-    expect(runtime.writer.status().degraded).toBe(false)
-  } finally {
-    unavailable = false
-    await runtime.close(500)
-  }
-})
-
-test("concurrent clear response delays cannot move the cached generation backwards", async () => {
-  const { storage } = await fixture()
-  const committed = Promise.withResolvers<undefined>()
-  const release = Promise.withResolvers<undefined>()
-  let delay = false
-  let transactions = 0
-  const runtime = await createHistoryRuntime(
-    {
-      read: (work) => storage.read(work),
-      atomicBatch: (statements) => storage.atomicBatch(statements),
-      close: () => storage.close(),
-      async transaction(work) {
-        transactions++
-        const result = await storage.transaction(work)
-        if (delay) {
-          delay = false
-          committed.resolve(undefined)
-          await release.promise
-        }
-        return result
-      },
-    },
-    { autoFlush: false },
-  )
-  try {
-    const initialTransactions = transactions
-    delay = true
-    const first = runtime.clear("activity")
-    await committed.promise
-    const second = runtime.clear("activity")
-    await Bun.sleep(20)
-    expect(transactions).toBe(initialTransactions + 1)
-    release.resolve(undefined)
-    expect(await first).toBe(1)
-    expect(await second).toBe(2)
-    expect(runtime.generations.activity).toBe(2)
-  } finally {
-    release.resolve(undefined)
-    await runtime.close(500)
-  }
 })
 
 test("Turso SDK transport retries a lost history commit without duplicate usage", async () => {
@@ -162,26 +50,6 @@ test("Turso SDK transport retries a lost history commit without duplicate usage"
     await storage.close()
     transport.close()
   }
-})
-
-test("clear reconciles its receipt after a lost commit response", async () => {
-  const { storage } = await fixture()
-  let lose = true
-  const repository = createHistoryRepository({
-    read: (work) => storage.read(work),
-    atomicBatch: (statements) => storage.atomicBatch(statements),
-    close: () => storage.close(),
-    async transaction(work) {
-      const value = await storage.transaction(work)
-      if (lose) {
-        lose = false
-        throw new Error("commit response lost")
-      }
-      return value
-    },
-  })
-  expect(await repository.clear("activity")).toBe(1)
-  expect(await repository.generations()).toMatchObject({ activity: 1 })
 })
 
 async function fixture() {
@@ -242,32 +110,154 @@ test("pruning retains old usage minutes and lifetime totals", async () => {
   expect((await repository.readUsage(now)).lifetime.requestCount).toBe(1)
 })
 
-test("clear generation prevents queued activity from resurrecting", async () => {
-  const { repository } = await fixture()
-  const record: HistoryRecord = {
-    id: "a",
-    kind: "activity",
-    generation: 0,
-    recordedAt: Date.now(),
-    payload: { type: "info", message: "safe" },
-  }
-  await repository.applyBatch("first", [record])
-  expect((await repository.list("activity")).records).toHaveLength(1)
-  expect(await repository.clear("activity")).toBe(1)
-  await repository.applyBatch("delayed", [{ ...record, id: "b" }])
-  expect((await repository.list("activity")).records).toHaveLength(0)
-})
-
-test("unclean prior runs create an unknown gap once; clean runs do not", async () => {
-  const { repository } = await fixture()
-  await repository.startRun("first", Date.now())
-  await repository.startRun("second", Date.now())
-  await repository.endRun("second", Date.now())
-  await repository.startRun("third", Date.now())
+test("only stale unclosed runs create one unknown gap, not concurrently healthy or clean runs", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const repository = createHistoryRepository(storage, { now: () => now })
+  await repository.startRun("first", now)
+  await repository.startRun("second", now)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(0)
+  await repository.endRun("second", now)
+  now += 300_001
+  await repository.startRun("third", now)
+  await repository.startRun("fourth", now)
   expect(await repository.collectionStatus()).toMatchObject({
     knownLostRecords: 0,
     unknownGaps: 1,
   })
+})
+
+test("idle runtimes renew their lease and closing one preserves the other run and its counters", async () => {
+  const { storage } = await fixture()
+  let now = Date.now()
+  const first = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  cleanup.unshift(() => first.close(1000).then(() => undefined))
+  first.writer.enqueue(usage(now))
+  await first.writer.flush()
+  now += 290_000
+  await first.writer.flush()
+  now += 20_000
+  const second = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  cleanup.unshift(() => second.close(1000).then(() => undefined))
+  second.writer.enqueue({ ...usage(now), id: "second-usage" })
+  await second.writer.flush()
+  expect((await second.repository.collectionStatus()).unknownGaps).toBe(0)
+  await second.close(1000)
+  const runs = await storage.read((session) =>
+    session.query({
+      sql: "SELECT clean, ended_at FROM capi_process_runs ORDER BY started_at",
+      args: [],
+    }),
+  )
+  expect(runs).toEqual([
+    { clean: 0, ended_at: null },
+    { clean: 1, ended_at: now },
+  ])
+  expect((await first.repository.readUsage(0)).lifetime.requestCount).toBe(2)
+  await first.close(1000)
+  const restarted = await createHistoryRuntime(storage, {
+    autoFlush: false,
+    now: () => now,
+  })
+  cleanup.unshift(() => restarted.close(1000).then(() => undefined))
+  expect((await restarted.repository.collectionStatus()).unknownGaps).toBe(0)
+})
+
+test("collection loss stays durable across pruning and its time window matches pending records", async () => {
+  const { repository } = await fixture()
+  const now = Date.now()
+  const losses: Array<HistoryRecord> = [
+    {
+      id: "usage-loss",
+      kind: "collection-gap",
+      generation: 0,
+      recordedAt: now - 2 * 86400_000,
+      payload: { historyKind: "usage", lostRecords: 2, lostBytes: 100 },
+    },
+    {
+      id: "routing-loss",
+      kind: "collection-gap",
+      generation: 0,
+      recordedAt: now,
+      payload: { historyKind: "routing", lostRecords: 3, lostBytes: 200 },
+    },
+    {
+      id: "unknown-loss",
+      kind: "collection-gap",
+      generation: 0,
+      recordedAt: now + 1,
+      payload: { unknown: true, reason: "expired-unconfirmed-batch" },
+    },
+  ]
+  const pending = losses.map((record) => ({ record }))
+  const window = { since: now - 1, until: now + 1 }
+  expect(await repository.collectionStatus(window, pending)).toEqual({
+    knownLostRecords: 3,
+    knownLostBytes: 200,
+    unknownGaps: 1,
+  })
+  await repository.applyBatch("losses", losses)
+  expect(
+    await repository.collectionStatus(
+      window,
+      losses.map((record) => ({ record, batchId: "losses" })),
+    ),
+  ).toEqual({ knownLostRecords: 3, knownLostBytes: 200, unknownGaps: 1 })
+  await repository.prune(now + 8 * 86400_000)
+  expect(await repository.collectionStatus()).toEqual({
+    knownLostRecords: 5,
+    knownLostBytes: 300,
+    unknownGaps: 1,
+  })
+  expect(await repository.collectionStatus(window)).toEqual({
+    knownLostRecords: 3,
+    knownLostBytes: 200,
+    unknownGaps: 1,
+  })
+})
+
+test("legacy unknown loss is repaired only with clean-run evidence and genuine loss remains", async () => {
+  const { storage, repository } = await fixture()
+  const now = Date.now()
+  await storage.atomicBatch([
+    {
+      sql: "INSERT INTO capi_process_runs(id,started_at,ended_at,clean) VALUES('clean-legacy',?,?,1),('old-legacy',?,NULL,0),('recent-legacy',?,NULL,0)",
+      args: [now - 1000, now - 500, now - 8 * 86400_000, now - 600_000],
+    },
+    {
+      sql: "INSERT INTO capi_collection_gaps(id,process_run_id,started_at,kind) VALUES('unclean-clean-legacy','clean-legacy',?,'unknown'),('unclean-old-legacy','old-legacy',?,'unknown'),('unclean-recent-legacy','recent-legacy',?,'unknown')",
+      args: [now - 1000, now - 8 * 86400_000, now - 600_000],
+    },
+    {
+      sql: "INSERT INTO capi_collection_gaps(id,process_run_id,started_at,kind,payload_json) VALUES('real-clean-loss','clean-legacy',?,'unknown',?)",
+      args: [
+        now - 750,
+        JSON.stringify({ reason: "expired-unconfirmed-batch" }),
+      ],
+    },
+  ])
+  await repository.startRun("current", now)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(3)
+  await repository.startRun("next", now + 1)
+  expect((await repository.collectionStatus()).unknownGaps).toBe(3)
+  expect(
+    await storage.read((session) =>
+      session.query({
+        sql: "SELECT id FROM capi_collection_gaps ORDER BY id",
+        args: [],
+      }),
+    ),
+  ).toEqual([
+    { id: "real-clean-loss" },
+    { id: "unclean-old-legacy" },
+    { id: "unclean-recent-legacy" },
+  ])
 })
 
 test("routing aggregation preserves prototype-like route keys as data", async () => {
@@ -295,123 +285,65 @@ test("routing aggregation preserves prototype-like route keys as data", async ()
   )
 })
 
-test("durable history rejects retired debug records before opening a transaction", async () => {
-  let transactions = 0
-  const repository = createHistoryRepository({
-    read: () => {
-      throw new Error("Unexpected storage read")
-    },
-    transaction: () => {
-      transactions++
-      throw new Error("Unexpected storage transaction")
-    },
-    atomicBatch: async () => {},
-    close: async () => {},
-  })
-  await expect(
-    repository.applyBatch("retired-debug", [
-      {
-        id: "retired-debug",
-        kind: "debug",
-        generation: 0,
-        recordedAt: Date.now(),
-        payload: { request: "synthetic-private-body" },
-      } as unknown as HistoryRecord,
-    ]),
-  ).rejects.toThrow("Unsupported history record kind")
-  expect(transactions).toBe(0)
-})
-
-test("retired debug diagnostic calls cannot read or clear activity history", async () => {
-  const { repository, storage } = await fixture()
-  await repository.applyBatch("keep-activity", [
-    {
-      id: "keep-activity",
-      kind: "activity",
-      generation: 0,
-      recordedAt: Date.now(),
-      payload: { type: "info", message: "keep me" },
-    },
-  ])
-  const retiredKind = "debug" as DiagnosticKind
-  await expect(repository.clear(retiredKind)).rejects.toThrow(
-    "Unsupported diagnostic kind",
-  )
-  await expect(repository.list(retiredKind)).rejects.toThrow(
-    "Unsupported diagnostic kind",
-  )
-  await expect(repository.get(retiredKind, "keep-activity")).rejects.toThrow(
-    "Unsupported diagnostic kind",
-  )
-  expect(
-    (await repository.list("activity")).records.map((record) => record.id),
-  ).toEqual(["keep-activity"])
-  expect(await repository.generations()).toEqual({ activity: 0 })
-  expect(
-    await storage.read((session) =>
-      session.query({
-        sql: "SELECT key FROM capi_metadata WHERE key='history_debug_generation'",
-        args: [],
-      }),
-    ),
-  ).toEqual([])
-})
-
-test("activity expiry and row caps are applied while usage remains intact", async () => {
-  const { repository, storage } = await fixture()
-  const now = Date.now()
-  await storage.transaction(async (s) => {
-    await s.execute({
-      sql: `WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ids WHERE n < 50002) INSERT INTO capi_activity (id, generation, created_at, expires_at, kind, payload_json, payload_bytes) SELECT printf('%06d', n), 0, ?, ?, 'info', '{}', 2 FROM ids`,
-      args: [now, now + 86400_000],
+for (const kind of ["debug", "activity"]) {
+  test(`durable history rejects retired ${kind} records before opening a transaction`, async () => {
+    let transactions = 0
+    const repository = createHistoryRepository({
+      read: () => {
+        throw new Error("Unexpected storage read")
+      },
+      transaction: () => {
+        transactions++
+        throw new Error("Unexpected storage transaction")
+      },
+      atomicBatch: async () => {},
+      close: async () => {},
     })
+    await expect(
+      repository.applyBatch("retired", [
+        {
+          id: "retired",
+          kind,
+          generation: 0,
+          recordedAt: Date.now(),
+          get payload() {
+            throw new Error("Retired payload must not be read")
+          },
+        } as unknown as HistoryRecord,
+      ]),
+    ).rejects.toThrow("Unsupported history record kind")
+    expect(transactions).toBe(0)
   })
-  await repository.prune(now)
-  const rows = await storage.read((s) =>
-    s.query({
-      sql: "SELECT COUNT(*) AS count, MIN(id) AS oldest FROM capi_activity",
-      args: [],
-    }),
-  )
-  expect(rows[0]).toEqual({ count: 50000, oldest: "000003" })
-  await repository.prune(now + 2 * 86400_000)
-  expect((await repository.list("activity")).records).toHaveLength(0)
-})
+}
 
-test("batched activity records respect clear generations and deduplicate receipts", async () => {
-  const { repository, storage } = await fixture()
+test("batched mixed counters commit all deltas once and conflicting batch reuse is rejected", async () => {
+  const { repository } = await fixture()
   const now = Date.now()
-  const activity = (id: string): HistoryRecord => ({
-    id,
-    kind: "activity",
+  const records: Array<HistoryRecord> = Array.from({ length: 200 }, (_, i) => ({
+    ...usage(now - i * 60_000),
+    id: `usage-${i}`,
+  }))
+  records.push({
+    id: "routing",
+    kind: "routing",
     generation: 0,
     recordedAt: now,
-    payload: { type: "info", message: id },
+    payload: { timestamp: now, totals: { requests: 3, upstreamCalls: 5 } },
   })
-  const batch = [
-    ...Array.from({ length: 130 }, (_, i) => activity(`batch-${i}`)),
-    activity("batch-0"),
-  ]
-  await repository.applyBatch("activity-batch", batch)
-  await repository.applyBatch("activity-batch", batch)
-  expect((await repository.get("activity", "batch-0"))?.payload).toMatchObject({
-    type: "info",
-    message: "batch-0",
+  await repository.applyBatch("counter-batch", records)
+  await repository.applyBatch("counter-batch", records)
+  expect((await repository.readUsage(0)).lifetime).toMatchObject({
+    inputTokens: 1400,
+    outputTokens: 2200,
+    requestCount: 200,
   })
-  expect(
-    await storage.read((session) =>
-      session.query({
-        sql: "SELECT count(*) AS count FROM capi_activity",
-        args: [],
-      }),
-    ),
-  ).toEqual([{ count: 130 }])
-  await repository.clear("activity")
-  await repository.applyBatch("activity-after-clear", [
-    activity("stale"),
-    { ...activity("current"), generation: 1 },
-  ])
-  expect(
-    (await repository.list("activity")).records.map((record) => record.id),
-  ).toEqual(["current"])
+  expect((await repository.readUsage(0)).buckets).toHaveLength(200)
+  expect((await repository.readRouting(0)).lifetime).toEqual({
+    requests: 3,
+    upstreamCalls: 5,
+  })
+  await expect(
+    repository.applyBatch("counter-batch", [usage(now)]),
+  ).rejects.toThrow("History batch identity conflict")
+  expect((await repository.readUsage(0)).lifetime.requestCount).toBe(200)
 })

@@ -18,6 +18,7 @@ import { migrateStorage } from "~/lib/storage/migrations"
 import { probeStorage } from "~/lib/storage/readiness"
 import { createSettingsRepository } from "~/lib/storage/settings-repository"
 import { initializeSnapshot } from "~/lib/storage/snapshot"
+import { peekHistoryRuntime } from "~/lib/telemetry-writer"
 import { validateStoredFeatureFlags } from "~/routes/feature-flags/store"
 import { validateStatsigOverrides } from "~/routes/statsig-overrides/store"
 
@@ -84,7 +85,7 @@ async function openRuntime(options: {
       },
     })
     const snapshot = await initializeSnapshot(settings)
-    let closed = false
+    let closing: Promise<void> | undefined
     const runtime: StorageRuntime = {
       storage,
       config: Object.freeze(
@@ -94,11 +95,14 @@ async function openRuntime(options: {
       ),
       settings,
       snapshot,
-      async close() {
-        if (closed) return
-        closed = true
-        if (current === runtime) current = undefined
-        await storage.close()
+      close() {
+        closing ??= (async () => {
+          const history = peekHistoryRuntime()
+          if (history?.storage === storage) await history.close(5000)
+          if (current === runtime) current = undefined
+          await storage.close()
+        })()
+        return closing
       },
     }
     current = runtime

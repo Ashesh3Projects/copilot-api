@@ -45,6 +45,7 @@ import {
 import { createHandlerLogger } from "~/lib/logger"
 import {
   applyModelFallbackToPayload,
+  getModelFallbackRedirect,
   applyModelFallbackTransition,
   createModelFallbackCredentialScope,
   runWithModelFallback,
@@ -486,7 +487,7 @@ async function handleGoogleAIInner(c: Context) {
   let customReferenceBeforeRedirect = resolveCustomGoogleModel(baseModel)
   const directModel = { model: baseModel }
   if (customReferenceBeforeRedirect && !isCount) {
-    applyModelFallbackToPayload(directModel)
+    applyModelFallbackToPayload(directModel, { effort: suffixEffort })
     customReferenceBeforeRedirect = resolveCustomGoogleModel(directModel.model)
   }
   if (customReferenceBeforeRedirect) {
@@ -497,8 +498,8 @@ async function handleGoogleAIInner(c: Context) {
       outputMode,
       rawModel,
       reasoningEffort: normalizeReasoningEffortForModel(
-        normalizeModelName(baseModel),
-        suffixEffort,
+        normalizeModelName(directModel.model),
+        getModelFallbackRedirect()?.effort ?? suffixEffort,
       ),
       reference: customReferenceBeforeRedirect,
     })
@@ -507,12 +508,20 @@ async function handleGoogleAIInner(c: Context) {
   // Apply silent model redirect. The public modelVersion remains rawModel.
   const {
     model: redirectedModel,
-    reasoningEffort,
+    reasoningEffort: redirectedEffort,
     verbosity,
   } = await resolveGoogleModelRedirect(c, rawModel)
   const modelPayload = { model: redirectedModel }
-  if (!isCount) applyModelFallbackToPayload(modelPayload)
+  if (!isCount)
+    applyModelFallbackToPayload(modelPayload, {
+      effort: redirectedEffort,
+      verbosity,
+    })
   const model = modelPayload.model
+  const reasoningEffort = normalizeReasoningEffortForModel(
+    model,
+    getModelFallbackRedirect()?.effort ?? redirectedEffort,
+  )
   const customReference = resolveCustomGoogleModel(model)
   if (customReference) {
     return await handleCustomGoogleRequest(c, {
@@ -612,7 +621,7 @@ async function handleGoogleAIInner(c: Context) {
   const candidates = await prepareChatCandidates({
     nativeMessagesOptions: {},
     reasoningEffort,
-    responsesVerbosity: verbosity,
+    responsesVerbosity: getModelFallbackRedirect()?.verbosity ?? verbosity,
     selectedModel,
     signal: c.req.raw.signal,
     source:

@@ -44,7 +44,6 @@ const MONITOR_ITEMS: Array<NavEntry> = [
   { section: "environments", label: "Environments", icon: MonitorIcon },
   { section: "llm-debug", label: "LLM Debug", icon: BugIcon },
   { section: "usage", label: "Usage", icon: ChartBarIcon },
-  { section: "activity", label: "Activity", icon: MessageSquareIcon },
 ]
 
 const CONTROL_ITEMS: Array<NavEntry> = [
@@ -107,6 +106,9 @@ async function logout(): Promise<void> {
 export function Shell({ children }: { children: ReactNode }) {
   const { section } = useHashRoute()
   const { mode, toggle } = useThemeMode()
+  const favicon = document
+    .querySelector<HTMLLinkElement>('link[rel="icon"]')
+    ?.getAttribute("href")
 
   return (
     <AppShell
@@ -120,7 +122,25 @@ export function Shell({ children }: { children: ReactNode }) {
             <SideNavHeading
               heading="Copilot API"
               subheading="Admin Dashboard"
-              icon={<CopilotIcon />}
+              icon={
+                favicon ?
+                  <img
+                    src={favicon}
+                    alt=""
+                    width={32}
+                    height={32}
+                    style={{
+                      display: "block",
+                      flexShrink: 0,
+                      boxSizing: "border-box",
+                      padding: 4,
+                      borderRadius: "var(--radius-element)",
+                      background: "var(--color-background-muted)",
+                      colorScheme: mode,
+                    }}
+                  />
+                : undefined
+              }
               headingHref="#overview"
             />
           }

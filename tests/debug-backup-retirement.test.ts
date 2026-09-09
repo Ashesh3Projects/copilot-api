@@ -88,10 +88,6 @@ async function legacyFrames(source: Storage, framed: boolean) {
       args: [],
     },
     {
-      sql: "INSERT INTO capi_activity(id,generation,created_at,expires_at,kind,payload_json,payload_bytes) VALUES('retained',0,1,9999999999999,'info','{}',2)",
-      args: [],
-    },
-    {
       sql: "INSERT INTO capi_gateway_credentials(id,digest,label,created_at) VALUES('retained-gateway',?,'Retained',0)",
       args: [gatewayDigest],
     },
@@ -109,11 +105,32 @@ async function legacyFrames(source: Storage, framed: boolean) {
     if (record.table === "capi_metadata" && record.key === '["schema_version"]')
       record.value = { key: "schema_version", value: "2" }
   }
-  records.push({
-    table: "capi_metadata",
-    key: '["history_debug_generation"]',
-    value: { key: "history_debug_generation", value: "12" },
-  })
+  records.push(
+    {
+      table: "capi_metadata",
+      key: '["history_debug_generation"]',
+      value: { key: "history_debug_generation", value: "12" },
+    },
+    {
+      table: "capi_metadata",
+      key: '["history_activity_generation"]',
+      value: { key: "history_activity_generation", value: "0" },
+    },
+    {
+      table: "capi_activity",
+      key: '["retained"]',
+      value: {
+        id: "retained",
+        generation: 0,
+        created_at: 1,
+        expires_at: 9999999999999,
+        kind: "info",
+        account_id: null,
+        payload_json: "{}",
+        payload_bytes: 2,
+      },
+    },
+  )
   const payload = JSON.stringify({
     request: privatePayload.repeat(framed ? 5000 : 1),
   })
@@ -238,7 +255,7 @@ test("new encrypted backups exclude retired debug data and metadata even if stal
     expect(plain).not.toContain("capi_debug")
     expect(plain).not.toContain("history_debug_generation")
     expect(plain).not.toContain(privatePayload)
-    expect(plain).toContain('"schemaVersion":3')
+    expect(plain).toContain('"schemaVersion":5')
   })
 })
 
@@ -275,7 +292,7 @@ test.each([false, true])(
             args: [],
           }),
           activity: await session.query({
-            sql: "SELECT id FROM capi_activity",
+            sql: "SELECT name FROM sqlite_master WHERE name='capi_activity'",
             args: [],
           }),
           usage: await session.query({
@@ -289,10 +306,10 @@ test.each([false, true])(
         }))
         expect(state.metadata).toEqual([
           { key: "config_revision", value: "2" },
-          { key: "schema_version", value: "3" },
+          { key: "schema_version", value: "5" },
         ])
         expect(state.settings).toEqual([{ namespace: "app", revision: 2 }])
-        expect(state.activity).toEqual([{ id: "retained" }])
+        expect(state.activity).toEqual([])
         expect(state.usage).toEqual([
           { input_tokens: 13, output_tokens: 17, request_count: 2 },
         ])

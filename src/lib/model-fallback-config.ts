@@ -8,6 +8,7 @@ import {
   writeSetting,
 } from "~/lib/storage/domain-settings"
 import { getRequestSnapshot } from "~/lib/storage/request-snapshot"
+import { peekStorageRuntime } from "~/lib/storage/runtime"
 
 const modelId = z
   .string()
@@ -67,6 +68,12 @@ export type ModelFallbackRule = ModelFallbackConfig["rules"][number]
 
 let testConfig: ModelFallbackConfig | undefined
 let testRevision = 0
+
+export function getModelFallbackConfigForRoutingSafety(): ModelFallbackConfig {
+  return testConfig || peekStorageRuntime() ?
+      getLoadedModelFallbackConfig()
+    : validateModelFallbackConfig({})
+}
 
 export function validateModelFallbackConfig(
   value: unknown,

@@ -151,42 +151,10 @@ async function main() {
     })
     check(dashboard.status === 200, "protected administrator account listing")
     await dashboard.arrayBuffer()
-    phase = "diagnostic-batches"
     const history = peekHistoryRuntime()
     check(history, "history initialized")
     await history.writer.flush()
     const now = Date.now()
-    const diagnostics: Array<HistoryRecord> = Array.from(
-      { length: 100 },
-      (_, index): HistoryRecord => ({
-        id: `smoke-activity-${index}`,
-        kind: "activity" as const,
-        generation: history.generations.activity,
-        recordedAt: now,
-        payload: { type: "info", message: "synthetic smoke activity" },
-      }),
-    )
-    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
-    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
-    const rows = await namespace.storage.read((sql) =>
-      sql.query({
-        sql: "SELECT count(*) AS count FROM capi_activity WHERE id LIKE 'smoke-%'",
-        args: [],
-      }),
-    )
-    check(rows[0]?.count === 100, "batched diagnostic count and receipt replay")
-    await history.clear("activity")
-    await history.repository.applyBatch("smoke-delayed-activity", diagnostics)
-    const cleared = await namespace.storage.read((sql) =>
-      sql.query({
-        sql: "SELECT count(*) AS count FROM capi_activity",
-        args: [],
-      }),
-    )
-    check(
-      cleared[0]?.count === 0,
-      "cleared generation rejects stale activity batch",
-    )
     phase = "counter-batches"
     const counterBatch: Array<HistoryRecord> = Array.from(
       { length: 100 },

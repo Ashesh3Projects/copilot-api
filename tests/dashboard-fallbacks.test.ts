@@ -5,6 +5,11 @@ import {
   setModelFallbackConfigForTest,
   validateModelFallbackConfig,
 } from "../src/lib/model-fallback-config"
+import {
+  addModelRedirect,
+  loadModelRedirects,
+  setModelRedirectsForTest,
+} from "../src/lib/model-redirect"
 import { DASHBOARD_HTML } from "../src/routes/dashboard/page-generated"
 import { server } from "../src/server"
 import {
@@ -22,11 +27,82 @@ beforeAll(async () => {
 
 beforeEach(() => {
   setModelFallbackConfigForTest(validateModelFallbackConfig({}))
+  setModelRedirectsForTest([])
 })
 
 afterAll(async () => {
   setModelFallbackConfigForTest(null)
+  setModelRedirectsForTest([])
   await resetTestAdminSession()
+})
+
+test("dashboard reports mixed routing loops and automatically clears warnings after correction", async () => {
+  setModelRedirectsForTest([
+    {
+      id: "back",
+      sourceModel: "b",
+      sourceEffort: "all",
+      targetModel: "a",
+      enabled: true,
+    },
+  ])
+  setModelFallbackConfigForTest(
+    validateModelFallbackConfig({
+      enabled: true,
+      rules: [
+        { id: "fallback", sourceModel: "a", targetModel: "b", enabled: true },
+      ],
+    }),
+  )
+  const headers = adminHeaders(adminSession, false)
+  const response = await server.request("/dashboard/api/model-routing-safety", {
+    headers,
+  })
+  expect(response.status).toBe(200)
+  expect(await response.json()).toMatchObject({
+    safe: false,
+    loop: { kind: "combined", models: ["a", "b", "a"] },
+  })
+  const fallbacks = await server.request("/dashboard/api/fallbacks", {
+    headers,
+  })
+  expect(await fallbacks.json()).toMatchObject({ safety: { safe: false } })
+  setModelRedirectsForTest([])
+  const corrected = await server.request(
+    "/dashboard/api/model-routing-safety",
+    { headers },
+  )
+  expect(await corrected.json()).toEqual({ safe: true })
+})
+
+test("persisted fallback mutations return safety for the committed settings", async () => {
+  setModelFallbackConfigForTest(null)
+  await loadModelRedirects()
+  await addModelRedirect("stored-b", "stored-a")
+  const config = validateModelFallbackConfig({
+    enabled: true,
+    rules: [
+      {
+        id: "stored",
+        sourceModel: "stored-a",
+        targetModel: "stored-b",
+        enabled: true,
+      },
+    ],
+  })
+  const update = await server.request("/dashboard/api/fallbacks", {
+    method: "PUT",
+    headers: adminHeaders(adminSession),
+    body: JSON.stringify(config),
+  })
+  expect(update.status).toBe(200)
+  expect(await update.json()).toMatchObject({ config, safety: { safe: false } })
+  const correction = await server.request("/dashboard/api/fallbacks", {
+    method: "PUT",
+    headers: adminHeaders(adminSession),
+    body: JSON.stringify({ ...config, rules: [] }),
+  })
+  expect(await correction.json()).toMatchObject({ safety: { safe: true } })
 })
 
 test("fallback settings require dashboard authentication", async () => {
@@ -86,12 +162,20 @@ test("fallback PUT saves rules and settings and GET returns them", async () => {
     body: JSON.stringify(config),
   })
   expect(update.status).toBe(200)
-  expect(await update.json()).toEqual({ config, cache: { entries: 0 } })
+  expect(await update.json()).toEqual({
+    config,
+    cache: { entries: 0 },
+    safety: { safe: true },
+  })
 
   const read = await server.request("/dashboard/api/fallbacks", {
     headers: adminHeaders(adminSession, false),
   })
-  expect(await read.json()).toEqual({ config, cache: { entries: 0 } })
+  expect(await read.json()).toEqual({
+    config,
+    cache: { entries: 0 },
+    safety: { safe: true },
+  })
 })
 
 test("invalid fallback requests cannot replace the active configuration", async () => {
@@ -165,7 +249,7 @@ test("dashboard bundle exposes fallback settings, bounded chains, and notice lim
   expect(DASHBOARD_HTML).toContain("Enable fallbacks")
   expect(DASHBOARD_HTML).toContain("3 fallback hops (4 model attempts)")
   expect(DASHBOARD_HTML).toContain("Each hop requires HTTP 422")
-  expect(DASHBOARD_HTML).toContain("Loops stop before retrying a model")
+  expect(DASHBOARD_HTML).toContain("pauses all redirects and fallbacks")
   expect(DASHBOARD_HTML).not.toContain("fallback rules do not form a chain")
   expect(DASHBOARD_HTML).toContain(
     "Keep using the fallback for the same conversation",

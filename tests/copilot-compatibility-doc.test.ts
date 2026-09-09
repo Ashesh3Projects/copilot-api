@@ -425,7 +425,7 @@ async function deriveCompatibilityMatrix(): Promise<{
     })
     expect(
       (await getLlmDebugLog(debugId))?.request.headers["Copilot-Session-Token"],
-    ).toBe("[REDACTED]")
+    ).toBe(token)
   } finally {
     await clearLlmDebugLogs()
   }
