@@ -318,14 +318,16 @@ describe("responses websocket upgrade handling", () => {
 
   test("captures canonical native Messages headers in upgrade state", async () => {
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": " beta-one, beta-two, beta-one ",
+      "anthropic-beta":
+        " interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14 ",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
       "x-request-id": "req-ws-headers",
     })
 
     expect(readNativeMessagesOptions(ws.data)).toEqual({
-      anthropicBeta: "beta-one,beta-two",
+      anthropicBeta:
+        "interleaved-thinking-2025-05-14,context-management-2025-06-27",
       anthropicVersion: "2024-01-01",
       modelProviderPreference: "anthropic",
     })
@@ -2591,7 +2593,8 @@ describe("responses websocket message handling", () => {
     installWebSocketEndpoint("/v1/messages")
     queuedResponses.push(createAnthropicMessageResponse("msg_ws_headers"))
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one, beta-two, beta-one",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14",
       "anthropic-version": "2024-01-01",
       "x-client-session-id": "ws-native-session",
       "x-model-provider-preference": "anthropic",
@@ -2610,7 +2613,9 @@ describe("responses websocket message handling", () => {
     )
 
     const headers = capturedUpstreamHeaders[0]
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2024-01-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
     expect(headers.get("x-request-id")).toBe("req-ws-native:1")
@@ -2638,7 +2643,8 @@ describe("responses websocket message handling", () => {
           model: "gpt-5.4",
           input: "one",
           headers: {
-            "anthropic-beta": "beta-one,beta-one",
+            "anthropic-beta":
+              "interleaved-thinking-2025-05-14,interleaved-thinking-2025-05-14",
             "anthropic-version": "2024-01-01",
             "x-model-provider-preference": "anthropic",
             authorization: "Bearer must-not-pass",
@@ -2661,7 +2667,9 @@ describe("responses websocket message handling", () => {
 
     expect(capturedUpstreamHeaders).toHaveLength(2)
     for (const headers of capturedUpstreamHeaders) {
-      expect(headers.get("anthropic-beta")).toBe("beta-one")
+      expect(headers.get("anthropic-beta")).toBe(
+        "interleaved-thinking-2025-05-14",
+      )
       expect(headers.get("anthropic-version")).toBe("2024-01-01")
       expect(headers.get("x-model-provider-preference")).toBe("anthropic")
       expect(headers.get("authorization")).not.toBe("Bearer must-not-pass")
@@ -2695,7 +2703,8 @@ describe("responses websocket message handling", () => {
       createAnthropicMessageResponse("msg_ws_redirect", targetModel),
     )
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one, beta-two",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27",
       "anthropic-version": "2024-01-01",
       "x-client-session-id": "ws-redirect-session",
       "x-model-provider-preference": "anthropic",
@@ -2725,7 +2734,9 @@ describe("responses websocket message handling", () => {
       .find((frame) => frame.type === "response.completed")
     expect(completed?.response?.model).toBe(requestedModel)
     const headers = capturedUpstreamHeaders[0]
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2024-01-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
     expect(headers.get("x-request-id")).toBe("req-ws-redirect:1")
@@ -2746,7 +2757,8 @@ describe("responses websocket message handling", () => {
       createAnthropicMessageResponse("msg_ws_retry"),
     )
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one, beta-two",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
       "x-request-id": "req-ws-retry",
@@ -2765,7 +2777,9 @@ describe("responses websocket message handling", () => {
 
     expect(capturedUpstreamHeaders).toHaveLength(2)
     for (const headers of capturedUpstreamHeaders) {
-      expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+      expect(headers.get("anthropic-beta")).toBe(
+        "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+      )
       expect(headers.get("anthropic-version")).toBe("2024-01-01")
       expect(headers.get("x-model-provider-preference")).toBe("anthropic")
       expect(headers.get("x-request-id")).toBe("req-ws-retry:1")
@@ -2810,7 +2824,7 @@ describe("responses websocket message handling", () => {
     state.models = responsesCapableModels
     queuedResponses.push(createResponsesSseResponse("resp_ws_no_headers"))
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one",
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
     })
@@ -2836,7 +2850,7 @@ describe("responses websocket message handling", () => {
     installWebSocketEndpoint("/chat/completions")
     queuedResponses.push(createChatCompletionsSseResponse())
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one",
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
     })
@@ -4024,7 +4038,7 @@ describe("responses websocket upstream handling", () => {
       }
     }
     ws.data.effectiveNativeMessagesOptions = {
-      anthropicBeta: "beta-one",
+      anthropicBeta: "interleaved-thinking-2025-05-14",
     }
     ws.data.responseSnapshots.set("resp_close_state", {
       model: "gpt-5.4",
@@ -4482,7 +4496,8 @@ describe("responses websocket warmup handling", () => {
   test("preserves native header options across warmup continuation", async () => {
     installWebSocketEndpoint("/v1/messages")
     const ws = await createUpgradedTestWebSocket({
-      "anthropic-beta": "beta-one, beta-two",
+      "anthropic-beta":
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27",
       "anthropic-version": "2024-01-01",
       "x-client-session-id": "ws-warmup-session",
       "x-model-provider-preference": "anthropic",
@@ -4522,7 +4537,9 @@ describe("responses websocket warmup handling", () => {
     )
 
     const headers = capturedUpstreamHeaders[0]
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2024-01-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
     expect(headers.get("x-request-id")).toBe("req-ws-warmup:2")

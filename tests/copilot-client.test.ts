@@ -201,6 +201,126 @@ test("uses one current API version and the configured integration id", () => {
   expect(headers["Copilot-Harness-Id"]).toBe("copilot-sdk")
 })
 
+test("builds only supported Copilot betas from Claude Desktop flags", () => {
+  const headers = copilotHeaders({
+    anthropicBeta:
+      "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,tool-search-tool-2025-10-19,effort-2025-11-24",
+  })
+
+  expect(headers["Anthropic-Beta"]).toBe(
+    "claude-code-20250219,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20",
+  )
+})
+
+test.each([
+  "adaptive-thinking-2026-01-28",
+  "advisor-tool-2026-03-01",
+  "advanced-tool-use-2025-11-20",
+  "claude-code-20250219",
+  "compact-2026-01-12",
+  "computer-use-2025-01-24",
+  "computer-use-2025-11-24",
+  "context-management-2025-06-27",
+  "fallback-credit-2026-07-01",
+  "fine-grained-tool-streaming-2025-05-14",
+  "interleaved-thinking-2025-05-14",
+  "mid-conv-tool-change-2026-07-01",
+  "mid-conversation-system-2026-04-07",
+  "task-budgets-2026-03-13",
+  "thinking-binding-controls-2026-08-01",
+  "token-efficient-tools-2025-02-19",
+])("retains supported beta %s while dropping unknown siblings", (beta) => {
+  const headers = copilotHeaders({
+    anthropicBeta: `unknown-beta, ${beta}, ${beta}`,
+  })
+  expect(headers["Anthropic-Beta"]).toBe(beta)
+})
+
+test.each([
+  "unknown-beta",
+  "INTERLEAVED-THINKING-2025-05-14",
+  "files-api-2025-04-14,code-execution-2025-08-25,mcp-client-2025-11-20,skills-2025-10-02,web-fetch-2025-09-10,output-128k-2025-02-19",
+  "context-1m-2025-08-07,effort-2025-11-24,prompt-caching-2024-07-31,pdfs-2024-09-25,token-counting-2024-11-01",
+])("omits Anthropic-Beta when no flags are supported: %s", (anthropicBeta) => {
+  expect(copilotHeaders({ anthropicBeta })).not.toHaveProperty("Anthropic-Beta")
+})
+
+test("deduplicates supported tool aliases before enforcing header limits", () => {
+  const headers = copilotHeaders({
+    anthropicBeta: [
+      ...Array<string>(80).fill("unknown-future-beta"),
+      " tool-search-tool-2025-10-19 ",
+      "tool-examples-2025-10-29",
+      "advanced-tool-use-2025-11-20",
+      "interleaved-thinking-2025-05-14",
+    ].join(","),
+  })
+  expect(headers["Anthropic-Beta"]).toBe(
+    "advanced-tool-use-2025-11-20,interleaved-thinking-2025-05-14",
+  )
+})
+
+test.each(["record", "Headers", "tuples"] as const)(
+  "filters %s headers before every Copilot send and debug capture",
+  async (representation) => {
+    queuedResults.push(
+      new Response("retry", { status: 503, headers: { "retry-after": "0" } }),
+      Response.json({ ok: true }),
+    )
+    const rawHeaders = {
+      Authorization: "Bearer test-upstream-token",
+      "content-type": "application/json",
+      "X-Request-Id": "allowlist-regression",
+      "X-Client-Machine-Id": "desktop-test",
+      "Copilot-Session-Token": "opaque-session-token",
+      "aNtHrOpIc-BeTa":
+        "interleaved-thinking-2025-05-14,tool-search-tool-2025-10-19,files-api-2025-04-14,unknown-beta",
+      "anthropic-version": "2023-06-01",
+      Cookie: "client-only-cookie",
+      "X-Api-Key": "client-only-key",
+      "X-Stainless-Retry-Count": "2",
+      "Anthropic-Dangerous-Direct-Browser-Access": "true",
+      "X-Unreviewed-Header": "client-only-value",
+    }
+    let headers: RequestInit["headers"] = rawHeaders
+    if (representation === "Headers") headers = new Headers(rawHeaders)
+    if (representation === "tuples") headers = Object.entries(rawHeaders)
+
+    const response = await copilotFetch("/v1/messages", {
+      method: "POST",
+      body: "{}",
+      headers,
+    })
+    await response.text()
+
+    expect(response.status).toBe(200)
+    expect(capturedRequests).toHaveLength(2)
+    for (const request of capturedRequests) {
+      expect(Object.fromEntries(new Headers(request.init?.headers))).toEqual({
+        authorization: "Bearer test-upstream-token",
+        "content-type": "application/json",
+        "x-request-id": "allowlist-regression",
+        "x-client-machine-id": "desktop-test",
+        "copilot-session-token": "opaque-session-token",
+        "anthropic-beta":
+          "interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20",
+        "anthropic-version": "2023-06-01",
+      })
+    }
+    const logs = await listLlmDebugLogs({ limit: 10 })
+    expect(logs.entries).toHaveLength(2)
+    for (const entry of logs.entries) {
+      const log = await getLlmDebugLog(entry.id)
+      const captured = new Headers(log?.request.headers)
+      expect(captured.get("anthropic-beta")).toBe(
+        "interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20",
+      )
+      expect(captured.has("cookie")).toBe(false)
+      expect(captured.has("x-unreviewed-header")).toBe(false)
+    }
+  },
+)
+
 test("does not exchange or retry an immutable public OAuth token after a 401", async () => {
   queuedResults.push(new Response("Unauthorized", { status: 401 }))
 
@@ -516,7 +636,7 @@ test("keeps conversation identity stable while preserving task attribution", () 
 
 test("maps only typed attribution and header options", () => {
   const headers = copilotHeaders({
-    anthropicBeta: " beta-feature ",
+    anthropicBeta: " interleaved-thinking-2025-05-14 ",
     anthropicVersion: " 2023-06-01 ",
     attribution: {
       clientExperimentAssignment: "client_flight:1;",
@@ -533,7 +653,7 @@ test("maps only typed attribution and header options", () => {
   })
 
   expect(headers).toMatchObject({
-    "Anthropic-Beta": "beta-feature",
+    "Anthropic-Beta": "interleaved-thinking-2025-05-14",
     "anthropic-version": "2023-06-01",
     "Copilot-Harness-Id": "copilot",
     "Copilot-Session-Token": "session-token",
@@ -576,7 +696,7 @@ test("drops every C0 and C1 control from every typed Copilot header", () => {
       (value: string) => `${value}${control}`,
     ]) {
       const headers = copilotHeaders({
-        anthropicBeta: invalid("beta-feature"),
+        anthropicBeta: invalid("interleaved-thinking-2025-05-14"),
         anthropicVersion: invalid("2026-08"),
         attribution: {
           agentTaskId: invalid("task-id"),

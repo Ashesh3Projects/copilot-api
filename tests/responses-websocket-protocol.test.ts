@@ -255,7 +255,7 @@ describe("parseResponsesWebSocketFrame", () => {
 describe("mergeEffectiveNativeMessagesOptions", () => {
   test("merges supplied sanitized fields into a fresh object", () => {
     const current = {
-      anthropicBeta: "beta-one",
+      anthropicBeta: "interleaved-thinking-2025-05-14",
       anthropicVersion: "2023-06-01",
       modelProviderPreference: "anthropic",
     }
@@ -264,7 +264,7 @@ describe("mergeEffectiveNativeMessagesOptions", () => {
     })
 
     expect(merged).toEqual({
-      anthropicBeta: "beta-one",
+      anthropicBeta: "interleaved-thinking-2025-05-14",
       anthropicVersion: "2024-01-01",
       modelProviderPreference: "anthropic",
     })

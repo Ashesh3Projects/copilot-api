@@ -1030,6 +1030,43 @@ test("forwards canonical beta, anthropic version, and provider preference on nat
   )
 })
 
+test("filters Claude Desktop beta flags and client-only headers on native Messages", async () => {
+  state.models = nativeMessagesModels
+  const response = await seedProtocolDatabase().then(() =>
+    server.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PROTOCOL_GATEWAY_KEY}`,
+        "content-type": "application/json",
+        "anthropic-beta":
+          "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,tool-search-tool-2025-10-19,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-client-machine-id": "desktop-header-test",
+        cookie: "client-only-cookie",
+        "x-stainless-runtime": "node",
+        "x-unreviewed-header": "client-only-value",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.8",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    }),
+  )
+
+  expect(response.status).toBe(200)
+  expect(lastUpstreamUrl).toContain("/v1/messages")
+  expect(lastUpstreamHeaders?.get("anthropic-beta")).toBe(
+    "claude-code-20250219,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20",
+  )
+  expect(lastUpstreamHeaders?.get("x-client-machine-id")).toBe(
+    "desktop-header-test",
+  )
+  expect(lastUpstreamHeaders?.get("cookie")).toBeNull()
+  expect(lastUpstreamHeaders?.get("x-stainless-runtime")).toBeNull()
+  expect(lastUpstreamHeaders?.get("x-unreviewed-header")).toBeNull()
+})
+
 test("forwards native Messages headers when a dual-endpoint model selects native", async () => {
   state.models = nativeMessagesModels
 

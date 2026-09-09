@@ -412,7 +412,8 @@ test("passes explicit native options through the Responses Messages bridge", asy
 
     const result = await executeResponsesMessagesBridge({
       nativeOptions: {
-        anthropicBeta: "beta-one, beta-two, beta-one",
+        anthropicBeta:
+          "interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14",
         anthropicVersion: "2023-06-01",
         modelProviderPreference: "anthropic",
         requestedModel: "requested-alias",
@@ -425,7 +426,9 @@ test("passes explicit native options through the Responses Messages bridge", asy
     })
 
     expect(result.model).toBe("requested-alias")
-    expect(headers?.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers?.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers?.get("anthropic-version")).toBe("2023-06-01")
     expect(headers?.get("x-model-provider-preference")).toBe("anthropic")
   } finally {

@@ -295,7 +295,8 @@ test("count_tokens drops malformed optional controls and invalid optional header
 test("count_tokens forwards prepared native headers", async () => {
   const response = await requestCountTokens({
     headers: {
-      "anthropic-beta": " beta-one, beta-two, beta-one ",
+      "anthropic-beta":
+        " interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14 ",
       "anthropic-version": "2024-01-01",
       "x-model-provider-preference": "anthropic",
     },
@@ -303,9 +304,29 @@ test("count_tokens forwards prepared native headers", async () => {
 
   expect(response.status).toBe(200)
   const headers = capturedRequests[0]?.headers
-  expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+  expect(headers.get("anthropic-beta")).toBe(
+    "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+  )
   expect(headers.get("anthropic-version")).toBe("2024-01-01")
   expect(headers.get("x-model-provider-preference")).toBe("anthropic")
+})
+
+test("count_tokens filters unsupported beta flags before native dispatch", async () => {
+  const response = await requestCountTokens({
+    headers: {
+      "anthropic-beta":
+        "tool-search-tool-2025-10-19,context-1m-2025-08-07,interleaved-thinking-2025-05-14,files-api-2025-04-14,unknown-beta",
+      "x-stainless-runtime": "node",
+    },
+  })
+
+  expect(response.status).toBe(200)
+  expect(capturedRequests).toHaveLength(1)
+  expect(capturedRequests[0]?.path).toBe("/v1/messages/count_tokens")
+  expect(capturedRequests[0]?.headers.get("anthropic-beta")).toBe(
+    "advanced-tool-use-2025-11-20,interleaved-thinking-2025-05-14",
+  )
+  expect(capturedRequests[0]?.headers.get("x-stainless-runtime")).toBeNull()
 })
 
 test("count_tokens uses the redirected target model upstream", async () => {

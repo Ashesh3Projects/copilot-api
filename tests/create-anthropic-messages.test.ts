@@ -710,7 +710,8 @@ test("preserves native fields and forwards canonical prepared headers", async ()
   const originalPayload = structuredClone(payload)
 
   await createAnthropicMessages(payload, {
-    anthropicBeta: " beta-one,beta-two, beta-one ",
+    anthropicBeta:
+      " interleaved-thinking-2025-05-14,context-management-2025-06-27, interleaved-thinking-2025-05-14 ",
     anthropicVersion: " 2023-06-01 ",
     modelProviderPreference: " anthropic ",
   })
@@ -726,7 +727,9 @@ test("preserves native fields and forwards canonical prepared headers", async ()
   })
   expect(capturedBody).not.toHaveProperty("_gateway_compaction")
   expect(capturedBody).not.toHaveProperty("_json_schema")
-  expect(capturedHeaders?.get("anthropic-beta")).toBe("beta-one,beta-two")
+  expect(capturedHeaders?.get("anthropic-beta")).toBe(
+    "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+  )
   expect(capturedHeaders?.get("anthropic-version")).toBe("2023-06-01")
   expect(capturedHeaders?.get("x-model-provider-preference")).toBe("anthropic")
 })
@@ -761,7 +764,8 @@ test("preserves beta, anthropic version, and provider preference on transport re
       messages: [{ role: "user", content: "hello" }],
     },
     {
-      anthropicBeta: "beta-one, beta-two, beta-one",
+      anthropicBeta:
+        "interleaved-thinking-2025-05-14, context-management-2025-06-27, interleaved-thinking-2025-05-14",
       anthropicVersion: "2023-06-01",
       modelProviderPreference: "anthropic",
     },
@@ -769,7 +773,9 @@ test("preserves beta, anthropic version, and provider preference on transport re
 
   expect(capturedHeaderAttempts).toHaveLength(2)
   for (const headers of capturedHeaderAttempts) {
-    expect(headers.get("anthropic-beta")).toBe("beta-one,beta-two")
+    expect(headers.get("anthropic-beta")).toBe(
+      "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+    )
     expect(headers.get("anthropic-version")).toBe("2023-06-01")
     expect(headers.get("x-model-provider-preference")).toBe("anthropic")
   }
@@ -804,10 +810,13 @@ test("retains valid beta siblings when another segment is invalid", async () => 
   } as AnthropicMessagesPayload
 
   await createAnthropicMessages(payload, {
-    anthropicBeta: "safe-beta,bad\u0001beta,safe-beta",
+    anthropicBeta:
+      "interleaved-thinking-2025-05-14,bad\u0001beta,interleaved-thinking-2025-05-14",
   })
 
-  expect(capturedHeaders?.get("anthropic-beta")).toBe("safe-beta")
+  expect(capturedHeaders?.get("anthropic-beta")).toBe(
+    "interleaved-thinking-2025-05-14",
+  )
 })
 
 test("uses one prepared snapshot when the caller mutates after invocation", async () => {
