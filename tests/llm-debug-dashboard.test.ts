@@ -127,6 +127,7 @@ test("serves LLM debug logs through dashboard API", async () => {
     headers: adminHeaders(adminSession, false),
   })
   expect(listResponse.status).toBe(200)
+  expect(listResponse.headers.get("cache-control")).toBe("no-store")
   const listBody = (await listResponse.json()) as {
     entries: Array<{ id: string; requestPreview: string }>
   }
@@ -140,6 +141,7 @@ test("serves LLM debug logs through dashboard API", async () => {
     },
   )
   expect(detailResponse.status).toBe(200)
+  expect(detailResponse.headers.get("cache-control")).toBe("no-store")
   const detailBody = (await detailResponse.json()) as {
     request: {
       body: string | null
@@ -170,6 +172,7 @@ test("serves LLM debug logs through dashboard API", async () => {
     method: "DELETE",
   })
   expect(clearResponse.status).toBe(200)
+  expect(clearResponse.headers.get("cache-control")).toBe("no-store")
 
   const afterClearResponse = await server.request("/dashboard/api/llm-debug", {
     headers: adminHeaders(adminSession, false),
@@ -190,6 +193,55 @@ test("dashboard bundle ships the LLM debug UI", () => {
   expect(DASHBOARD_HTML).toContain("contain:layout paint")
   expect(DASHBOARD_HTML).not.toContain("Reformatted, not exact bytes")
   expect(DASHBOARD_HTML).not.toContain("Quick Add: Nebius Qwen3 Embedding")
+})
+
+test("dashboard debug pagination serves distinct pages from memory", async () => {
+  const startedAtMs = Date.now()
+  const ids = Array.from({ length: 3 }, () =>
+    startLlmDebugLog({
+      method: "POST",
+      path: "/responses",
+      requestHeaders: {},
+      requestBody: "{}",
+      url: "https://example.test/responses",
+      startedAtMs,
+    }),
+  )
+    .sort()
+    .reverse()
+  const firstResponse = await server.request(
+    "/dashboard/api/llm-debug?limit=2",
+    {
+      headers: adminHeaders(adminSession, false),
+    },
+  )
+  const first = (await firstResponse.json()) as {
+    cursor: string
+    entries: Array<{ id: string }>
+  }
+  expect(first.entries.map((entry) => entry.id)).toEqual(ids.slice(0, 2))
+  const secondResponse = await server.request(
+    `/dashboard/api/llm-debug?limit=2&cursor=${encodeURIComponent(first.cursor)}`,
+    {
+      headers: adminHeaders(adminSession, false),
+    },
+  )
+  const second = (await secondResponse.json()) as {
+    cursor: string | null
+    entries: Array<{ id: string }>
+  }
+  expect(second.entries.map((entry) => entry.id)).toEqual(ids.slice(2))
+  expect(second.cursor).toBeNull()
+})
+
+test("dashboard rejects invalid debug pagination without caching the response", async () => {
+  for (const query of ["cursor=invalid", "limit=invalid", "limit=Infinity"]) {
+    const response = await server.request(`/dashboard/api/llm-debug?${query}`, {
+      headers: adminHeaders(adminSession, false),
+    })
+    expect(response.status).toBe(400)
+    expect(response.headers.get("cache-control")).toBe("no-store")
+  }
 })
 
 test("replays a chat completions debug log with fresh auth and parses SSE metadata", async () => {
@@ -222,6 +274,7 @@ test("replays a chat completions debug log with fresh auth and parses SSE metada
   )
 
   expect(response.status).toBe(200)
+  expect(response.headers.get("cache-control")).toBe("no-store")
   const body = (await response.json()) as {
     finishReason: string
     responseId: string
@@ -253,6 +306,7 @@ test("rejects invalid replay requests", async () => {
     },
   )
   expect(missingResponse.status).toBe(404)
+  expect(missingResponse.headers.get("cache-control")).toBe("no-store")
 
   const embeddingsId = startLlmDebugLog({
     method: "POST",

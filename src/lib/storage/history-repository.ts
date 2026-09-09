@@ -11,7 +11,17 @@ import type {
   PendingHistoryRecord,
 } from "~/lib/telemetry-writer"
 
-export type DiagnosticKind = "activity" | "debug"
+export type DiagnosticKind = "activity"
+export function isHistoryRecordKind(
+  value: unknown,
+): value is HistoryRecord["kind"] {
+  return (
+    value === "usage"
+    || value === "routing"
+    || value === "activity"
+    || value === "collection-gap"
+  )
+}
 export interface HistoryPageOptions {
   limit?: number
   cursor?: string
@@ -267,86 +277,58 @@ async function applyRoutingBatch(
   })
 }
 function diagnosticExpiry(record: HistoryRecord): number {
-  if (record.kind === "activity") return record.recordedAt + 7 * 86400_000
-  const p = historyObject(record.payload)
-  const completed = p.status === "complete" || p.status === "completed"
-  return (
-    number(p.startedAtMs ?? p.updatedAt ?? record.recordedAt)
-    + (completed ? 10 : 60) * 60_000
-  )
+  return record.recordedAt + 7 * 86400_000
+}
+function validateDiagnosticKind(kind: unknown): void {
+  if (kind !== "activity") throw new Error("Unsupported diagnostic kind")
 }
 async function applyDiagnostics(
   session: SqlSession,
   records: ReadonlyArray<HistoryRecord>,
 ) {
-  for (const kind of ["activity", "debug"] as const) {
-    const selected = records.filter((record) => record.kind === kind)
-    if (selected.length === 0) continue
-    const current = await generation(session, kind)
-    const rows = selected
-      .filter((record) => record.generation === current)
-      .map((record) => {
-        const payload = JSON.stringify(record.payload)
-        const bytes = Buffer.byteLength(payload)
-        const p = historyObject(record.payload)
-        return kind === "activity" ?
-            [
-              record.id,
-              record.generation,
-              record.recordedAt,
-              diagnosticExpiry(record),
-              typeof p.type === "string" ? p.type : "info",
-              payload,
-              bytes,
-            ]
-          : [
-              record.id,
-              record.generation,
-              record.recordedAt,
-              number(p.updatedAt ?? record.recordedAt),
-              diagnosticExpiry(record),
-              typeof p.status === "string" ? p.status : "pending",
-              p.replayable === true ? 1 : 0,
-              payload,
-              bytes,
-            ]
-      })
-    const columns =
-      kind === "activity" ?
-        "id,generation,created_at,expires_at,kind,payload_json,payload_bytes"
-      : "id,generation,created_at,updated_at,expires_at,status,replayable,payload_json,payload_bytes"
-    const width = columns.split(",").length
-    const chunkSize = Math.floor(900 / width)
-    const conflict =
-      kind === "activity" ? "DO NOTHING" : (
-        "DO UPDATE SET updated_at = excluded.updated_at, expires_at = excluded.expires_at, status = excluded.status, replayable = excluded.replayable, payload_json = excluded.payload_json, payload_bytes = excluded.payload_bytes WHERE excluded.updated_at >= updated_at"
-      )
-    for (let offset = 0; offset < rows.length; offset += chunkSize) {
-      const chunk = rows.slice(offset, offset + chunkSize)
-      const placeholders = chunk
-        .map(() => `(${Array.from({ length: width }, () => "?").join(",")})`)
-        .join(",")
-      await session.execute({
-        sql: `INSERT INTO ${kind === "activity" ? "capi_activity" : "capi_debug"} (${columns}) VALUES ${placeholders} ON CONFLICT(id) ${conflict}`,
-        args: chunk.flat(),
-      })
-    }
+  const selected = records.filter((record) => record.kind === "activity")
+  if (selected.length === 0) return
+  const current = await generation(session, "activity")
+  const rows = selected
+    .filter((record) => record.generation === current)
+    .map((record) => {
+      const payload = JSON.stringify(record.payload)
+      const bytes = Buffer.byteLength(payload)
+      const p = historyObject(record.payload)
+      return [
+        record.id,
+        record.generation,
+        record.recordedAt,
+        diagnosticExpiry(record),
+        typeof p.type === "string" ? p.type : "info",
+        payload,
+        bytes,
+      ]
+    })
+  const columns =
+    "id,generation,created_at,expires_at,kind,payload_json,payload_bytes"
+  const width = columns.split(",").length
+  const chunkSize = Math.floor(900 / width)
+  for (let offset = 0; offset < rows.length; offset += chunkSize) {
+    const chunk = rows.slice(offset, offset + chunkSize)
+    const placeholders = chunk
+      .map(() => `(${Array.from({ length: width }, () => "?").join(",")})`)
+      .join(",")
+    await session.execute({
+      sql: `INSERT INTO capi_activity (${columns}) VALUES ${placeholders} ON CONFLICT(id) DO NOTHING`,
+      args: chunk.flat(),
+    })
   }
 }
-async function pruneDiagnostics(
-  session: SqlSession,
-  kind: DiagnosticKind,
-  now: number,
-) {
-  const table = kind === "activity" ? "capi_activity" : "capi_debug"
-  const cap = kind === "activity" ? 50_000 : 2000,
-    bytes = kind === "activity" ? 64 * 1024 * 1024 : 128 * 1024 * 1024
+async function pruneDiagnostics(session: SqlSession, now: number) {
+  const cap = 50_000,
+    bytes = 64 * 1024 * 1024
   await session.execute({
-    sql: `DELETE FROM ${table} WHERE expires_at <= ?`,
+    sql: "DELETE FROM capi_activity WHERE expires_at <= ?",
     args: [now],
   })
   await session.execute({
-    sql: `DELETE FROM ${table} WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS position, SUM(payload_bytes) OVER (ORDER BY created_at DESC, id DESC) AS total_bytes FROM ${table}) WHERE position > ? OR total_bytes > ?)`,
+    sql: "DELETE FROM capi_activity WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS position, SUM(payload_bytes) OVER (ORDER BY created_at DESC, id DESC) AS total_bytes FROM capi_activity) WHERE position > ? OR total_bytes > ?)",
     args: [cap, bytes],
   })
 }
@@ -397,6 +379,8 @@ export function createHistoryRepository(
   const clock = options.now ?? Date.now
   return {
     async applyBatch(batchId, records) {
+      if (records.some((record) => !isHistoryRecordKind(record.kind)))
+        throw new Error("Unsupported history record kind")
       const digest = createHash("sha256")
         .update(JSON.stringify(records))
         .digest("hex")
@@ -421,8 +405,7 @@ export function createHistoryRepository(
             case "routing": {
               break
             }
-            case "activity":
-            case "debug": {
+            case "activity": {
               break
             }
             default: {
@@ -452,8 +435,7 @@ export function createHistoryRepository(
             sql: "UPDATE capi_process_runs SET last_flush_at = ? WHERE id = ?",
             args: [now, options.runId],
           })
-        await pruneDiagnostics(session, "activity", now)
-        await pruneDiagnostics(session, "debug", now)
+        await pruneDiagnostics(session, now)
         await session.execute({
           sql: "DELETE FROM capi_routing_minutes WHERE minute < ?",
           args: [minute(now - 86400_000)],
@@ -468,10 +450,10 @@ export function createHistoryRepository(
     async generations() {
       return storage.read(async (s) => ({
         activity: await generation(s, "activity"),
-        debug: await generation(s, "debug"),
       }))
     },
     async clear(kind) {
+      validateDiagnosticKind(kind)
       const id = randomUUID()
       try {
         return await storage.transaction(async (s) => {
@@ -481,7 +463,7 @@ export function createHistoryRepository(
             args: [String(next), `history_${kind}_generation`],
           })
           await s.execute({
-            sql: `DELETE FROM ${kind === "activity" ? "capi_activity" : "capi_debug"}`,
+            sql: "DELETE FROM capi_activity",
             args: [],
           })
           // A clear has its own receipt; it never advances configuration revision.
@@ -507,8 +489,7 @@ export function createHistoryRepository(
     },
     async prune(now) {
       await storage.transaction(async (s) => {
-        await pruneDiagnostics(s, "activity", now)
-        await pruneDiagnostics(s, "debug", now)
+        await pruneDiagnostics(s, now)
         await s.execute({
           sql: "DELETE FROM capi_routing_minutes WHERE minute < ?",
           args: [minute(now - 86400_000)],
@@ -524,10 +505,6 @@ export function createHistoryRepository(
         await s.execute({
           sql: "INSERT INTO capi_process_runs (id, started_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
           args: [id, now],
-        })
-        await s.execute({
-          sql: "UPDATE capi_debug SET status = 'interrupted', replayable = 0, payload_json = json_set(payload_json, '$.status', 'interrupted', '$.replayable', json('false')) WHERE status IN ('pending', 'streaming')",
-          args: [],
         })
       })
     },
@@ -629,6 +606,7 @@ export function createHistoryRepository(
       })
     },
     async list(kind, opts = {}, pending = []) {
+      validateDiagnosticKind(kind)
       // eslint-disable-next-line complexity -- SQL and pending overlay apply the same independent optional filters.
       return storage.read(async (s) => {
         const current = await generation(s, kind),
@@ -646,7 +624,7 @@ export function createHistoryRepository(
           args.push(opts.until)
         }
         if (opts.type) {
-          clauses.push(`${kind === "activity" ? "kind" : "status"} = ?`)
+          clauses.push("kind = ?")
           args.push(opts.type)
         }
         if (cursor) {
@@ -654,7 +632,7 @@ export function createHistoryRepository(
           args.push(cursor.timestamp, cursor.timestamp, cursor.id)
         }
         const rows = await s.query({
-          sql: `SELECT * FROM ${kind === "activity" ? "capi_activity" : "capi_debug"} WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ?`,
+          sql: `SELECT * FROM capi_activity WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ?`,
           // Pending completions can remove matching stored rows; overread the
           // bounded queue size so pagination still reaches older matches.
           args: [...args, limit + 1 + pending.length],
@@ -673,8 +651,7 @@ export function createHistoryRepository(
             if (
               (opts.since !== undefined && record.recordedAt < opts.since)
               || (opts.until !== undefined && record.recordedAt > opts.until)
-              || (opts.type
-                && p[kind === "activity" ? "type" : "status"] !== opts.type)
+              || (opts.type && p.type !== opts.type)
               || (cursor
                 && (record.recordedAt > cursor.timestamp
                   || (record.recordedAt === cursor.timestamp
@@ -700,10 +677,11 @@ export function createHistoryRepository(
     },
     // eslint-disable-next-line max-params -- Caller supplies optional fixture time independently of pending overlay.
     async get(kind, id, pending = [], now = clock()) {
+      validateDiagnosticKind(kind)
       return storage.read(async (s) => {
         const current = await generation(s, kind)
         const rows = await s.query({
-          sql: `SELECT * FROM ${kind === "activity" ? "capi_activity" : "capi_debug"} WHERE id = ? AND generation = ? AND expires_at > ?`,
+          sql: "SELECT * FROM capi_activity WHERE id = ? AND generation = ? AND expires_at > ?",
           args: [id, current, now],
         })
         let result = rows[0] ? fromRow(rows[0], kind) : null

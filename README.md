@@ -526,19 +526,22 @@ docker compose run --rm --no-deps copilot-api admin --reset
 docker compose up -d copilot-api
 ```
 
-LLM Debug stores bounded, sanitized outbound attempts in the database. URLs,
-headers, body fields, and recognized credential values are scrubbed before
-capture is queued. Successful captures expire after ten minutes; failed or
-interrupted captures after one hour. Capacity limits can evict entries sooner.
+LLM Debug keeps bounded, sanitized outbound attempts only in server memory.
+URLs, headers, body fields, and recognized credential values are scrubbed before
+capture. Successful captures expire ten minutes after the request starts; all
+other captures expire after one hour. Clear and restart remove the captures.
+Capacity limits can evict entries sooner. Captures never enter SQLite, Turso,
+or application backups. Upgrading applies migration `003`, which drops the old
+`capi_debug` table; existing external backup files are not erased.
 Replay supports complete replayable Chat Completions and Responses captures,
 obtains fresh server-side credentials, and rejects redacted, omitted, expired,
 or interrupted captures and removed or changed providers.
 
 `GET /usage` returns current Copilot quota data. Dashboard utilization instead
 uses committed minute/model usage buckets and lifetime counters; committed old
-usage is retained. Diagnostic and routing detail has bounded retention. Pending
-telemetry is bounded to 2,000 records, 16 MiB, and five minutes; pressure and
-outages may omit diagnostic bodies or lose records. Collection-gap indicators
+usage is retained. Activity and routing detail have bounded retention. Pending
+usage, routing, and Activity telemetry is bounded to 2,000 records, 16 MiB, and
+five minutes; pressure and outages may lose records. Collection-gap indicators
 report known loss and uncertainty instead of claiming complete history.
 
 Sanitized ZIP export excludes credential and history tables and replaces
@@ -983,8 +986,8 @@ returns `200` with `{ "text": "..." }`.
   to the client, ordinary logs, and Sentry with its status and content type.
   Protect their transport, retention, and access, and rotate credentials exposed
   through those channels.
-- **Protect diagnostic history.** LLM Debug stores bounded, sanitized captures
-  in the database. Prompts and non-secret response content can still be
+- **Protect diagnostic history.** LLM Debug retains bounded, sanitized captures
+  only in process memory. Prompts and non-secret response content can still be
   sensitive. Access requires an administrator session; capture retention and
   replay eligibility are limited.
 - **Use Sentry deliberately.** When `SENTRY_DSN` is set, AI prompt and completion

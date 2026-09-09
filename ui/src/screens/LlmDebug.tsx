@@ -323,7 +323,7 @@ function LlmDebugListView() {
             <ConfirmButton
               label="Clear All"
               confirmTitle="Clear all debug logs?"
-              confirmDescription="This permanently deletes every captured LLM debug log entry. This cannot be undone."
+              confirmDescription="This clears every captured LLM debug entry from memory. This cannot be undone."
               confirmActionLabel="Clear All"
               icon={<Trash2Icon />}
               onConfirm={handleClearAll}
@@ -332,6 +332,11 @@ function LlmDebugListView() {
         : undefined
       }
     >
+      <Text type="supporting" color="secondary">
+        Captures stay in server memory for 10 minutes after successful requests
+        start and 1 hour for all other requests. Restarting the server clears
+        them. Older captures may be removed earlier when memory is full.
+      </Text>
       {error ?
         <Banner
           status="error"

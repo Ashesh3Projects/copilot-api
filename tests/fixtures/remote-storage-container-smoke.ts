@@ -158,54 +158,34 @@ async function main() {
     const now = Date.now()
     const diagnostics: Array<HistoryRecord> = Array.from(
       { length: 100 },
-      (_, index): Array<HistoryRecord> => [
-        {
-          id: `smoke-activity-${index}`,
-          kind: "activity" as const,
-          generation: history.generations.activity,
-          recordedAt: now,
-          payload: { type: "info", message: "synthetic smoke activity" },
-        },
-        {
-          id: `smoke-debug-${index}`,
-          kind: "debug" as const,
-          generation: history.generations.debug,
-          recordedAt: now,
-          payload: {
-            status: "complete",
-            replayable: false,
-            startedAtMs: now,
-            updatedAt: now,
-            message: "synthetic smoke debug",
-          },
-        },
-      ],
-    ).flat()
-    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
-    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
-    for (const table of ["capi_activity", "capi_debug"]) {
-      const rows = await namespace.storage.read((sql) =>
-        sql.query({
-          sql: `SELECT count(*) AS count FROM ${table} WHERE id LIKE 'smoke-%'`,
-          args: [],
-        }),
-      )
-      check(
-        rows[0]?.count === 100,
-        "batched diagnostic count and receipt replay",
-      )
-    }
-    await history.clear("debug")
-    await history.repository.applyBatch(
-      "smoke-delayed-debug",
-      diagnostics.filter((record) => record.kind === "debug"),
+      (_, index): HistoryRecord => ({
+        id: `smoke-activity-${index}`,
+        kind: "activity" as const,
+        generation: history.generations.activity,
+        recordedAt: now,
+        payload: { type: "info", message: "synthetic smoke activity" },
+      }),
     )
+    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
+    await history.repository.applyBatch("smoke-diagnostic-batch", diagnostics)
+    const rows = await namespace.storage.read((sql) =>
+      sql.query({
+        sql: "SELECT count(*) AS count FROM capi_activity WHERE id LIKE 'smoke-%'",
+        args: [],
+      }),
+    )
+    check(rows[0]?.count === 100, "batched diagnostic count and receipt replay")
+    await history.clear("activity")
+    await history.repository.applyBatch("smoke-delayed-activity", diagnostics)
     const cleared = await namespace.storage.read((sql) =>
-      sql.query({ sql: "SELECT count(*) AS count FROM capi_debug", args: [] }),
+      sql.query({
+        sql: "SELECT count(*) AS count FROM capi_activity",
+        args: [],
+      }),
     )
     check(
       cleared[0]?.count === 0,
-      "cleared generation rejects stale debug batch",
+      "cleared generation rejects stale activity batch",
     )
     phase = "counter-batches"
     const counterBatch: Array<HistoryRecord> = Array.from(

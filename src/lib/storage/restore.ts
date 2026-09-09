@@ -7,7 +7,12 @@ import type {
   TransferProgress,
   TransferRecord,
 } from "~/lib/storage/transfer-records"
-import type { JsonValue, SqlSession, Storage } from "~/lib/storage/types"
+import type {
+  JsonValue,
+  SqlSession,
+  SqlValue,
+  Storage,
+} from "~/lib/storage/types"
 
 import {
   BACKUP_HEADER_BYTES,
@@ -21,7 +26,11 @@ import {
 } from "~/lib/storage/errors"
 import { parseStorageCounter } from "~/lib/storage/migrations"
 import { readStoreRevision } from "~/lib/storage/operations"
-import { currentSchemaVersion, currentTables } from "~/lib/storage/schema"
+import {
+  currentCounterKeys,
+  currentSchemaVersion,
+  currentTables,
+} from "~/lib/storage/schema"
 import {
   assertEmptyTransferTarget,
   insertTransferRecords,
@@ -32,6 +41,7 @@ import {
   TRANSFER_TABLES,
   TRANSFER_TIMEOUT_MS,
   transferColumns,
+  transferTablesForSchema,
   validateTransferRecord,
 } from "~/lib/storage/transfer-records"
 import { validateTransferDomains } from "~/lib/storage/transfer-validation"
@@ -59,12 +69,7 @@ export async function validateTransferredState(
     )
   )
     invalid()
-  for (const key of [
-    "config_revision",
-    "history_activity_generation",
-    "history_debug_generation",
-  ])
-    parseStorageCounter(metadata.get(key))
+  for (const key of currentCounterKeys) parseStorageCounter(metadata.get(key))
   await validateTransferDomains(session)
   // All inserts enforce the schema's foreign keys. Routing JSON has an additional stable-ID reference.
   const routing = await session.query({
@@ -120,7 +125,12 @@ class RecordDecoder {
   private pending?: PendingRecord
   private readonly singletonKeys = new Set<string>()
   private readonly digest = createHash("sha256")
+  // The metadata table arrives first; its schema row selects validation before
+  // history rows arrive. The final authenticated manifest must agree with it.
+  private sourceVersion?: number
+  private readonly tableOrder = transferTablesForSchema(2)
   readonly counts: Record<string, number> = {}
+  readonly retainedCounts: Record<string, number> = {}
   manifest?: TransferManifest
   records = 0
   private batch: Array<TransferRecord> = []
@@ -180,7 +190,7 @@ class RecordDecoder {
         invalid()
       if (
         manifest.formatVersion !== 1
-        || manifest.schemaVersion !== currentSchemaVersion
+        || manifest.schemaVersion !== this.sourceVersion
         || typeof manifest.sourceStoreId !== "string"
         || manifest.recordsSha256 !== this.digest.digest("hex")
       )
@@ -220,7 +230,7 @@ class RecordDecoder {
           if (
             typeof field.name !== "string"
             || names.has(field.name)
-            || !transferColumns(record.table).some(
+            || !transferColumns(record.table, this.sourceVersion ?? 2).some(
               (column) => column.name === field.name && column.type === "TEXT",
             )
             || value[field.name] !== null
@@ -291,8 +301,24 @@ class RecordDecoder {
     }
   }
   private async record(record: TransferRecord): Promise<void> {
-    validateTransferRecord(record)
-    const index = TRANSFER_TABLES.indexOf(record.table)
+    const value = validateTransferRecord(record, this.sourceVersion ?? 2)
+    this.validateRecordOrder(record)
+    this.counts[record.table] = (this.counts[record.table] ?? 0) + 1
+    this.records++
+    const retained = this.replacementRecord(record, value)
+    if (!retained) return
+    const bytes = Buffer.byteLength(JSON.stringify(retained))
+    if (this.batchBytes + bytes > 1024 * 1024) await this.flush()
+    this.batch.push(retained)
+    this.batchBytes += bytes
+    this.retainedCounts[retained.table] =
+      (this.retainedCounts[retained.table] ?? 0) + 1
+    // Single large fields may exceed the bounded batch budget: flush immediately.
+    if (this.batch.length >= 100 || this.batchBytes >= 1024 * 1024)
+      await this.flush()
+  }
+  private validateRecordOrder(record: TransferRecord): void {
+    const index = this.tableOrder.indexOf(record.table)
     if (index < this.tableIndex) invalid()
     const key = JSON.parse(record.key) as Array<string | number>
     if (index === this.tableIndex && this.previousKey) {
@@ -320,15 +346,36 @@ class RecordDecoder {
       if (this.singletonKeys.has(id)) invalid()
       this.singletonKeys.add(id)
     }
-    const bytes = Buffer.byteLength(JSON.stringify(record))
-    if (this.batchBytes + bytes > 1024 * 1024) await this.flush()
-    this.batch.push(record)
-    this.batchBytes += bytes
-    this.counts[record.table] = (this.counts[record.table] ?? 0) + 1
-    this.records++
-    // Single large fields may exceed the bounded batch budget: flush immediately.
-    if (this.batch.length >= 100 || this.batchBytes >= 1024 * 1024)
-      await this.flush()
+  }
+  private replacementRecord(
+    record: TransferRecord,
+    value: Readonly<Record<string, SqlValue>>,
+  ): TransferRecord | null {
+    if (record.table === "capi_metadata" && value.key === "schema_version") {
+      const version = parseStorageCounter(value.value)
+      if (version !== 2 && version !== currentSchemaVersion) invalid()
+      if (
+        version === currentSchemaVersion
+        && this.singletonKeys.has('capi_metadata:["history_debug_generation"]')
+      )
+        invalid()
+      this.sourceVersion = version
+      return {
+        ...record,
+        value: { key: "schema_version", value: String(currentSchemaVersion) },
+      }
+    }
+    // Retired records count toward the original manifest's integrity checks,
+    // but never enter a write batch or a replacement database, even temporarily.
+    if (record.table === "capi_debug") return null
+    if (
+      record.table === "capi_metadata"
+      && value.key === "history_debug_generation"
+    ) {
+      parseStorageCounter(value.value)
+      return null
+    }
+    return record
   }
   private async flush(): Promise<void> {
     if (this.batch.length === 0) return
@@ -342,7 +389,11 @@ class RecordDecoder {
   }
   finish(): void {
     if (this.buffer.length > 0 || this.pending || !this.manifest) invalid()
-    for (const key of REQUIRED_TRANSFER_METADATA_KEYS) {
+    const requiredMetadata = [
+      ...REQUIRED_TRANSFER_METADATA_KEYS,
+      ...(this.sourceVersion === 2 ? ["history_debug_generation"] : []),
+    ]
+    for (const key of requiredMetadata) {
       if (!this.singletonKeys.has(`capi_metadata:${JSON.stringify([key])}`))
         invalid()
     }
@@ -430,7 +481,7 @@ export async function discardIncompleteTransfer(
       args: [],
     })
     await session.execute({
-      sql: "UPDATE capi_metadata SET value='0' WHERE key IN ('config_revision','history_activity_generation','history_debug_generation')",
+      sql: "UPDATE capi_metadata SET value='0' WHERE key IN ('config_revision','history_activity_generation')",
       args: [],
     })
     await session.execute({
@@ -533,7 +584,7 @@ export async function restoreBackup(
       )
         invalid()
       for (const table of TRANSFER_TABLES) {
-        const count = decoder.counts[table] ?? 0
+        const count = decoder.retainedCounts[table] ?? 0
         const rows = await session.query({
           sql: `SELECT COUNT(*) AS count FROM ${table}${table === "capi_metadata" ? " WHERE key != 'transfer_incomplete'" : ""}`,
           args: [],

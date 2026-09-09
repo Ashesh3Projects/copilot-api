@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-confusing-void-expression -- Bun rejection matchers must be awaited at runtime. */
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -5,7 +6,10 @@ import { join } from "node:path"
 
 import type { HistoryRecord } from "~/lib/telemetry-writer"
 
-import { createHistoryRepository } from "~/lib/storage/history-repository"
+import {
+  createHistoryRepository,
+  type DiagnosticKind,
+} from "~/lib/storage/history-repository"
 import { LocalSqliteStorage } from "~/lib/storage/local-sqlite"
 import { migrateStorage } from "~/lib/storage/migrations"
 import { TursoStorage } from "~/lib/storage/turso"
@@ -291,62 +295,66 @@ test("routing aggregation preserves prototype-like route keys as data", async ()
   )
 })
 
-test("pending diagnostic completion removes the old status-filtered version", async () => {
-  const { repository } = await fixture()
-  const now = Date.now()
-  const record: HistoryRecord = {
-    id: "debug-update",
-    kind: "debug",
-    generation: 0,
-    recordedAt: now,
-    payload: { status: "pending", updatedAt: now },
-  }
-  await repository.applyBatch("debug-start", [record])
-  const pending = [
-    {
-      record: {
-        ...record,
-        payload: { status: "complete", updatedAt: now + 1 },
-      },
+test("durable history rejects retired debug records before opening a transaction", async () => {
+  let transactions = 0
+  const repository = createHistoryRepository({
+    read: () => {
+      throw new Error("Unexpected storage read")
     },
-  ]
-  expect(
-    (await repository.list("debug", { type: "pending" }, pending)).records,
-  ).toHaveLength(0)
-  expect(
-    (await repository.list("debug", { type: "complete" }, pending)).records,
-  ).toHaveLength(1)
+    transaction: () => {
+      transactions++
+      throw new Error("Unexpected storage transaction")
+    },
+    atomicBatch: async () => {},
+    close: async () => {},
+  })
+  await expect(
+    repository.applyBatch("retired-debug", [
+      {
+        id: "retired-debug",
+        kind: "debug",
+        generation: 0,
+        recordedAt: Date.now(),
+        payload: { request: "synthetic-private-body" },
+      } as unknown as HistoryRecord,
+    ]),
+  ).rejects.toThrow("Unsupported history record kind")
+  expect(transactions).toBe(0)
 })
 
-test("expired pending completion suppresses the older unfinished diagnostic", async () => {
-  const { repository } = await fixture()
-  const now = Date.now()
-  const record: HistoryRecord = {
-    id: "debug-expired",
-    kind: "debug",
-    generation: 0,
-    recordedAt: now - 11 * 60000,
-    payload: {
-      status: "pending",
-      startedAtMs: now - 11 * 60000,
-      updatedAt: now,
-    },
-  }
-  await repository.applyBatch("expired-start", [record])
-  const pending = [
+test("retired debug diagnostic calls cannot read or clear activity history", async () => {
+  const { repository, storage } = await fixture()
+  await repository.applyBatch("keep-activity", [
     {
-      record: {
-        ...record,
-        payload: {
-          status: "complete",
-          startedAtMs: now - 11 * 60000,
-          updatedAt: now + 1,
-        },
-      },
+      id: "keep-activity",
+      kind: "activity",
+      generation: 0,
+      recordedAt: Date.now(),
+      payload: { type: "info", message: "keep me" },
     },
-  ]
-  expect((await repository.list("debug", {}, pending)).records).toHaveLength(0)
-  expect(await repository.get("debug", record.id, pending)).toBeNull()
+  ])
+  const retiredKind = "debug" as DiagnosticKind
+  await expect(repository.clear(retiredKind)).rejects.toThrow(
+    "Unsupported diagnostic kind",
+  )
+  await expect(repository.list(retiredKind)).rejects.toThrow(
+    "Unsupported diagnostic kind",
+  )
+  await expect(repository.get(retiredKind, "keep-activity")).rejects.toThrow(
+    "Unsupported diagnostic kind",
+  )
+  expect(
+    (await repository.list("activity")).records.map((record) => record.id),
+  ).toEqual(["keep-activity"])
+  expect(await repository.generations()).toEqual({ activity: 0 })
+  expect(
+    await storage.read((session) =>
+      session.query({
+        sql: "SELECT key FROM capi_metadata WHERE key='history_debug_generation'",
+        args: [],
+      }),
+    ),
+  ).toEqual([])
 })
 
 test("activity expiry and row caps are applied while usage remains intact", async () => {
@@ -370,47 +378,40 @@ test("activity expiry and row caps are applied while usage remains intact", asyn
   expect((await repository.list("activity")).records).toHaveLength(0)
 })
 
-test("batched debug updates keep newest completion, respect clear generations, and deduplicate receipts", async () => {
+test("batched activity records respect clear generations and deduplicate receipts", async () => {
   const { repository, storage } = await fixture()
   const now = Date.now()
-  const debug = (
-    id: string,
-    updatedAt: number,
-    status: string,
-  ): HistoryRecord => ({
+  const activity = (id: string): HistoryRecord => ({
     id,
-    kind: "debug",
+    kind: "activity",
     generation: 0,
     recordedAt: now,
-    payload: { startedAtMs: now, updatedAt, status, replayable: false },
+    payload: { type: "info", message: id },
   })
   const batch = [
-    ...Array.from({ length: 110 }, (_, i) =>
-      debug(`batch-${i}`, now, "pending"),
-    ),
-    debug("batch-0", now + 2, "complete"),
-    debug("batch-0", now + 1, "pending"),
+    ...Array.from({ length: 130 }, (_, i) => activity(`batch-${i}`)),
+    activity("batch-0"),
   ]
-  await repository.applyBatch("debug-batch", batch)
-  await repository.applyBatch("debug-batch", batch)
-  expect((await repository.get("debug", "batch-0"))?.payload).toMatchObject({
-    status: "complete",
-    updatedAt: now + 2,
+  await repository.applyBatch("activity-batch", batch)
+  await repository.applyBatch("activity-batch", batch)
+  expect((await repository.get("activity", "batch-0"))?.payload).toMatchObject({
+    type: "info",
+    message: "batch-0",
   })
   expect(
     await storage.read((session) =>
       session.query({
-        sql: "SELECT count(*) AS count FROM capi_debug",
+        sql: "SELECT count(*) AS count FROM capi_activity",
         args: [],
       }),
     ),
-  ).toEqual([{ count: 110 }])
-  await repository.clear("debug")
-  await repository.applyBatch("debug-after-clear", [
-    debug("stale", now, "pending"),
-    { ...debug("current", now, "complete"), generation: 1 },
+  ).toEqual([{ count: 130 }])
+  await repository.clear("activity")
+  await repository.applyBatch("activity-after-clear", [
+    activity("stale"),
+    { ...activity("current"), generation: 1 },
   ])
   expect(
-    (await repository.list("debug")).records.map((record) => record.id),
+    (await repository.list("activity")).records.map((record) => record.id),
   ).toEqual(["current"])
 })

@@ -8,6 +8,7 @@ import {
   currentIndexes,
   currentTables,
   storageMigrations,
+  storageSchema,
 } from "~/lib/storage/schema"
 
 const applicationObjectsSql =
@@ -21,7 +22,14 @@ export function isolatedNamespace(underlying: Storage) {
   if (!/^test_[a-f\d]{32}_$/.test(prefix))
     throw new Error("Invalid test namespace")
   const mapping = new Map(
-    [...tableNames, ...indexNames].map((name) => [name, `${prefix}${name}`]),
+    [
+      ...new Set([
+        ...tableNames,
+        ...indexNames,
+        ...Object.keys(storageSchema(1).tables),
+        ...Object.keys(storageSchema(1).indexes),
+      ]),
+    ].map((name) => [name, `${prefix}${name}`]),
   )
   const reverse = new Map(
     [...mapping].map(([logical, physical]) => [physical, logical]),
