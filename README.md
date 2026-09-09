@@ -222,6 +222,10 @@ Ordinary inference routes require credentials even on loopback.
 Audio transcription uses the same `/v1` base URL and gateway key. It requires
 a Groq API key stored through the dashboard:
 
+In **Settings → Speech transcription**, the current key is masked and has
+eye/copy controls. Revealing it requires your administrator session and the
+same CSRF/Origin protections as other stored credentials.
+
 ```sh
 curl http://127.0.0.1:4141/v1/audio/transcriptions \
   -H "Authorization: Bearer replace-with-gateway-key" \
@@ -760,6 +764,17 @@ retained. Clients must use a new stored gateway key after the upgrade.
 
 ### Environment variables
 
+Use an ordinary `.env` file in the working directory for local Bun commands,
+or the optional project `.env` consumed by Docker Compose. Copy `.env.example`
+as a starting point and fill in deployment-specific values; exported process
+environment variables take precedence.
+
+**Upgrading to 5.0.0:** the bundled 1Password/Varlock integration is removed.
+Put actual deployment values in `.env` or the process environment before
+updating the container. In particular, set both Turso values explicitly if
+you use the remote database; neither value being configured selects SQLite.
+This does not change database-backed account, gateway, provider, or Groq keys.
+
 | Variable | Scope | Purpose |
 | --- | --- | --- |
 | `COPILOT_INTEGRATION_ID` | Direct and Docker | Copilot integration identifier; defaults to `copilot-developer-cli` for the stable Copilot CLI model catalog. Override it when the deployment has its own assigned integration ID. |
@@ -777,7 +792,6 @@ retained. Clients must use a new stored gateway key after the upgrade.
 | `COPILOT_HOST` | Docker entrypoint | Set the container listening host |
 | `COPILOT_VERBOSE` | Docker entrypoint | Add `--verbose` when set to `true` |
 | `COPILOT_DEBUG` | Docker entrypoint | Add `--debug` when set to `true` |
-| `OP_TOKEN`, `OP_ENV_ID` | Docker entrypoint | Optionally resolve container secrets through the bundled 1Password/Varlock integration |
 | `NODE_TLS_REJECT_UNAUTHORIZED` | Direct and Docker | Setting `0` disables outbound TLS verification process-wide; unsafe outside controlled debugging |
 | `CERT_DIR` | HTTPS proxy helper | Certificate directory used by `scripts/https-proxy.mjs` |
 
@@ -810,8 +824,9 @@ docker compose up -d
 Use the code in `/dashboard` to choose the initial gateway key and password,
 then add accounts and provider credentials. The host port is bound to loopback.
 Configure `COPILOT_ADMIN_ORIGIN` and exact `COPILOT_TRUSTED_PROXY_CIDRS` for an
-external reverse proxy. Optional `OP_TOKEN` and `OP_ENV_ID` preserve the bundled
-1Password/Varlock delivery path for deployment settings and the Turso pair.
+external reverse proxy. Store their values and the optional Turso pair directly
+in `.env`. The container starts the application directly without fetching
+environment values from an external secret manager.
 
 ```dotenv
 COPILOT_HOST=0.0.0.0

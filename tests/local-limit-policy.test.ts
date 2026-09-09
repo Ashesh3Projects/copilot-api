@@ -162,8 +162,7 @@ test("active documentation exposes no local limit configuration", () => {
     "README.md",
     "SECURITY.md",
     path.join("nginx", "README.md"),
-    ".env.schema",
-    "env.d.ts",
+    ".env.example",
   ]
     .map((file) => fs.readFileSync(path.join(root, file), "utf8"))
     .join("\n")

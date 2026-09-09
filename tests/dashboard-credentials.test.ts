@@ -286,6 +286,42 @@ test("Groq status conceals secret and writes preserve blank fields", async () =>
   })
 })
 
+test("the stored Groq key is masked in status and revealable only with admin CSRF authority", async () => {
+  const credential = "gsk-fixture-current-transcription-key"
+  await request("/groq", "PUT", { apiKey: credential })
+  const before = await getStoreRevision(fixture.storage)
+  const status = await request("/groq")
+  const summary = await status.json()
+  expect(summary).toMatchObject({
+    apiKeyConfigured: true,
+    maskedValue: "gsk-f...n-key",
+    revision: before,
+  })
+  expect(JSON.stringify(summary)).not.toContain(credential)
+  const revealed = await request("/groq/reveal", "POST")
+  expect(revealed.status).toBe(200)
+  expect(revealed.headers.get("cache-control")).toBe("no-store")
+  expect(await revealed.json()).toEqual({ credential, revision: before })
+  expect(await getStoreRevision(fixture.storage)).toBe(before)
+  expect(
+    (await request("/groq/reveal", "POST", undefined, { "x-copilot-csrf": "" }))
+      .status,
+  ).toBe(401)
+  expect(
+    (
+      await request("/groq/reveal", "POST", undefined, {
+        origin: "https://wrong.example",
+      })
+    ).status,
+  ).toBe(401)
+  await request("/groq", "PUT", { clearApiKey: true })
+  expect((await request("/groq/reveal", "POST")).status).toBe(404)
+  expect(await (await request("/groq")).json()).toMatchObject({
+    apiKeyConfigured: false,
+    maskedValue: null,
+  })
+})
+
 test("storage errors are unavailable, with sanitized response and retained credential", async () => {
   fixture.failWrites()
   const response = await request("/groq", "PUT", { apiKey: "private-unsaved" })

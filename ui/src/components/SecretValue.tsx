@@ -12,10 +12,12 @@ export function SecretValue({
   label,
   maskedValue,
   revealPath,
+  actions,
 }: {
   label: string
   maskedValue: string
   revealPath: string
+  actions?: ReactNode
 }) {
   const [raw, setRaw] = useState<string>()
   const [loading, setLoading] = useState(false)
@@ -89,7 +91,9 @@ export function SecretValue({
           isDisabled={loading}
           onClick={copy}
         />
+        {actions}
       </HStack>
     </VStack>
   )
 }
+import type { ReactNode } from "react"

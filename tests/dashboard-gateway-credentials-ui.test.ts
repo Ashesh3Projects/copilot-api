@@ -33,3 +33,18 @@ test("first setup shares optional key generation and describes persistent admini
   expect(source).toContain("not a memorable password")
   expect(source).toContain("reveal")
 })
+
+test("Groq uses current-value reveal controls and gateway deletion is a compact inline icon", async () => {
+  const source = await Bun.file(
+    new URL("../ui/src/components/StoredCredentials.tsx", import.meta.url),
+  ).text()
+  expect(source).toContain("groq/reveal")
+  expect(source).toContain("maskedValue")
+  expect(source).toContain("Trash2Icon")
+  expect(source).toContain("isIconOnly")
+  expect(source).toContain("actions={")
+  expect(source).not.toContain('label="Delete"')
+  expect(source).not.toContain(
+    "A Groq key is stored. Leave blank to retain it.",
+  )
+})

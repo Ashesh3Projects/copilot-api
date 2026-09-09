@@ -3,7 +3,6 @@ import config from "@echristian/eslint-config"
 export default config(
   {
     ignores: [
-      "env.d.ts",
       "src/routes/dashboard/page-generated.ts",
       "ui/dist",
       "ui/scripts",

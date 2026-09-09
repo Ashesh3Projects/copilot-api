@@ -9,8 +9,6 @@ services:
     volumes:
       - copilot-data:/app/data
     environment:
-      - OP_TOKEN=${OP_TOKEN:-}
-      - OP_ENV_ID=${OP_ENV_ID:-}
       # Both optional: neither uses the local SQLite volume; both select Turso.
       - TURSO_DATABASE_URL
       - TURSO_AUTH_TOKEN

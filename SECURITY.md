@@ -50,11 +50,11 @@ affected, include its exact version or digest.
   sufficient for dashboard workflows; there is no second password prompt.
   Mutations still require the SameSite CSRF cookie, matching header, and
   approved Origin.
-- Gateway keys, provider keys, and custom-header values are excluded from
+- Gateway keys, Groq keys, provider keys, and custom-header values are excluded from
   routine dashboard listings and returned only by explicit administrator-only
   reveal endpoints, protected by session, CSRF and Origin checks with no-store
   responses. Gateway hard deletion is transactional and protects the final
-  active key. Revealed gateway values are cleared on hide; provider values are
+  active key. Revealed gateway/Groq values are cleared on hide; provider values are
   held only while the editor is open and cleared on close. Credential-control
   request bodies are omitted from diagnostic
   logging, and credential-control events are dropped from Sentry telemetry.

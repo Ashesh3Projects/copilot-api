@@ -2,7 +2,7 @@ node_modules
 
 .env
 .env.*
-!.env.schema
+!.env.example
 *.crt
 *.key
 *.pem
