@@ -228,17 +228,6 @@ async function seedSource(storage: Storage) {
       payload: { type: "info", message: "transfer activity" },
     },
     {
-      id: "transfer-debug",
-      kind: "debug",
-      recordedAt: now,
-      generation: 0,
-      payload: {
-        status: "completed",
-        replayable: false,
-        message: "redacted fixture",
-      },
-    },
-    {
       id: "transfer-gap",
       kind: "collection-gap",
       recordedAt: now,
@@ -337,9 +326,6 @@ async function verifyRepositories(
     (await history.get("activity", "transfer-activity", [], fixture.now))
       ?.payload,
   ).toMatchObject({ message: "transfer activity" })
-  expect(
-    (await history.get("debug", "transfer-debug", [], fixture.now))?.payload,
-  ).toMatchObject({ status: "completed" })
 }
 
 async function runTransfer(backend: Storage) {

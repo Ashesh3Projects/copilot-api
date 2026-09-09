@@ -52,13 +52,13 @@ test("fresh schema includes auth, settings and history with revision zero", asyn
     "usage_lifetime",
     "routing_minutes",
     "activity",
-    "debug",
     "applied_operations",
     "imports",
     "process_runs",
     "collection_gaps",
   ])
     expect(names).toContain(`capi_${name}`)
+  expect(names).not.toContain("capi_debug")
   expect(
     await storage.read((session) =>
       session.query({

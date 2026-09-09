@@ -10,13 +10,14 @@ import { StorageUnavailableError } from "~/lib/storage/errors"
 import {
   createHistoryRepository,
   historyObject,
+  isHistoryRecordKind,
   sumHistoryCounters,
 } from "~/lib/storage/history-repository"
 import { withStorageDeadline } from "~/lib/storage/operation-budget"
 
 export interface HistoryRecord {
   id: string
-  kind: "usage" | "routing" | "activity" | "debug" | "collection-gap"
+  kind: "usage" | "routing" | "activity" | "collection-gap"
   recordedAt: number
   generation: number
   payload: JsonValue
@@ -104,24 +105,6 @@ function coalesce(records: ReadonlyArray<HistoryRecord>): Array<HistoryRecord> {
       )
   }
   return [...counters.values(), ...diagnostics]
-}
-
-function omitDiagnosticBodies(item: Queued): number {
-  if (item.record.kind !== "debug") return 0
-  const payload = historyObject(item.record.payload)
-  let changed = false
-  for (const key of ["request", "response"]) {
-    const body = historyObject(payload[key] ?? null)
-    if (typeof body.body !== "string" || body.body.length === 0) continue
-    body.body = null
-    body.omittedReason = "queue-pressure"
-    changed = true
-  }
-  if (!changed) return 0
-  payload.replayable = false
-  const prior = item.bytes
-  item.bytes = Buffer.byteLength(JSON.stringify(item.record))
-  return prior - item.bytes
 }
 
 // eslint-disable-next-line max-lines-per-function -- One closure owns queue, retry batch and admission state.
@@ -262,17 +245,6 @@ export function createTelemetryWriter(
       reportTelemetryFailure()
     }
   }
-  const discardBody = (): boolean => {
-    const diagnostic = queue.find(
-      (value) =>
-        value.record.kind === "debug" && omitDiagnosticBodies(value) > 0,
-    )
-    if (!diagnostic) return false
-    pendingBytes =
-      queue.reduce((sum, value) => sum + value.bytes, 0)
-      + (active?.items.reduce((sum, value) => sum + value.bytes, 0) ?? 0)
-    return count() < MAX_RECORDS
-  }
   const timer =
     options.autoFlush === false ?
       undefined
@@ -281,9 +253,9 @@ export function createTelemetryWriter(
       }, 1000)
   timer?.unref()
   const writer: TelemetryWriter = {
-    // eslint-disable-next-line complexity -- Admission accounts independently for record, byte, priority and diagnostic-body limits.
+    // eslint-disable-next-line complexity -- Admission accounts independently for record, byte, priority and generation limits.
     enqueue(record) {
-      if (closed) return false
+      if (closed || !isHistoryRecordKind(record.kind)) return false
       try {
         const serialized = JSON.stringify(record)
         const bytes = Buffer.byteLength(serialized),
@@ -293,7 +265,7 @@ export function createTelemetryWriter(
             enqueuedAt: clock.now(),
           }
         const generationBlocked =
-          (record.kind === "activity" || record.kind === "debug")
+          record.kind === "activity"
           && options.acceptDiagnostic?.(record.kind) === false
         if (bytes > MAX_BYTES || generationBlocked) {
           droppedRecords++
@@ -305,10 +277,8 @@ export function createTelemetryWriter(
           return false
         }
         while (count() >= MAX_RECORDS || pendingBytes + bytes > MAX_BYTES) {
-          if (pendingBytes + bytes > MAX_BYTES && discardBody()) continue
           const index = queue.findIndex(
-            (value) =>
-              value.record.kind === "debug" || value.record.kind === "activity",
+            (value) => value.record.kind === "activity",
           )
           let candidate = index
           if (
@@ -407,13 +377,11 @@ export async function createHistoryRuntime(
   const generations = await repository.generations()
   const clearTails: Record<DiagnosticKind, Promise<unknown>> = {
     activity: Promise.resolve(),
-    debug: Promise.resolve(),
   }
   const pendingClears: Record<DiagnosticKind, number> = {
     activity: 0,
-    debug: 0,
   }
-  const clearEpochs: Record<DiagnosticKind, number> = { activity: 0, debug: 0 }
+  const clearEpochs: Record<DiagnosticKind, number> = { activity: 0 }
   const unresolved = new Set<DiagnosticKind>()
   const reconcileGenerations = async () => {
     const needed = [...unresolved].filter((kind) => pendingClears[kind] === 0)
@@ -440,9 +408,7 @@ export async function createHistoryRuntime(
       acceptDiagnostic: (kind) =>
         !unresolved.has(kind) && pendingClears[kind] === 0,
       generationDegraded: () =>
-        unresolved.size > 0
-        || pendingClears.activity > 0
-        || pendingClears.debug > 0,
+        unresolved.size > 0 || pendingClears.activity > 0,
     },
   )
   let closing: Promise<TelemetryStatus> | undefined

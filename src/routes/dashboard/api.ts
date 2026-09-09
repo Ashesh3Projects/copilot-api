@@ -37,6 +37,7 @@ import {
   clearLlmDebugLogs,
   getLlmDebugLog,
   listLlmDebugLogs,
+  LlmDebugQueryError,
 } from "~/lib/llm-debug-log"
 import {
   addModelRedirect,
@@ -1079,7 +1080,19 @@ export async function handleDeleteTrustedJwtDigest(c: Context) {
 }
 
 export async function handleListLlmDebugLogs(c: Context) {
-  return c.json(await listLlmDebugLogs())
+  const limit = c.req.query("limit")
+  try {
+    return c.json(
+      await listLlmDebugLogs({
+        limit: limit === undefined ? undefined : Number(limit),
+        cursor: c.req.query("cursor"),
+      }),
+    )
+  } catch (error) {
+    if (error instanceof LlmDebugQueryError)
+      return c.json({ error: error.message }, 400)
+    throw error
+  }
 }
 
 export async function handleGetLlmDebugLog(c: Context) {

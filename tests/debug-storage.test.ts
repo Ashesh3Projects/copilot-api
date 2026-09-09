@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, test, spyOn } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import {
   captureDebugResponseBody,
+  DEBUG_CAPTURE_MEMORY_MAX_BYTES,
   debugCaptureMemoryUsage,
 } from "../src/lib/debug-capture"
 import {
@@ -34,8 +35,10 @@ beforeEach(async () => {
   )
   await migrateStorage(storage)
   history = await createHistoryRuntime(storage, { autoFlush: false })
+  await clearLlmDebugLogs()
 })
 afterEach(async () => {
+  await clearLlmDebugLogs()
   await history.close(500)
   await storage.close()
 })
@@ -49,26 +52,42 @@ function start() {
     upstream: { kind: "copilot", accountId: 23 },
   })
 }
-test("pending overlays and durable rows contain no live credentials, preserving conversation and pins", async () => {
+test("captures and dashboard reads never enter telemetry or SQL, preserving conversation and pins", async () => {
+  const databaseRead = spyOn(storage, "read")
+  const databaseWrite = spyOn(storage, "transaction")
+  const enqueue = spyOn(history.writer, "enqueue")
   const id = start()
   expect((await getLlmDebugLog(id))?.request.body).toContain(
     "ordinary conversation",
   )
   failLlmDebugLog(id, new Error("failed using active-secret"))
-  const pending = await history.writer.read((items) => Promise.resolve(items))
-  expect(JSON.stringify(pending)).not.toContain("active-secret")
-  await history.writer.flush()
-  const rows = await storage.read((s) =>
-    s.query({ sql: "SELECT payload_json FROM capi_debug", args: [] }),
-  )
-  expect(JSON.stringify(rows)).not.toContain("active-secret")
-  expect((await getLlmDebugLog(id))?.upstream).toEqual({
+  const entry = await getLlmDebugLog(id)
+  expect(JSON.stringify(entry)).not.toContain("active-secret")
+  expect(entry?.upstream).toEqual({
     kind: "copilot",
     accountId: 23,
   })
+  expect((await listLlmDebugLogs()).entries[0]?.id).toBe(id)
+  await clearLlmDebugLogs()
+  expect(await getLlmDebugLog(id)).toBeUndefined()
+  expect(enqueue).not.toHaveBeenCalled()
+  expect(databaseRead).not.toHaveBeenCalled()
+  expect(databaseWrite).not.toHaveBeenCalled()
+  enqueue.mockRestore()
+  databaseRead.mockRestore()
+  databaseWrite.mockRestore()
+  expect(history.writer.status().pendingRecords).toBe(0)
+  await history.writer.flush()
+  const tables = await storage.read((s) =>
+    s.query({
+      sql: "SELECT name FROM sqlite_master WHERE name LIKE 'capi_debug%'",
+      args: [],
+    }),
+  )
+  expect(tables).toEqual([])
 })
 
-test("custom configured secret header values are absent from header, body and error queue", async () => {
+test("custom configured secrets are absent from retained headers, bodies and errors", async () => {
   const id = startLlmDebugLog({
     upstream: { kind: "custom", providerId: "custom-fixture" },
     requestHeaders: {
@@ -90,16 +109,17 @@ test("custom configured secret header values are absent from header, body and er
       'Upstream said {"api_key":"synthetic-fragment-secret"}; synthetic-subscription-secret',
     ),
   )
-  const pending = await history.writer.read((items) => Promise.resolve(items))
+  const entry = await getLlmDebugLog(id)
+  expect(entry).toBeDefined()
   for (const secret of [
     "synthetic-unusual-secret",
     "synthetic-subscription-secret",
     "synthetic-id-secret",
     "synthetic-fragment-secret",
   ])
-    expect(JSON.stringify(pending)).not.toContain(secret)
+    expect(JSON.stringify(entry)).not.toContain(secret)
 })
-test("clear generations reject late completions, including pending writer batches", async () => {
+test("clearing memory cancels captures and ignores their late completions", async () => {
   const id = start()
   const signal = getLlmDebugCaptureSignal(id)
   await clearLlmDebugLogs()
@@ -147,7 +167,7 @@ test("active capture state evicts oldest requests and releases their readers", a
     (await listLlmDebugLogs({ limit: 200 })).entries.length,
   ).toBeLessThanOrEqual(200)
 })
-test("new history runtime exposes unfinished rows as interrupted and completed rows intact", async () => {
+test("database history lifecycle cannot reload, interrupt or delete process-local captures", async () => {
   const unfinished = start()
   const completed = start()
   finishLlmDebugLog(completed, {
@@ -161,8 +181,8 @@ test("new history runtime exposes unfinished rows as interrupted and completed r
   // eslint-disable-next-line require-atomic-updates -- Isolated sequential test lifecycle.
   history = await createHistoryRuntime(storage, { autoFlush: false })
   expect(await getLlmDebugLog(unfinished)).toMatchObject({
-    status: "interrupted",
-    replayable: false,
+    status: "pending",
+    replayable: true,
   })
   expect(await getLlmDebugLog(completed)).toMatchObject({
     status: "complete",
@@ -170,13 +190,14 @@ test("new history runtime exposes unfinished rows as interrupted and completed r
   })
 })
 
-test("Turso transport persists scrubbed debug captures and reopens them", async () => {
+test("debug operations send no Turso requests and keep scrubbed results only in memory", async () => {
   await history.close(500)
   const transport = createFakeTursoFetch()
   const remote = new TursoStorage(testConfig())
   try {
     await migrateStorage(remote)
     const runtime = await createHistoryRuntime(remote, { autoFlush: false })
+    const requestCount = transport.requests.length
     const id = start()
     finishLlmDebugLog(id, {
       body: '{"output":"active-secret", "api_key":"response-secret"}',
@@ -184,16 +205,116 @@ test("Turso transport persists scrubbed debug captures and reopens them", async 
       status: 200,
       statusText: "OK",
     })
-    await runtime.close(500)
-    const reopened = await createHistoryRuntime(remote, { autoFlush: false })
     const entry = await getLlmDebugLog(id)
     expect(entry).toMatchObject({ status: "complete", replayable: false })
     expect(JSON.stringify(entry)).not.toContain("active-secret")
     expect(JSON.stringify(entry)).not.toContain("response-secret")
     expect(JSON.stringify(entry)).not.toContain("response-cookie")
-    await reopened.close(500)
+    expect((await listLlmDebugLogs()).count).toBe(1)
+    await clearLlmDebugLogs()
+    expect(transport.requests.length).toBe(requestCount)
+    expect(runtime.writer.status().pendingRecords).toBe(0)
+    await runtime.close(500)
   } finally {
     await remote.close()
     transport.close()
+  }
+})
+
+test("debug remains available while the selected database is unavailable", async () => {
+  const databaseRead = spyOn(storage, "read").mockImplementation(() => {
+    throw new Error("Fixture database unavailable")
+  })
+  try {
+    const id = start()
+    finishLlmDebugLog(id, {
+      body: "{}",
+      headers: {},
+      status: 200,
+      statusText: "OK",
+    })
+    expect((await getLlmDebugLog(id))?.status).toBe("complete")
+    expect((await listLlmDebugLogs()).count).toBe(1)
+    await clearLlmDebugLogs()
+    expect((await listLlmDebugLogs()).count).toBe(0)
+    expect(databaseRead).not.toHaveBeenCalled()
+  } finally {
+    databaseRead.mockRestore()
+  }
+})
+
+test("completed request and response bodies share the bounded memory budget", async () => {
+  const baseline = debugCaptureMemoryUsage()
+  let first: string | undefined
+  for (let index = 0; index < 40; index++) {
+    const id = startLlmDebugLog({
+      method: "POST",
+      path: "/responses",
+      url: "https://example.test/responses",
+      requestHeaders: {},
+      requestBody: JSON.stringify({ input: "x".repeat(450_000) }),
+    })
+    first ??= id
+    finishLlmDebugLog(id, {
+      body: JSON.stringify({ output: "y".repeat(450_000) }),
+      headers: {},
+      status: 200,
+      statusText: "OK",
+    })
+    expect(debugCaptureMemoryUsage()).toBeLessThanOrEqual(
+      DEBUG_CAPTURE_MEMORY_MAX_BYTES,
+    )
+  }
+  expect(debugCaptureMemoryUsage()).toBeGreaterThan(baseline)
+  if (!first) throw new Error("Expected a debug capture")
+  expect(await getLlmDebugLog(first)).toBeUndefined()
+  expect((await listLlmDebugLogs()).count).toBeGreaterThan(0)
+  await clearLlmDebugLogs()
+  expect(debugCaptureMemoryUsage()).toBe(baseline)
+})
+
+test("fresh processes cannot recover completed debug bodies or pending captures", async () => {
+  const script = `
+    import { LocalSqliteStorage } from './src/lib/storage/local-sqlite';
+    import { migrateStorage } from './src/lib/storage/migrations';
+    import { createHistoryRuntime } from './src/lib/telemetry-writer';
+    import { startLlmDebugLog, finishLlmDebugLog, listLlmDebugLogs } from './src/lib/llm-debug-log';
+    const storage = new LocalSqliteStorage(process.env.DEBUG_TEST_DATABASE);
+    await migrateStorage(storage);
+    const history = await createHistoryRuntime(storage, { autoFlush: false });
+    if (process.env.DEBUG_TEST_CAPTURE === '1') {
+      const input = { method: 'POST', path: '/responses', url: 'https://example.test/responses', requestHeaders: {}, requestBody: '{"input":"volatile-restart-marker"}' };
+      startLlmDebugLog(input);
+      const id = startLlmDebugLog(input);
+      finishLlmDebugLog(id, { body: '{"output":"volatile-restart-answer"}', headers: {}, status: 200, statusText: 'OK' });
+    }
+    console.log(JSON.stringify({ count: (await listLlmDebugLogs()).count }));
+    await history.close(500);
+    await storage.close();
+  `
+  const path = resolve(
+    import.meta.dir,
+    "../.superpowers/test-data/debug",
+    `${crypto.randomUUID()}.sqlite`,
+  )
+  for (const capture of ["1", "0"]) {
+    const child = Bun.spawn([process.execPath, "--eval", script], {
+      cwd: resolve(import.meta.dir, ".."),
+      env: {
+        ...process.env,
+        DEBUG_TEST_DATABASE: path,
+        DEBUG_TEST_CAPTURE: capture,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [output, errors, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect(errors).toBe("")
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(output)).toEqual({ count: capture === "1" ? 2 : 0 })
   }
 })

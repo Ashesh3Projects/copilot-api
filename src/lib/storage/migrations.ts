@@ -6,25 +6,16 @@ import {
   StorageCommitUnknownError,
   StorageSchemaError,
 } from "~/lib/storage/errors"
+import { initialMigration } from "~/lib/storage/migrations/001-initial"
 import {
-  initialMigration,
-  initialTables,
-} from "~/lib/storage/migrations/001-initial"
-import {
-  currentIndexes,
   currentSchemaVersion,
-  currentTables,
   storageMigrations,
+  storageSchema,
 } from "~/lib/storage/schema"
 
 const checksums = storageMigrations.map((migration) =>
   createHash("sha256").update(JSON.stringify(migration)).digest("hex"),
 )
-const counterKeys = [
-  "config_revision",
-  "history_activity_generation",
-  "history_debug_generation",
-] as const
 
 export function parseStorageCounter(value: unknown): number {
   if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/.test(value)) {
@@ -69,6 +60,7 @@ async function validateSchema(
   session: SqlSession,
   version: number,
 ): Promise<void> {
+  const schema = storageSchema(version)
   const objects = await applicationObjects(session)
   const tables = new Set(
     objects.filter((row) => row.type === "table").map((row) => row.name),
@@ -77,10 +69,9 @@ async function validateSchema(
     objects.filter((row) => row.type === "index").map((row) => row.name),
   )
   if (
-    Object.keys(version === 1 ? initialTables : currentTables).some(
-      (name) => !tables.has(name),
-    )
-    || Object.keys(currentIndexes).some((name) => !indexes.has(name))
+    Object.keys(schema.tables).some((name) => !tables.has(name))
+    || Object.keys(schema.indexes).some((name) => !indexes.has(name))
+    || (version >= 3 && tables.has("capi_debug"))
   ) {
     throw new StorageSchemaError("Application schema is incomplete")
   }
@@ -101,7 +92,9 @@ async function validateSchema(
   ) {
     throw new StorageSchemaError("Required storage metadata is invalid")
   }
-  for (const key of counterKeys) parseStorageCounter(metadata.get(key))
+  for (const key of schema.counterKeys) parseStorageCounter(metadata.get(key))
+  if (version >= 3 && metadata.has("history_debug_generation"))
+    throw new StorageSchemaError("Retired debug metadata is present")
   const lifetime = await session.query({
     sql: "SELECT id FROM capi_usage_lifetime",
     args: [],
@@ -123,7 +116,9 @@ export async function migrateStorage(storage: Storage): Promise<void> {
         const metadata: Array<[string, string]> = [
           ["schema_version", String(initialMigration.version)],
           ["store_id", randomUUID()],
-          ...counterKeys.map((key): [string, string] => [key, "0"]),
+          ...storageSchema(initialMigration.version).counterKeys.map(
+            (key): [string, string] => [key, "0"],
+          ),
         ]
         for (const [key, value] of metadata) {
           await session.execute({

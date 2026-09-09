@@ -216,27 +216,24 @@ test("a failed diagnostic batch leaves queue capacity for priority counters", as
   expect((await f.repository.readUsage(0)).lifetime.requestCount).toBe(1)
 })
 
-test("byte pressure omits debug bodies before evicting diagnostic metadata", async () => {
+test("telemetry refuses retired debug records without retaining their payload", async () => {
   const f = await fixture()
-  for (let i = 0; i < 5; i++)
+  expect(
     f.writer.enqueue({
-      ...record(`body-${i}`, f.now, "debug"),
-      payload: {
-        request: {
-          body: "x".repeat(4 * 1024 * 1024),
-          bodyBytes: 4 * 1024 * 1024,
-        },
-        replayable: true,
-      },
-    })
+      ...record("private-debug", f.now),
+      kind: "debug",
+      payload: { request: "synthetic-private-body" },
+    } as unknown as HistoryRecord),
+  ).toBe(false)
   expect(f.writer.status()).toMatchObject({
-    pendingRecords: 5,
+    pendingRecords: 0,
+    pendingBytes: 0,
     droppedRecords: 0,
   })
-  const page = await f.writer.read((pending) =>
-    f.repository.list("debug", {}, pending),
-  )
-  expect(JSON.stringify(page)).toContain('"omittedReason":"queue-pressure"')
+  expect(await f.writer.read((pending) => Promise.resolve(pending))).toEqual([])
+  f.writer.enqueue(record("after-debug", f.now))
+  await f.writer.flush()
+  expect((await f.repository.readUsage(0)).lifetime.requestCount).toBe(1)
 })
 
 test("one hundred diagnostic records flush at 30ms SQL latency within the unchanged deadline", async () => {

@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, jest, test } from "bun:test"
-import { mkdir } from "node:fs/promises"
-import { resolve } from "node:path"
 
+import { debugCaptureMemoryUsage } from "../src/lib/debug-capture"
 import {
   abortLlmDebugLog,
   clearLlmDebugLogs,
@@ -12,36 +11,39 @@ import {
   listLlmDebugLogs,
   startLlmDebugLog,
 } from "../src/lib/llm-debug-log"
-import { LocalSqliteStorage } from "../src/lib/storage/local-sqlite"
-import { migrateStorage } from "../src/lib/storage/migrations"
-import {
-  createHistoryRuntime,
-  type HistoryRuntime,
-} from "../src/lib/telemetry-writer"
-
-let storage: LocalSqliteStorage
-let history: HistoryRuntime
 beforeEach(async () => {
-  const directory = resolve(
-    import.meta.dir,
-    "../.superpowers/test-data/debug-log",
-  )
-  await mkdir(directory, { recursive: true })
-  storage = new LocalSqliteStorage(
-    resolve(directory, `${crypto.randomUUID()}.sqlite`),
-  )
-  await migrateStorage(storage)
-  history = await createHistoryRuntime(storage, { autoFlush: false })
   await clearLlmDebugLogs()
 })
 
 afterEach(async () => {
+  await clearLlmDebugLogs()
   jest.useRealTimers()
-  await history.close(500)
-  await storage.close()
 })
 
-test("scrubs request and completed response credentials before storage", async () => {
+test("captures request and response in memory without initializing storage", async () => {
+  const id = startLlmDebugLog({
+    method: "POST",
+    path: "/responses",
+    requestBody: '{"input":"memory only"}',
+    requestHeaders: {},
+    url: "https://example.test/responses",
+  })
+  expect((await getLlmDebugLog(id))?.status).toBe("pending")
+  finishLlmDebugLog(id, {
+    body: '{"output":"volatile answer"}',
+    headers: {},
+    status: 200,
+    statusText: "OK",
+  })
+  expect((await getLlmDebugLog(id))?.response?.body).toContain(
+    "volatile answer",
+  )
+  expect((await listLlmDebugLogs()).count).toBe(1)
+  await clearLlmDebugLogs()
+  expect(await getLlmDebugLog(id)).toBeUndefined()
+})
+
+test("scrubs request and completed response credentials before retaining them", async () => {
   const startedAtMs = Date.now()
   const requestBody = `{"messages": [ {"role": "user", "content": "Find this request"} ], "api_key": "body-secret", "model": "gpt-test", "stream": false}`
   const responseBody = `{ "access_token": "response-secret", "ok": true }`
@@ -449,7 +451,7 @@ test("retains complete previews inside the retention window", async () => {
   expect(entry?.requestPreview).toContain(longPrompt)
 })
 
-test("cleanup removes expired durable entries", async () => {
+test("timer releases expired captures from memory without dashboard reads", async () => {
   jest.useFakeTimers()
   const startedAtMs = Date.now()
   const id = startLlmDebugLog({
@@ -467,13 +469,67 @@ test("cleanup removes expired durable entries", async () => {
     statusText: "OK",
   })
 
-  await history.writer.flush()
-  jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS)
-  await history.repository.prune(Date.now())
+  expect(debugCaptureMemoryUsage()).toBeGreaterThan(0)
+  jest.advanceTimersByTime(LLM_DEBUG_HISTORY_WINDOW_MS)
+  expect(debugCaptureMemoryUsage()).toBe(0)
   jest.setSystemTime(startedAtMs)
 
-  // Moving the clock back proves cleanup removed the durable row.
+  // Moving the clock back proves the timer removed the capture itself.
   expect((await listLlmDebugLogs()).count).toBe(0)
+})
+
+test("paginates memory by timestamp and id without duplicates", async () => {
+  const startedAtMs = Date.now()
+  const ids = Array.from({ length: 5 }, () =>
+    startLlmDebugLog({
+      method: "POST",
+      path: "/responses",
+      requestBody: "{}",
+      requestHeaders: {},
+      url: "https://example.test/responses",
+      startedAtMs,
+    }),
+  )
+    .sort()
+    .reverse()
+  const first = await listLlmDebugLogs({ limit: 2 })
+  expect(first.entries.map((entry) => entry.id)).toEqual(ids.slice(0, 2))
+  expect(first.cursor).not.toBeNull()
+  if (!first.cursor) throw new Error("Expected a second debug page")
+  const second = await listLlmDebugLogs({ limit: 2, cursor: first.cursor })
+  expect(second.entries.map((entry) => entry.id)).toEqual(ids.slice(2, 4))
+  if (!second.cursor) throw new Error("Expected a third debug page")
+  const third = await listLlmDebugLogs({ limit: 2, cursor: second.cursor })
+  expect(third.entries.map((entry) => entry.id)).toEqual(ids.slice(4))
+  expect(third.cursor).toBeNull()
+})
+
+test("successful captures expire exactly at ten minutes and pending captures at one hour", async () => {
+  jest.useFakeTimers()
+  const startedAtMs = Date.now()
+  const input = {
+    method: "POST",
+    path: "/responses",
+    requestBody: "{}",
+    requestHeaders: {},
+    url: "https://example.test/responses",
+  }
+  const complete = startLlmDebugLog(input)
+  const pending = startLlmDebugLog(input)
+  finishLlmDebugLog(complete, {
+    body: "{}",
+    headers: {},
+    status: 200,
+    statusText: "OK",
+  })
+  jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS - 1)
+  expect(await getLlmDebugLog(complete)).toBeDefined()
+  jest.setSystemTime(startedAtMs + LLM_DEBUG_HISTORY_WINDOW_MS)
+  expect(await getLlmDebugLog(complete)).toBeUndefined()
+  expect(await getLlmDebugLog(pending)).toBeDefined()
+  jest.setSystemTime(startedAtMs + 60 * 60_000)
+  expect(await getLlmDebugLog(pending)).toBeUndefined()
+  expect(debugCaptureMemoryUsage()).toBe(0)
 })
 
 test("keeps aborted requests terminal when late response work finishes", async () => {
